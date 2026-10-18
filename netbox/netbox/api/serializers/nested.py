@@ -1,5 +1,6 @@
 from extras.models import Tag
 from utilities.api import get_related_object_by_attrs
+
 from .base import BaseModelSerializer
 
 __all__ = (
@@ -16,7 +17,9 @@ class WritableNestedSerializer(BaseModelSerializer):
     """
     def to_internal_value(self, data):
         queryset = self.Meta.model.objects.all()
-        return get_related_object_by_attrs(queryset, data)
+        request = self.context.get('request')
+        user = request.user if request else None
+        return get_related_object_by_attrs(queryset, data, user=user)
 
 
 # Declared here for use by PrimaryModelSerializer

@@ -2,25 +2,49 @@ import json
 
 from django import forms
 from django.conf import settings
+from django.db.models import BigIntegerField as BigIntegerModelField
 from django.db.models import Count
-from django.forms.fields import JSONField as _JSONField, InvalidJSONInput
+from django.forms.fields import InvalidJSONInput
+from django.forms.fields import JSONField as _JSONField
 from django.templatetags.static import static
 from django.utils.translation import gettext_lazy as _
-from netaddr import AddrFormatError, EUI
+from netaddr import EUI, AddrFormatError
 
 from utilities.forms import widgets
 from utilities.validators import EnhancedURLValidator
 
 __all__ = (
+    'BigIntegerField',
     'ColorField',
     'CommentField',
     'JSONField',
     'LaxURLField',
     'MACAddressField',
+    'PositiveBigIntegerField',
     'QueryField',
     'SlugField',
     'TagFilterField',
 )
+
+
+class BigIntegerField(forms.IntegerField):
+    """
+    An IntegerField constrained to the range of a signed 64-bit integer.
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('min_value', -BigIntegerModelField.MAX_BIGINT - 1)
+        kwargs.setdefault('max_value', BigIntegerModelField.MAX_BIGINT)
+        super().__init__(*args, **kwargs)
+
+
+class PositiveBigIntegerField(BigIntegerField):
+    """
+    An IntegerField constrained to the range supported by Django's
+    PositiveBigIntegerField model field.
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('min_value', 0)
+        super().__init__(*args, **kwargs)
 
 
 class QueryField(forms.CharField):
@@ -38,7 +62,7 @@ class CommentField(forms.CharField):
     widget = widgets.MarkdownWidget
     label = _('Comments')
     help_text = _(
-        '<i class="mdi mdi-information-outline"></i> '
+        '<i class="mdi mdi-information-outline" aria-hidden="true"></i> '
         '<a href="{url}" target="_blank" tabindex="-1">Markdown</a> syntax is supported'
     ).format(url=static('docs/reference/markdown/'))
 

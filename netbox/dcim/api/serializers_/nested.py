@@ -1,10 +1,11 @@
 from drf_spectacular.utils import extend_schema_serializer
 from rest_framework import serializers
 
-from netbox.api.serializers import WritableNestedSerializer
 from dcim import models
+from netbox.api.serializers import WritableNestedSerializer
 
 __all__ = (
+    'NestedCoolingOutflowSerializer',
     'NestedDeviceBaySerializer',
     'NestedDeviceRoleSerializer',
     'NestedDeviceSerializer',
@@ -66,6 +67,14 @@ class NestedDeviceSerializer(WritableNestedSerializer):
     class Meta:
         model = models.Device
         fields = ['id', 'url', 'display_url', 'display', 'name']
+
+
+class NestedCoolingOutflowSerializer(WritableNestedSerializer):
+    device = NestedDeviceSerializer(read_only=True)
+
+    class Meta:
+        model = models.CoolingOutflow
+        fields = ['id', 'url', 'display_url', 'display', 'device', 'name']
 
 
 class NestedInterfaceSerializer(WritableNestedSerializer):

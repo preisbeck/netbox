@@ -1,4 +1,5 @@
 import collections
+
 from django.utils.translation import gettext as _
 
 
@@ -24,14 +25,15 @@ class Registry(dict):
 registry = Registry({
     'counter_fields': collections.defaultdict(dict),
     'data_backends': dict(),
-    'denormalized_fields': collections.defaultdict(list),
+    'event_rule_actions': dict(),
     'event_types': dict(),
     'filtersets': dict(),
+    'model_actions': collections.defaultdict(set),
     'model_features': dict(),
-    'models': collections.defaultdict(set),
     'plugins': dict(),
     'request_processors': list(),
     'search': dict(),
+    'serializer_resolvers': dict(),
     'system_jobs': dict(),
     'tables': collections.defaultdict(dict),
     'views': collections.defaultdict(dict),

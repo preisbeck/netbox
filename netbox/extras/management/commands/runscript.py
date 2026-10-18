@@ -3,10 +3,11 @@ import logging
 import sys
 import uuid
 
+from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 
 from extras.jobs import ScriptJob
-from extras.scripts import get_module_and_script
+from extras.scripts import EXEC_PARAM_FIELDS, get_module_and_script
 from users.models import User
 from utilities.request import NetBoxFakeRequest
 
@@ -68,7 +69,7 @@ class Command(BaseCommand):
                 'info': logging.INFO,
                 'warning': logging.WARNING,
             }[loglevel])
-        except KeyError:
+        except KeyError:  # pragma: no cover
             raise CommandError(f"Invalid log level: {loglevel}")
 
         # Initialize the script form
@@ -81,27 +82,36 @@ class Command(BaseCommand):
                     logger.error(f'\t{field}: {error.get("message")}')
             raise CommandError()
 
-        # Remove extra fields from ScriptForm before passng data to script
-        form.cleaned_data.pop('_schedule_at')
-        form.cleaned_data.pop('_interval')
-        form.cleaned_data.pop('_commit')
+        # Remove exec-parameter fields from ScriptForm before passing data to the script
+        cleaned_data = form.cleaned_data.copy()
+        notifications = cleaned_data.pop('_notifications')
+        for key in EXEC_PARAM_FIELDS:
+            cleaned_data.pop(key, None)
 
         # Execute the script.
-        job = ScriptJob.enqueue(
-            instance=script_obj,
-            user=user,
-            immediate=True,
-            data=form.cleaned_data,
-            request=NetBoxFakeRequest({
-                'META': {},
-                'POST': data,
-                'GET': {},
-                'FILES': {},
-                'user': user,
-                'path': '',
-                'id': uuid.uuid4()
-            }),
-            commit=commit,
-        )
+        try:
+            job = ScriptJob.enqueue(
+                instance=script_obj,
+                user=user,
+                immediate=True,
+                data=cleaned_data,
+                notifications=notifications,
+                request=NetBoxFakeRequest({
+                    'META': {},
+                    'COOKIES': {},
+                    'POST': data,
+                    'GET': {},
+                    'FILES': {},
+                    'user': user,
+                    'method': 'POST',
+                    'path': '',
+                    'id': uuid.uuid4()
+                }),
+                commit=commit,
+            )
+        except ValidationError as e:
+            # The script's Meta configuration is invalid (see #22872). Report it as a clean command error rather than
+            # an unhandled traceback.
+            raise CommandError('; '.join(e.messages))
 
         logger.info(f"Script completed in {job.duration}")

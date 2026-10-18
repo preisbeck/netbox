@@ -1,7 +1,6 @@
 import django_filters
 import netaddr
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.utils.translation import gettext as _
 from drf_spectacular.types import OpenApiTypes
@@ -12,23 +11,31 @@ from circuits.models import Provider
 from dcim.base_filtersets import ScopedFilterSet
 from dcim.models import Device, Interface, Region, Site, SiteGroup
 from netbox.filtersets import (
-    ChangeLoggedModelFilterSet, OrganizationalModelFilterSet, NetBoxModelFilterSet, PrimaryModelFilterSet,
+    ChangeLoggedModelFilterSet,
+    NetBoxModelFilterSet,
+    OrganizationalModelFilterSet,
+    PrimaryModelFilterSet,
 )
 from tenancy.filtersets import ContactModelFilterSet, TenancyFilterSet
 from utilities.filters import (
-    MultiValueCharFilter, MultiValueContentTypeFilter, MultiValueNumberFilter, NumericArrayFilter,
+    MultiValueCharFilter,
+    MultiValueContentTypeFilter,
+    MultiValueNumberFilter,
     TreeNodeMultipleChoiceFilter,
 )
 from utilities.filtersets import register_filterset
 from virtualization.models import VirtualMachine, VMInterface
 from vpn.models import L2VPN
+
 from .choices import *
 from .models import *
+from .utils import normalize_port_mapping, port_mapping_q
+from .utils import parse_inet_addresses as utils_parse_inet_addresses
 
 __all__ = (
-    'AggregateFilterSet',
     'ASNFilterSet',
     'ASNRangeFilterSet',
+    'AggregateFilterSet',
     'FHRPGroupAssignmentFilterSet',
     'FHRPGroupFilterSet',
     'IPAddressFilterSet',
@@ -282,6 +289,18 @@ class ASNFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         to_field_name='slug',
         label=_('Provider (slug)'),
     )
+    role_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=Role.objects.all(),
+        distinct=False,
+        label=_('Role (ID)'),
+    )
+    role = django_filters.ModelMultipleChoiceFilter(
+        field_name='role__slug',
+        queryset=Role.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Role (slug)'),
+    )
 
     class Meta:
         model = ASN
@@ -466,8 +485,7 @@ class PrefixFilterSet(PrimaryModelFilterSet, ScopedFilterSet, TenancyFilterSet, 
             if '/' in value:
                 return queryset.filter(prefix__net_contains_or_equals=str(netaddr.IPNetwork(value).cidr))
             # Searching by IP address
-            else:
-                return queryset.filter(prefix__net_contains=str(netaddr.IPAddress(value)))
+            return queryset.filter(prefix__net_contains=str(netaddr.IPAddress(value)))
         except (AddrFormatError, ValueError):
             return queryset.none()
 
@@ -561,10 +579,11 @@ class IPRangeFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ContactModelFilt
             return queryset.none()
 
     def filter_address(self, queryset, name, value):
-        try:
-            return queryset.filter(**{f'{name}__net_in': value})
-        except ValidationError:
+        # Discard any invalid addresses. If none remain, return an empty queryset.
+        addresses = utils_parse_inet_addresses(value)
+        if not addresses:
             return queryset.none()
+        return queryset.filter(**{f'{name}__net_in': addresses})
 
     def search_by_parent(self, queryset, name, value):
         if not value:
@@ -732,37 +751,19 @@ class IPAddressFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ContactModelFi
                 return queryset.none()
         return queryset.filter(q)
 
+    # TODO: Remove in v5.0
     def parse_inet_addresses(self, value):
         """
-        Parse networks or IP addresses and cast to a format
-        acceptable by the Postgres inet type.
-
-        Skips invalid values.
+        Deprecated: Use ipam.utils.parse_inet_addresses() instead. Retained for backward compatibility.
         """
-        parsed = []
-        for addr in value:
-            if netaddr.valid_ipv4(addr) or netaddr.valid_ipv6(addr):
-                parsed.append(addr)
-                continue
-            try:
-                network = netaddr.IPNetwork(addr)
-                parsed.append(str(network))
-            except (AddrFormatError, ValueError):
-                continue
-        return parsed
+        return utils_parse_inet_addresses(value)
 
     def filter_address(self, queryset, name, value):
-        # Let's first parse the addresses passed
-        # as argument. If they are all invalid,
-        # we return an empty queryset
+        # Discard any invalid addresses. If none remain, return an empty queryset.
         value = self.parse_inet_addresses(value)
-        if len(value) == 0:
+        if not value:
             return queryset.none()
-
-        try:
-            return queryset.filter(address__net_in=value)
-        except ValidationError:
-            return queryset.none()
+        return queryset.filter(address__net_in=value)
 
     @extend_schema_field(OpenApiTypes.STR)
     def filter_present_in_vrf(self, queryset, name, vrf):
@@ -802,11 +803,10 @@ class IPAddressFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ContactModelFi
                 assigned_object_type__in=content_types,
                 assigned_object_id__isnull=False
             )
-        else:
-            return queryset.exclude(
-                assigned_object_type__in=content_types,
-                assigned_object_id__isnull=False
-            )
+        return queryset.exclude(
+            assigned_object_type__in=content_types,
+            assigned_object_id__isnull=False
+        )
 
     def _assigned(self, queryset, name, value):
         if value:
@@ -814,11 +814,10 @@ class IPAddressFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ContactModelFi
                 assigned_object_type__isnull=True,
                 assigned_object_id__isnull=True
             )
-        else:
-            return queryset.filter(
-                assigned_object_type__isnull=True,
-                assigned_object_id__isnull=True
-            )
+        return queryset.filter(
+            assigned_object_type__isnull=True,
+            assigned_object_id__isnull=True
+        )
 
 
 @register_filterset
@@ -930,25 +929,28 @@ class FHRPGroupAssignmentFilterSet(ChangeLoggedModelFilterSet):
 @register_filterset
 class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
     scope_type = MultiValueContentTypeFilter()
-    region = django_filters.NumberFilter(
+    region = MultiValueNumberFilter(
         method='filter_scope'
     )
-    site_group = django_filters.NumberFilter(
+    site_group = MultiValueNumberFilter(
         method='filter_scope'
     )
-    site = django_filters.NumberFilter(
+    site = MultiValueNumberFilter(
         method='filter_scope'
     )
-    location = django_filters.NumberFilter(
+    location = MultiValueNumberFilter(
         method='filter_scope'
     )
-    rack = django_filters.NumberFilter(
+    rack_group = MultiValueNumberFilter(
         method='filter_scope'
     )
-    cluster_group = django_filters.NumberFilter(
+    rack = MultiValueNumberFilter(
         method='filter_scope'
     )
-    cluster = django_filters.NumberFilter(
+    cluster_group = MultiValueNumberFilter(
+        method='filter_scope'
+    )
+    cluster = MultiValueNumberFilter(
         method='filter_scope'
     )
     contains_vid = django_filters.NumberFilter(
@@ -958,7 +960,7 @@ class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
 
     class Meta:
         model = VLANGroup
-        fields = ('id', 'name', 'slug', 'description', 'scope_id')
+        fields = ('id', 'name', 'slug', 'description', 'scope_id', 'total_vlan_ids')
 
     def search(self, queryset, name, value):
         if not value.strip():
@@ -973,7 +975,7 @@ class VLANGroupFilterSet(OrganizationalModelFilterSet, TenancyFilterSet):
         model_name = name.replace('_', '')
         return queryset.filter(
             scope_type=ContentType.objects.get(model=model_name),
-            scope_id=value
+            scope_id__in=value
         )
 
 
@@ -1017,6 +1019,17 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         to_field_name='slug',
         label=_('Site (slug)'),
     )
+    related_to_site = django_filters.ModelMultipleChoiceFilter(
+        queryset=Site.objects.all(),
+        method='filter_related_to_site',
+        label=_('Related to site (ID)'),
+    )
+    # get_additional_lookups() skips filters with a method.
+    related_to_site__n = django_filters.ModelMultipleChoiceFilter(
+        queryset=Site.objects.all(),
+        method='filter_related_to_site_negated',
+        label=_('Related to site (ID)'),
+    )
     group_id = django_filters.ModelMultipleChoiceFilter(
         queryset=VLANGroup.objects.all(),
         distinct=False,
@@ -1050,8 +1063,12 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         queryset=Site.objects.all(),
         method='get_for_site'
     )
+    available_at_site_group = django_filters.ModelChoiceFilter(
+        queryset=SiteGroup.objects.all(),
+        method='get_for_site_group'
+    )
     available_on_device = django_filters.ModelChoiceFilter(
-        queryset=Device.objects.all(),
+        queryset=Device.objects.select_related('cluster'),
         method='get_for_device'
     )
     available_on_virtualmachine = django_filters.ModelChoiceFilter(
@@ -1112,6 +1129,10 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         return queryset.get_for_site(value)
 
     @extend_schema_field(OpenApiTypes.STR)
+    def get_for_site_group(self, queryset, name, value):
+        return queryset.get_for_site_group(value)
+
+    @extend_schema_field(OpenApiTypes.STR)
     def get_for_device(self, queryset, name, value):
         return queryset.get_for_device(value)
 
@@ -1120,22 +1141,32 @@ class VLANFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
         return queryset.get_for_virtualmachine(value)
 
     @extend_schema_field(OpenApiTypes.INT)
+    def filter_related_to_site(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.get_related_to_sites(value)
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def filter_related_to_site_negated(self, queryset, name, value):
+        if not value:
+            return queryset
+        return queryset.get_related_to_sites(value, negate=True)
+
+    @extend_schema_field(OpenApiTypes.INT)
     def filter_interface_id(self, queryset, name, value):
         if value is None:
             return queryset.none()
-        return queryset.filter(
-            Q(interfaces_as_tagged=value) |
-            Q(interfaces_as_untagged=value)
-        ).distinct()
+        tagged = queryset.filter(interfaces_as_tagged=value)
+        untagged = queryset.filter(interfaces_as_untagged=value)
+        return queryset.filter(pk__in=tagged.union(untagged).values('pk'))
 
     @extend_schema_field(OpenApiTypes.INT)
     def filter_vminterface_id(self, queryset, name, value):
         if value is None:
             return queryset.none()
-        return queryset.filter(
-            Q(vminterfaces_as_tagged=value) |
-            Q(vminterfaces_as_untagged=value)
-        ).distinct()
+        tagged = queryset.filter(vminterfaces_as_tagged=value)
+        untagged = queryset.filter(vminterfaces_as_untagged=value)
+        return queryset.filter(pk__in=tagged.union(untagged).values('pk'))
 
 
 @register_filterset
@@ -1189,16 +1220,146 @@ class VLANTranslationRuleFilterSet(NetBoxModelFilterSet):
         return queryset.filter(qs_filter)
 
 
-@register_filterset
-class ServiceTemplateFilterSet(PrimaryModelFilterSet):
-    port = NumericArrayFilter(
-        field_name='ports',
-        lookup_expr='contains'
+# Service/ServiceTemplate port filter name -> the port lookup it applies, in the order the conditions
+# are built. See ServicePortMappingFilterMixin and ipam.utils.PORT_MAPPING_LOOKUPS.
+SERVICE_PORT_FILTERS = {
+    'port': 'exact',
+    'port__gt': 'gt',
+    'port__gte': 'gte',
+    'port__lt': 'lt',
+    'port__lte': 'lte',
+}
+
+
+class ServicePortMappingFilterMixin(django_filters.FilterSet):
+    """
+    Shared ``port_mappings``, ``protocol`` and ``port`` filtering for Service and ServiceTemplate, all
+    operating on the ``port_mappings`` array. ``protocol`` and every active ``port`` lookup are
+    correlated: they must all be satisfied by one single mapping, so ``?protocol=tcp&port__gt=1000`` does
+    not match a service whose only tcp mapping is tcp/80, and ``?port__gte=1000&port__lte=2000`` does not
+    match a service exposing only ports 500 and 5000. See ``ipam.utils.port_mapping_q``.
+    """
+    # Whole-mapping lookup, e.g. ?port_mappings=tcp/80. Each value already names one complete
+    # protocol/port pair, so this needs none of the protocol/port correlation machinery below and is
+    # simply ANDed with the other filters.
+    port_mappings = MultiValueCharFilter(
+        method='filter_port_mappings',
+        label=_('Port mapping (protocol/port)'),
     )
+    port_mappings__n = MultiValueCharFilter(
+        method='filter_port_mappings_negated',
+        label=_('Port mapping (protocol/port)'),
+    )
+    protocol = django_filters.MultipleChoiceFilter(
+        choices=ServiceProtocolChoices,
+        method='filter_protocol_noop',
+    )
+    # Negation lookup retained from when `protocol` was a model field: method-based filters don't get
+    # the char-based lookups (protocol__n, __ic, ...) auto-generated, and silently dropping protocol__n
+    # would widen existing saved filters/scripts rather than error. The __ic/__nic/__empty variants were
+    # never meaningful on a small fixed choice set and are intentionally left gone.
+    protocol__n = django_filters.MultipleChoiceFilter(
+        choices=ServiceProtocolChoices,
+        method='filter_protocol_negated',
+    )
+    # `port` and its range lookups. These are declared explicitly because a method-based filter gets no
+    # auto-generated lookups (BaseFilterSet.get_additional_lookups() skips filters with a method), and
+    # they must be correlated with `protocol` rather than applied independently. `port__empty` is
+    # intentionally absent: port_mappings is never empty on a validated object, so it was never
+    # meaningful. See ipam.utils.PORT_MAPPING_LOOKUPS for the lookup -> SQL operator mapping.
+    #
+    # `protocol` above and every `port*` lookup below (except the negations, which stand alone) are
+    # deliberately no-ops: because they must be correlated with one another they cannot be applied as each
+    # filter runs. filter_queryset() applies them together, once, after super() has applied the rest.
+    port = MultiValueNumberFilter(
+        method='filter_noop',
+    )
+    port__n = MultiValueNumberFilter(
+        method='filter_port_negated',
+    )
+    port__gt = MultiValueNumberFilter(
+        method='filter_noop',
+    )
+    port__gte = MultiValueNumberFilter(
+        method='filter_noop',
+    )
+    port__lt = MultiValueNumberFilter(
+        method='filter_noop',
+    )
+    port__lte = MultiValueNumberFilter(
+        method='filter_noop',
+    )
+
+    def filter_queryset(self, queryset):
+        """
+        Apply `protocol` and every active `port*` lookup as a single correlated predicate.
+
+        These can't be applied per-filter the way django-filter normally works: they must all be satisfied
+        by one single mapping, and a query combining N of them would otherwise emit N independent (and
+        redundant) copies of the same scan. So the individual filters are no-ops and the combined
+        predicate is built here, from the cleaned data, exactly once per call.
+        """
+        queryset = super().filter_queryset(queryset)
+
+        cleaned_data = self.form.cleaned_data
+        protocols = cleaned_data.get('protocol') or []
+        port_tests = [
+            (lookup, values)
+            for lookup, values in (
+                (lookup, cleaned_data.get(name) or [])
+                for name, lookup in SERVICE_PORT_FILTERS.items()
+            )
+            if values
+        ]
+        if not protocols and not port_tests:
+            return queryset
+
+        return queryset.filter(port_mapping_q(protocols, port_tests))
+
+    def filter_noop(self, queryset, name, value):
+        # See filter_queryset(), which applies `protocol` and the port lookups as one correlated predicate.
+        return queryset
+
+    def filter_protocol_noop(self, queryset, name, value: list[str]):
+        # A no-op like filter_noop(), from which this differs only in its type hint. `protocol` is not a
+        # model field, so the schema generator cannot infer the parameter's type from the model, and a
+        # plain MultipleChoiceFilter carries none of the @extend_schema_field annotations which the
+        # MultiValue* filters (used by the port lookups) do. The hint supplies it.
+        return self.filter_noop(queryset, name, value)
+
+    def filter_port_mappings(self, queryset, name, value: list[str]):
+        # Array overlap (&&) is served by the GIN index on port_mappings and gives the multi-value OR
+        # semantics used throughout NetBox: ?port_mappings=tcp/80&port_mappings=udp/53 matches either.
+        if not value:
+            return queryset
+        return queryset.filter(port_mappings__overlap=[normalize_port_mapping(v) for v in value])
+
+    def filter_port_mappings_negated(self, queryset, name, value: list[str]):
+        if not value:
+            return queryset
+        return queryset.exclude(port_mappings__overlap=[normalize_port_mapping(v) for v in value])
+
+    def filter_protocol_negated(self, queryset, name, value: list[str]):
+        # Exclude services exposing any of the given protocols (negation of the protocol-only lookup).
+        if not value:
+            return queryset
+        return queryset.exclude(port_mapping_q(value))
+
+    def filter_port_negated(self, queryset, name, value: list[int]):
+        # Exclude services exposing any of the given ports. Correlated with `protocol` when supplied, so
+        # ?protocol=tcp&port__n=80 excludes only services exposing tcp/80 (not those exposing udp/80).
+        if not value:
+            return queryset
+        protocols = self.form.cleaned_data.get('protocol') or []
+        return queryset.exclude(port_mapping_q(protocols, [('exact', value)]))
+
+
+@register_filterset
+class ServiceTemplateFilterSet(ServicePortMappingFilterMixin, PrimaryModelFilterSet):
 
     class Meta:
         model = ServiceTemplate
-        fields = ('id', 'name', 'protocol', 'description')
+        fields = ('id', 'name', 'description')
 
     def search(self, queryset, name, value):
         if not value.strip():
@@ -1211,7 +1372,7 @@ class ServiceTemplateFilterSet(PrimaryModelFilterSet):
 
 
 @register_filterset
-class ServiceFilterSet(ContactModelFilterSet, PrimaryModelFilterSet):
+class ServiceFilterSet(ServicePortMappingFilterMixin, ContactModelFilterSet, PrimaryModelFilterSet):
     parent_object_type = MultiValueContentTypeFilter()
     device = MultiValueCharFilter(
         method='filter_device',
@@ -1254,14 +1415,10 @@ class ServiceFilterSet(ContactModelFilterSet, PrimaryModelFilterSet):
         to_field_name='address',
         label=_('IP address'),
     )
-    port = NumericArrayFilter(
-        field_name='ports',
-        lookup_expr='contains'
-    )
 
     class Meta:
         model = Service
-        fields = ('id', 'name', 'protocol', 'description', 'parent_object_type', 'parent_object_id')
+        fields = ('id', 'name', 'description', 'parent_object_type', 'parent_object_id')
 
     def search(self, queryset, name, value):
         if not value.strip():

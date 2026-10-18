@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import random
@@ -6,12 +7,15 @@ import string
 from contextlib import contextmanager
 
 from django.contrib.auth.models import Permission
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils.text import slugify
+from PIL import Image
 
 from core.models import ObjectType
 from dcim.models import Device, DeviceRole, DeviceType, Manufacturer, Site
 from extras.choices import CustomFieldTypeChoices
 from extras.models import CustomField, Tag
+from ipam.models import IPAddress
 from users.models import User
 from virtualization.models import Cluster, ClusterType, VirtualMachine
 
@@ -54,6 +58,15 @@ def create_test_device(name, site=None, **attrs):
     return device
 
 
+def create_test_image(filename):
+    """
+    Convenience method for creating an uploaded PNG image file.
+    """
+    image = io.BytesIO()
+    Image.new('RGB', (1, 1)).save(image, format='PNG')
+    return SimpleUploadedFile(name=filename, content=image.getvalue(), content_type='image/png')
+
+
 def create_test_virtualmachine(name):
     """
     Convenience method for creating a VirtualMachine.
@@ -63,6 +76,28 @@ def create_test_virtualmachine(name):
     virtual_machine = VirtualMachine.objects.create(name=name, cluster=cluster)
 
     return virtual_machine
+
+
+def create_test_nat_ip_pair(
+    real_address='10.0.0.10/32', nat_address='198.51.100.10/32', inside_interface=None, outside_interface=None
+):
+    """
+    Convenience method for creating an inside IP and its NAT outside IP.
+
+    Optionally, assign either address to an Interface or VMInterface.
+    Returns (real_ip, nat_ip).
+    """
+    real_ip = IPAddress(address=real_address)
+    if inside_interface is not None:
+        real_ip.assigned_object = inside_interface
+    real_ip.save()
+
+    nat_ip = IPAddress(address=nat_address, nat_inside=real_ip)
+    if outside_interface is not None:
+        nat_ip.assigned_object = outside_interface
+    nat_ip.save()
+
+    return real_ip, nat_ip
 
 
 def create_test_user(username='testuser', permissions=None):
@@ -114,9 +149,15 @@ def disable_logging(level=logging.CRITICAL):
     """
     Temporarily suppress log messages at or below the specified level (default: critical).
     """
+    # Capture the current disable level so it can be restored on exit (rather than assuming
+    # NOTSET), which keeps nested calls well-behaved. The teardown runs inside a finally block so
+    # logging is always restored even if the wrapped block raises.
+    previous_level = logging.root.manager.disable
     logging.disable(level)
-    yield
-    logging.disable(logging.NOTSET)
+    try:
+        yield
+    finally:
+        logging.disable(previous_level)
 
 
 #
@@ -168,3 +209,30 @@ def get_random_string(length, charset=None):
     """
     characters = string.ascii_letters + string.digits  # a-z, A-Z, 0-9
     return ''.join(random.choice(characters) for __ in range(length))
+
+
+#
+# Database routing
+#
+
+class UnpinnedQuery(Exception):
+    """Raised when a query which should have been pinned to a connection is routed instead."""
+
+
+class PinnedConnectionRouter:
+    """
+    Fails any read or write of the given models which is not pinned to an explicit database
+    alias. Django consults DATABASE_ROUTERS only for queries which name no connection, so a
+    signal handler which threads through the alias supplied by the signal never reaches
+    this router. Each test leaves out the model being saved, as Django routes that save
+    itself.
+    """
+    def __init__(self, *models):
+        self.models = models
+
+    def _check(self, model, **hints):
+        if model in self.models:
+            raise UnpinnedQuery(f"{model.__name__} query was routed rather than pinned to a connection")
+
+    db_for_read = _check
+    db_for_write = _check

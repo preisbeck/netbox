@@ -1,14 +1,16 @@
 import json
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
+from django.contrib.contenttypes.models import ContentType
 from django.urls import reverse
 from django.utils import timezone
 from django_rq import get_queue
-from django_rq.settings import QUEUES_MAP
+from django_rq.settings import get_queues_map
 from django_rq.workers import get_worker
-from rq.job import Job as RQ_Job, JobStatus
+from rq.job import Job as RQ_Job
+from rq.job import JobStatus
 from rq.registry import DeferredJobRegistry, FailedJobRegistry, FinishedJobRegistry, StartedJobRegistry
 
 from core.choices import ObjectChangeActionChoices
@@ -16,6 +18,7 @@ from core.models import *
 from dcim.models import Site
 from users.models import User
 from utilities.testing import TestCase, ViewTestCases, create_tags, disable_logging
+from utilities.testing.mixins import RQQueueTestMixin
 
 
 class DataSourceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
@@ -102,6 +105,140 @@ class DataFileTestCase(
         )
         DataFile.objects.bulk_create(data_files)
 
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders file content inline, which may include plaintext secrets, so the
+        response must instruct the browser not to persist it to its local cache.
+        """
+        datafile = DataFile.objects.first()
+        datafile.data = b'super-secret-password'
+        datafile.save()
+
+        self.add_permissions('core.view_datafile')
+        response = self.client.get(datafile.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the content is in fact rendered in the response
+        self.assertIn('super-secret-password', str(response.content))
+
+        # Confirm the response is not cacheable
+        self.assertNotCacheable(response)
+
+
+class JobTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = Job
+
+    @classmethod
+    def setUpTestData(cls):
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///var/tmp/source1/',
+        )
+        ct = ContentType.objects.get_for_model(DataSource)
+        Job.objects.bulk_create(
+            [
+                Job(
+                    name='Job 1',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='pending',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+                Job(
+                    name='Job 2',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='running',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+                Job(
+                    name='Job 3',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='completed',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+            ]
+        )
+
+
+class JobLogViewTestCase(TestCase):
+    user_permissions = (
+        'core.view_job',
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.job = Job.objects.create(
+            name='Test Job',
+            job_id=uuid.uuid4(),
+        )
+        cls.job.log_entries = [
+            {
+                'level': 'info',
+                'message': f'log line {i}',
+                'timestamp': datetime(2026, 1, 1, tzinfo=UTC),
+            }
+            for i in range(120)
+        ]
+        cls.job.save()
+
+    def setUp(self):
+        super().setUp()
+        # Pin per_page so page-boundary assertions don't depend on PAGINATE_COUNT.
+        self.user.config.data = {'pagination': {'per_page': 50}}
+        self.user.config.save()
+
+    def test_log_page_renders_table_inline(self):
+        """The full page renders the first log page inside an HTMX container."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'htmx-container')
+        self.assertContains(response, 'log line 0')
+        self.assertContains(response, 'Showing 1-50 of 120')
+
+    def test_log_page_table_is_embedded(self):
+        """The embedded table never pushes page/per_page into the browser URL."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, 'hx-push-url="true"')
+
+    def test_log_table_htmx_renders_partial(self):
+        """An HTMX request returns the paginated table partial."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url, headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 0')
+        self.assertContains(response, 'Showing 1-50 of 120')
+        self.assertContains(response, 'Per Page')
+
+    def test_log_table_htmx_page_navigation(self):
+        """`?page=2` advances the embedded table to the second page."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(f'{url}?page=2', headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 50')
+        self.assertNotContains(response, 'log line 49')
+
+    def test_log_table_htmx_per_page(self):
+        """`?per_page=100` widens the embedded table page size."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(f'{url}?per_page=100', headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 99')
+        self.assertNotContains(response, 'log line 100')
+
 
 # TODO: Convert to StandardTestCases.Views
 class ObjectChangeTestCase(TestCase):
@@ -140,7 +277,7 @@ class ObjectChangeTestCase(TestCase):
         self.assertHttpStatus(response, 200)
 
 
-class BackgroundTaskTestCase(TestCase):
+class BackgroundTaskTestCase(RQQueueTestMixin, TestCase):
     user_permissions = ()
 
     # Dummy worker functions
@@ -161,11 +298,6 @@ class BackgroundTaskTestCase(TestCase):
         self.user.is_superuser = True
         self.user.is_active = True
         self.user.save()
-
-        # Clear all queues prior to running each test
-        get_queue('default').connection.flushall()
-        get_queue('high').connection.flushall()
-        get_queue('low').connection.flushall()
 
     def test_background_queue_list(self):
         url = reverse('core:background_queue_list')
@@ -188,7 +320,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_list_default(self):
         queue = get_queue('default')
         queue.enqueue(self.dummy_job_default)
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
 
         response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'queued']))
         self.assertEqual(response.status_code, 200)
@@ -197,7 +329,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_list_high(self):
         queue = get_queue('high')
         queue.enqueue(self.dummy_job_high)
-        queue_index = QUEUES_MAP['high']
+        queue_index = get_queues_map()['high']
 
         response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'queued']))
         self.assertEqual(response.status_code, 200)
@@ -206,7 +338,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_list_finished(self):
         queue = get_queue('default')
         job = queue.enqueue(self.dummy_job_default)
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
 
         registry = FinishedJobRegistry(queue.name, queue.connection)
         registry.add(job, 2)
@@ -217,7 +349,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_list_failed(self):
         queue = get_queue('default')
         job = queue.enqueue(self.dummy_job_default)
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
 
         registry = FailedJobRegistry(queue.name, queue.connection)
         registry.add(job, 2)
@@ -228,7 +360,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_scheduled(self):
         queue = get_queue('default')
         queue.enqueue_at(datetime.now(), self.dummy_job_default)
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
 
         response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'scheduled']))
         self.assertEqual(response.status_code, 200)
@@ -237,7 +369,7 @@ class BackgroundTaskTestCase(TestCase):
     def test_background_tasks_list_deferred(self):
         queue = get_queue('default')
         job = queue.enqueue(self.dummy_job_default)
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
 
         registry = DeferredJobRegistry(queue.name, queue.connection)
         registry.add(job, 2)
@@ -271,9 +403,8 @@ class BackgroundTaskTestCase(TestCase):
 
         # Enqueue & run a job that will fail
         job = queue.enqueue(self.dummy_job_failing)
-        worker = get_worker('default')
         with disable_logging():
-            worker.work(burst=True)
+            self.run_rq_jobs('default')
         self.assertTrue(job.is_failed)
 
         # Re-enqueue the failed job and check that its status has been reset
@@ -309,8 +440,11 @@ class BackgroundTaskTestCase(TestCase):
 
         worker = get_worker('default')
         job = queue.enqueue(self.dummy_job_default)
-        worker.prepare_job_execution(job)
-        worker.prepare_execution(job)
+        # prepare_job_execution() invokes the worker heartbeat, which logs a "re-registering"
+        # warning for this freshly-created (unregistered) worker; suppress the expected noise.
+        with disable_logging():
+            worker.prepare_job_execution(job)
+            worker.prepare_execution(job)
 
         self.assertEqual(job.get_status(), JobStatus.STARTED)
 
@@ -334,7 +468,7 @@ class BackgroundTaskTestCase(TestCase):
         worker2 = get_worker('high')
         worker2.register_birth()
 
-        queue_index = QUEUES_MAP['default']
+        queue_index = get_queues_map()['default']
         response = self.client.get(reverse('core:worker_list', args=[queue_index]))
         self.assertEqual(response.status_code, 200)
         self.assertIn(str(worker1.name), str(response.content))
@@ -372,6 +506,7 @@ class SystemTestCase(TestCase):
         self.assertIn('plugins', data)
         self.assertIn('config', data)
         self.assertIn('objects', data)
+        self.assertIn('db_schema', data)
 
     def test_system_view_with_config_revision(self):
         ConfigRevision.objects.create()

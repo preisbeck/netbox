@@ -4,6 +4,7 @@ from django.utils.translation import gettext_lazy as _
 from circuits.models import *
 from netbox.tables import NetBoxTable, OrganizationalModelTable, PrimaryModelTable, columns
 from tenancy.tables import ContactsColumnMixin, TenancyColumnsMixin
+
 from .columns import CommitRateColumn
 
 __all__ = (
@@ -81,6 +82,7 @@ class CircuitTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
         url_name='circuits:circuit_list'
     )
     assignments = columns.ManyToManyColumn(
+        accessor='group_assignments',
         verbose_name=_('Assignments'),
         linkify_item=True
     )
@@ -158,7 +160,7 @@ class CircuitTerminationTable(NetBoxTable):
         )
 
 
-class CircuitGroupTable(OrganizationalModelTable):
+class CircuitGroupTable(TenancyColumnsMixin, OrganizationalModelTable):
     name = tables.Column(
         verbose_name=_('Name'),
         linkify=True
@@ -175,8 +177,8 @@ class CircuitGroupTable(OrganizationalModelTable):
     class Meta(OrganizationalModelTable.Meta):
         model = CircuitGroup
         fields = (
-            'pk', 'name', 'description', 'circuit_group_assignment_count', 'comments', 'tags',
-            'created', 'last_updated', 'actions',
+            'pk', 'name', 'description', 'circuit_group_assignment_count', 'tenant', 'tenant_group', 'comments',
+            'tags', 'created', 'last_updated', 'actions',
         )
         default_columns = ('pk', 'name', 'description', 'circuit_group_assignment_count')
 
@@ -189,14 +191,16 @@ class CircuitGroupAssignmentTable(NetBoxTable):
     provider = tables.Column(
         accessor='member__provider',
         verbose_name=_('Provider'),
-        linkify=True
+        orderable=False,
+        linkify=True,
     )
     member_type = columns.ContentTypeColumn(
         verbose_name=_('Type')
     )
     member = tables.Column(
         verbose_name=_('Circuit'),
-        linkify=True
+        orderable=False,
+        linkify=True,
     )
     priority = tables.Column(
         verbose_name=_('Priority'),

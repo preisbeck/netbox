@@ -1,24 +1,32 @@
 from django import forms
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.postgres.forms import SimpleArrayField
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils.translation import gettext_lazy as _
 
-from dcim.models import Device, Interface, Site
 from dcim.forms.mixins import ScopedImportForm
+from dcim.models import Device, Interface, Site
 from ipam.choices import *
 from ipam.constants import *
 from ipam.models import *
+from ipam.utils import expand_port_mapping, split_port_mapping
+from ipam.validators import validate_port_mappings
 from netbox.forms import NetBoxModelImportForm, OrganizationalModelImportForm, PrimaryModelImportForm
 from tenancy.models import Tenant
 from utilities.forms.fields import (
-    CSVChoiceField, CSVContentTypeField, CSVModelChoiceField, CSVModelMultipleChoiceField, SlugField,
+    CSVChoiceField,
+    CSVContentTypeField,
+    CSVModelChoiceField,
+    CSVModelMultipleChoiceField,
     NumericRangeArrayField,
+    SlugField,
 )
 from virtualization.models import VirtualMachine, VMInterface
 
 __all__ = (
-    'AggregateImportForm',
     'ASNImportForm',
     'ASNRangeImportForm',
+    'AggregateImportForm',
     'FHRPGroupImportForm',
     'IPAddressImportForm',
     'IPRangeImportForm',
@@ -28,8 +36,8 @@ __all__ = (
     'RouteTargetImportForm',
     'ServiceImportForm',
     'ServiceTemplateImportForm',
-    'VLANImportForm',
     'VLANGroupImportForm',
+    'VLANImportForm',
     'VLANTranslationPolicyImportForm',
     'VLANTranslationRuleImportForm',
     'VRFImportForm',
@@ -134,6 +142,13 @@ class ASNImportForm(PrimaryModelImportForm):
         to_field_name='name',
         help_text=_('Assigned RIR')
     )
+    role = CSVModelChoiceField(
+        label=_('Role'),
+        queryset=Role.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Functional role')
+    )
     tenant = CSVModelChoiceField(
         label=_('Tenant'),
         queryset=Tenant.objects.all(),
@@ -144,7 +159,7 @@ class ASNImportForm(PrimaryModelImportForm):
 
     class Meta:
         model = ASN
-        fields = ('asn', 'rir', 'tenant', 'description', 'owner', 'comments', 'tags')
+        fields = ('asn', 'rir', 'role', 'tenant', 'description', 'owner', 'comments', 'tags')
 
 
 class RoleImportForm(OrganizationalModelImportForm):
@@ -206,8 +221,8 @@ class PrefixImportForm(ScopedImportForm, PrimaryModelImportForm):
     class Meta:
         model = Prefix
         fields = (
-            'prefix', 'vrf', 'tenant', 'vlan_group', 'vlan_site', 'vlan', 'status', 'role', 'scope_type', 'scope_id',
-            'is_pool', 'mark_utilized', 'description', 'owner', 'comments', 'tags',
+            'prefix', 'vrf', 'tenant', 'vlan_group', 'vlan_site', 'vlan', 'status', 'role', 'scope_type', 'scope_name',
+            'scope_id', 'is_pool', 'mark_utilized', 'description', 'owner', 'comments', 'tags',
         )
         labels = {
             'scope_id': _('Scope ID'),
@@ -368,15 +383,13 @@ class IPAddressImportForm(PrimaryModelImportForm):
         # Make sure is_primary is None when it's not included in the uploaded data
         if 'is_primary' not in self.data:
             return None
-        else:
-            return self.cleaned_data['is_primary']
+        return self.cleaned_data['is_primary']
 
     def clean_is_oob(self):
         # Make sure is_oob is None when it's not included in the uploaded data
         if 'is_oob' not in self.data:
             return None
-        else:
-            return self.cleaned_data['is_oob']
+        return self.cleaned_data['is_oob']
 
     def clean(self):
         super().clean()
@@ -420,19 +433,38 @@ class IPAddressImportForm(PrimaryModelImportForm):
         ipaddress = super().save(*args, **kwargs)
 
         # Set as primary for device/VM
-        if self.cleaned_data.get('is_primary') is not None:
-            parent = self.cleaned_data.get('device') or self.cleaned_data.get('virtual_machine')
-            if self.instance.address.version == 4:
-                parent.primary_ip4 = ipaddress if self.cleaned_data.get('is_primary') else None
-            elif self.instance.address.version == 6:
-                parent.primary_ip6 = ipaddress if self.cleaned_data.get('is_primary') else None
-            parent.save()
+        parent = self.cleaned_data.get('device') or self.cleaned_data.get('virtual_machine')
+        if parent and self.cleaned_data.get('is_primary') is not None:
+            if self.cleaned_data.get('is_primary'):
+                parent.snapshot()
+                if self.instance.address.version == 4:
+                    parent.primary_ip4 = ipaddress
+                elif self.instance.address.version == 6:
+                    parent.primary_ip6 = ipaddress
+                parent.save()
+            else:
+                # Only clear the primary IP if this IP is currently set as primary
+                if self.instance.address.version == 4 and parent.primary_ip4 == ipaddress:
+                    parent.snapshot()
+                    parent.primary_ip4 = None
+                    parent.save()
+                elif self.instance.address.version == 6 and parent.primary_ip6 == ipaddress:
+                    parent.snapshot()
+                    parent.primary_ip6 = None
+                    parent.save()
 
         # Set as OOB for device
-        if self.cleaned_data.get('is_oob') is not None:
-            parent = self.cleaned_data.get('device')
-            parent.oob_ip = ipaddress if self.cleaned_data.get('is_oob') else None
-            parent.save()
+        parent = self.cleaned_data.get('device')
+        if parent and self.cleaned_data.get('is_oob') is not None:
+            if self.cleaned_data.get('is_oob'):
+                parent.snapshot()
+                parent.oob_ip = ipaddress
+                parent.save()
+            elif parent.oob_ip == ipaddress:
+                # Only clear OOB if this IP is currently set as the OOB IP
+                parent.snapshot()
+                parent.oob_ip = None
+                parent.save()
 
         return ipaddress
 
@@ -453,7 +485,8 @@ class FHRPGroupImportForm(PrimaryModelImportForm):
         fields = ('protocol', 'group_id', 'auth_type', 'auth_key', 'name', 'description', 'owner', 'comments', 'tags')
 
 
-class VLANGroupImportForm(OrganizationalModelImportForm):
+class VLANGroupImportForm(ScopedImportForm, OrganizationalModelImportForm):
+    # Override ScopedImportForm.scope_type to set custom queryset
     scope_type = CSVContentTypeField(
         queryset=ContentType.objects.filter(model__in=VLANGROUP_SCOPE_TYPES),
         required=False,
@@ -473,10 +506,11 @@ class VLANGroupImportForm(OrganizationalModelImportForm):
     class Meta:
         model = VLANGroup
         fields = (
-            'name', 'slug', 'scope_type', 'scope_id', 'vid_ranges', 'tenant', 'description', 'owner', 'comments', 'tags'
+            'name', 'slug', 'scope_type', 'scope_name', 'scope_id', 'vid_ranges', 'tenant', 'description', 'owner',
+            'comments', 'tags',
         )
         labels = {
-            'scope_id': 'Scope ID',
+            'scope_id': _('Scope ID'),
         }
 
 
@@ -556,19 +590,49 @@ class VLANTranslationRuleImportForm(NetBoxModelImportForm):
         fields = ('policy', 'local_vid', 'remote_vid')
 
 
-class ServiceTemplateImportForm(PrimaryModelImportForm):
-    protocol = CSVChoiceField(
-        label=_('Protocol'),
-        choices=ServiceProtocolChoices,
-        help_text=_('IP protocol')
+class ServicePortMappingsImportMixin(forms.Form):
+    """
+    Adds a ``port_mappings`` CSV column parsed from a comma-separated list of ``protocol/port`` pairs
+    (e.g. "tcp/80,udp/53") into the model's flat ``['tcp/80', 'udp/53']`` list. A pair's port half may be
+    a hyphen range (e.g. "tcp/8000-8010"), matching the port syntax the edit form accepts.
+    """
+    port_mappings = SimpleArrayField(
+        base_field=forms.CharField(),
+        label=_('Port mappings'),
+        required=True,
+        help_text=_('Comma-separated list of protocol/port pairs in double quotes (e.g. "tcp/80,udp/53"). '
+                    'A port range may be given with a hyphen (e.g. "tcp/8000-8010").')
     )
+
+    def clean_port_mappings(self):
+        mappings = self.cleaned_data.get('port_mappings')
+        if not mappings:
+            return []
+        # Expand any hyphen range in a pair's port half (tcp/8000-8010 -> tcp/8000, tcp/8001, ...) so the
+        # CSV accepts the same port syntax as the edit form. validate_port_mappings then normalizes and
+        # checks each expanded pair, matching the protocol case-insensitively.
+        expanded = []
+        for mapping in mappings:
+            protocol, ports = split_port_mapping(mapping.strip())
+            try:
+                expanded.extend(expand_port_mapping(protocol, ports))
+            except DjangoValidationError as exc:
+                raise forms.ValidationError(exc.messages)
+        try:
+            expanded = validate_port_mappings(expanded)
+        except DjangoValidationError as exc:
+            raise forms.ValidationError(exc.messages)
+        return expanded
+
+
+class ServiceTemplateImportForm(ServicePortMappingsImportMixin, PrimaryModelImportForm):
 
     class Meta:
         model = ServiceTemplate
-        fields = ('name', 'protocol', 'ports', 'description', 'owner', 'comments', 'tags')
+        fields = ('name', 'port_mappings', 'description', 'owner', 'comments', 'tags')
 
 
-class ServiceImportForm(PrimaryModelImportForm):
+class ServiceImportForm(ServicePortMappingsImportMixin, PrimaryModelImportForm):
     parent_object_type = CSVContentTypeField(
         queryset=ContentType.objects.filter(SERVICE_ASSIGNMENT_MODELS),
         required=True,
@@ -585,11 +649,6 @@ class ServiceImportForm(PrimaryModelImportForm):
         required=False,
         help_text=_('Parent object ID'),
     )
-    protocol = CSVChoiceField(
-        label=_('Protocol'),
-        choices=ServiceProtocolChoices,
-        help_text=_('IP protocol')
-    )
     ipaddresses = CSVModelMultipleChoiceField(
         queryset=IPAddress.objects.all(),
         required=False,
@@ -600,7 +659,7 @@ class ServiceImportForm(PrimaryModelImportForm):
     class Meta:
         model = Service
         fields = (
-            'ipaddresses', 'name', 'protocol', 'ports', 'description', 'owner', 'comments', 'tags',
+            'ipaddresses', 'name', 'port_mappings', 'description', 'owner', 'comments', 'tags',
         )
 
     def __init__(self, data=None, *args, **kwargs):

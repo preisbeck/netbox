@@ -1,33 +1,47 @@
+import django_filters
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import Prefetch
 from django.db.models.expressions import RawSQL
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
+from django_filters.constants import EMPTY_VALUES
 
 from circuits.models import Provider
 from dcim.filtersets import InterfaceFilterSet
 from dcim.forms import InterfaceFilterForm
 from dcim.models import Device, Interface, Site
-from ipam.tables import VLANTranslationRuleTable
+from extras.ui.panels import CustomFieldsPanel, TagsPanel
 from netbox.object_actions import AddObject, BulkDelete, BulkEdit, BulkExport, BulkImport
+from netbox.ui import actions, layout
+from netbox.ui.breadcrumbs import Breadcrumb, filtered_list_url
+from netbox.ui.panels import (
+    CommentsPanel,
+    ContextTablePanel,
+    ObjectsTablePanel,
+    PluginContentPanel,
+    RelatedObjectsPanel,
+    TemplatePanel,
+)
 from netbox.views import generic
 from utilities.query import count_related
 from utilities.tables import get_table_ordering
-from utilities.views import GetRelatedModelsMixin, ViewTab, register_model_view
+from utilities.views import GetRelatedModelsMixin, GetReturnURLMixin, ViewTab, register_model_view
 from virtualization.filtersets import VMInterfaceFilterSet
 from virtualization.forms import VMInterfaceFilterForm
 from virtualization.models import VirtualMachine, VMInterface
+
 from . import filtersets, forms, tables
 from .choices import PrefixStatusChoices
 from .constants import *
 from .models import *
-from .utils import add_requested_prefixes, add_available_vlans, annotate_ip_space
-
+from .ui import panels
+from .utils import add_available_vlans, add_requested_prefixes, annotate_ip_space
 
 #
 # VRFs
 #
+
 
 @register_model_view(VRF, 'list', path='', detail=False)
 class VRFListView(generic.ObjectListView):
@@ -40,6 +54,35 @@ class VRFListView(generic.ObjectListView):
 @register_model_view(VRF)
 class VRFView(GetRelatedModelsMixin, generic.ObjectView):
     queryset = VRF.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.Layout(
+        layout.Row(
+            layout.Column(
+                panels.VRFPanel(),
+                TagsPanel(),
+                PluginContentPanel('left_page'),
+            ),
+            layout.Column(
+                RelatedObjectsPanel(),
+                CustomFieldsPanel(),
+                CommentsPanel(),
+                PluginContentPanel('right_page'),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                ContextTablePanel('import_targets_table', title=_('Import route targets')),
+            ),
+            layout.Column(
+                ContextTablePanel('export_targets_table', title=_('Export route targets')),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
+            ),
+        ),
+    )
 
     def get_extra_context(self, request, instance):
         import_targets_table = tables.RouteTargetTable(
@@ -133,6 +176,58 @@ class RouteTargetListView(generic.ObjectListView):
 @register_model_view(RouteTarget)
 class RouteTargetView(generic.ObjectView):
     queryset = RouteTarget.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.Layout(
+        layout.Row(
+            layout.Column(
+                panels.RouteTargetPanel(),
+                TagsPanel(),
+                PluginContentPanel('left_page'),
+            ),
+            layout.Column(
+                CustomFieldsPanel(),
+                CommentsPanel(),
+                PluginContentPanel('right_page'),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                ObjectsTablePanel(
+                    'ipam.vrf',
+                    filters={'import_target_id': lambda ctx: ctx['object'].pk},
+                    title=_('Importing VRFs'),
+                ),
+            ),
+            layout.Column(
+                ObjectsTablePanel(
+                    'ipam.vrf',
+                    filters={'export_target_id': lambda ctx: ctx['object'].pk},
+                    title=_('Exporting VRFs'),
+                ),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                ObjectsTablePanel(
+                    'vpn.l2vpn',
+                    filters={'import_target_id': lambda ctx: ctx['object'].pk},
+                    title=_('Importing L2VPNs'),
+                ),
+            ),
+            layout.Column(
+                ObjectsTablePanel(
+                    'vpn.l2vpn',
+                    filters={'export_target_id': lambda ctx: ctx['object'].pk},
+                    title=_('Exporting L2VPNs'),
+                ),
+            ),
+        ),
+        layout.Row(
+            layout.Column(
+                PluginContentPanel('full_width_page'),
+            ),
+        ),
+    )
 
 
 @register_model_view(RouteTarget, 'add', detail=False)
@@ -191,6 +286,17 @@ class RIRListView(generic.ObjectListView):
 @register_model_view(RIR)
 class RIRView(GetRelatedModelsMixin, generic.ObjectView):
     queryset = RIR.objects.all()
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.RIRPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            RelatedObjectsPanel(),
+            CommentsPanel(),
+            CustomFieldsPanel(),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         return {
@@ -255,7 +361,21 @@ class ASNRangeListView(generic.ObjectListView):
 
 @register_model_view(ASNRange)
 class ASNRangeView(generic.ObjectView):
+    template_name = 'generic/object.html'
     queryset = ASNRange.objects.all()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('rir', url=filtered_list_url('ipam:asnrange_list', 'rir_id')),
+        ],
+        left_panels=[
+            panels.ASNRangePanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            CommentsPanel(),
+            CustomFieldsPanel(),
+        ],
+    )
 
 
 @register_model_view(ASNRange, 'asns')
@@ -335,7 +455,22 @@ class ASNListView(generic.ObjectListView):
 
 @register_model_view(ASN)
 class ASNView(GetRelatedModelsMixin, generic.ObjectView):
+    template_name = 'generic/object.html'
     queryset = ASN.objects.all()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('rir', url=filtered_list_url('ipam:asn_list', 'rir_id')),
+        ],
+        left_panels=[
+            panels.ASNPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            RelatedObjectsPanel(),
+            CustomFieldsPanel(),
+            CommentsPanel(),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         return {
@@ -410,11 +545,87 @@ class AggregateListView(generic.ObjectListView):
 
 @register_model_view(Aggregate)
 class AggregateView(generic.ObjectView):
+    template_name = 'generic/object.html'
     queryset = Aggregate.objects.all()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('rir', url=filtered_list_url('ipam:aggregate_list', 'rir_id')),
+        ],
+        left_panels=[
+            panels.AggregatePanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+    )
+
+
+class ChildAvailabilityMixin:
+    """
+    Mixin for ObjectChildrenView subclasses that render synthetic "available" rows
+    (available IP space, prefixes, or VLANs) and must suppress them when the request
+    activates a child object filter, so objects excluded by the filter are not
+    misrepresented as available space.
+    """
+
+    def _get_detection_filterset(self, request):
+        """
+        Return the bound FilterSet used to evaluate the request, or None if the view declares no
+        filterset. ObjectChildrenView.get() has already built one and validated its form while
+        resolving the child queryset, so reuse it rather than paying for a second FilterSet:
+        get_filters() regenerates every dynamic lookup variant and NetBoxModelFilterSet.__init__
+        queries the custom fields for the model. Build one only for direct calls where get() has
+        not run.
+        """
+        if self.filterset_instance is not None:
+            return self.filterset_instance
+        if self.filterset is None:
+            return None
+
+        return self.filterset(request.GET, request=request)
+
+    def _has_active_child_filters(self, request):
+        """
+        Return True if the request supplies a valid, non-empty value for any filter declared by
+        the view's filterset. Saved filters are expanded during filterset instantiation and
+        dynamic custom field filters are registered on the instance, so both are detected.
+        Permission constraints and parent scoping never appear in the request, so they cannot
+        affect the result. The result is memoized because a single request evaluates it from
+        both prep_table_data and get_extra_context.
+        """
+        if hasattr(self, '_active_child_filters'):
+            return self._active_child_filters
+
+        self._active_child_filters = False
+
+        # An empty request cannot activate a filter, so skip validating a form for nothing.
+        if not request.GET:
+            return False
+
+        filterset = self._get_detection_filterset(request)
+        if filterset is None:
+            return False
+
+        # A non-empty cleaned value means the request activated a declared filter. Emptiness
+        # follows each filter's own semantics, so absent multi-value fields stay inactive.
+        # This is a no-op for a reused FilterSet: .qs validated the form to build the queryset.
+        filterset.form.is_valid()
+        for name, value in filterset.form.cleaned_data.items():
+            if isinstance(filterset.filters[name], django_filters.MultipleChoiceFilter):
+                if value:  # mirrors MultipleChoiceFilter.filter()
+                    self._active_child_filters = True
+                    break
+            elif value not in EMPTY_VALUES:  # mirrors Filter.filter()
+                self._active_child_filters = True
+                break
+
+        return self._active_child_filters
 
 
 @register_model_view(Aggregate, 'prefixes')
-class AggregatePrefixesView(generic.ObjectChildrenView):
+class AggregatePrefixesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Aggregate.objects.all()
     child_model = Prefix
     table = tables.PrefixTable
@@ -438,13 +649,21 @@ class AggregatePrefixesView(generic.ObjectChildrenView):
         show_available = bool(request.GET.get('show_available', 'true') == 'true')
         show_assigned = bool(request.GET.get('show_assigned', 'true') == 'true')
 
+        if show_available and self._has_active_child_filters(request):
+            show_available = False
+
         return add_requested_prefixes(parent.prefix, queryset, show_available, show_assigned)
 
     def get_extra_context(self, request, instance):
+        show_available = (
+            bool(request.GET.get('show_available', 'true') == 'true') and
+            not self._has_active_child_filters(request)
+        )
+
         return {
             'bulk_querystring': f'within={instance.prefix}',
             'first_available_prefix': instance.get_first_available_prefix(),
-            'show_available': bool(request.GET.get('show_available', 'true') == 'true'),
+            'show_available': show_available,
             'show_assigned': bool(request.GET.get('show_assigned', 'true') == 'true'),
         }
 
@@ -495,7 +714,8 @@ class RoleListView(generic.ObjectListView):
     queryset = Role.objects.annotate(
         prefix_count=count_related(Prefix, 'role'),
         iprange_count=count_related(IPRange, 'role'),
-        vlan_count=count_related(VLAN, 'role')
+        vlan_count=count_related(VLAN, 'role'),
+        asn_count=count_related(ASN, 'role')
     )
     filterset = filtersets.RoleFilterSet
     filterset_form = forms.RoleFilterForm
@@ -505,6 +725,17 @@ class RoleListView(generic.ObjectListView):
 @register_model_view(Role)
 class RoleView(GetRelatedModelsMixin, generic.ObjectView):
     queryset = Role.objects.all()
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.RolePanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            RelatedObjectsPanel(),
+            CommentsPanel(),
+            CustomFieldsPanel(),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         return {
@@ -568,15 +799,26 @@ class PrefixListView(generic.ObjectListView):
 @register_model_view(Prefix)
 class PrefixView(generic.ObjectView):
     queryset = Prefix.objects.all()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('vrf', url=filtered_list_url('ipam:prefix_list', 'vrf_id')),
+        ],
+        left_panels=[
+            panels.PrefixPanel(),
+        ],
+        right_panels=[
+            TemplatePanel('ipam/panels/prefix_addressing.html'),
+            CustomFieldsPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+        bottom_panels=[
+            ContextTablePanel('duplicate_prefix_table', title=_('Duplicate prefixes')),
+            ContextTablePanel('parent_prefix_table', title=_('Parent prefixes')),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
-        try:
-            aggregate = Aggregate.objects.restrict(request.user, 'view').get(
-                prefix__net_contains_or_equals=str(instance.prefix)
-            )
-        except Aggregate.DoesNotExist:
-            aggregate = None
-
         # Parent prefixes table
         parent_prefixes = Prefix.objects.restrict(request.user, 'view').filter(
             Q(vrf=instance.vrf) | Q(vrf__isnull=True, status=PrefixStatusChoices.STATUS_CONTAINER)
@@ -607,15 +849,16 @@ class PrefixView(generic.ObjectView):
         )
         duplicate_prefix_table.configure(request)
 
-        return {
-            'aggregate': aggregate,
+        context = {
             'parent_prefix_table': parent_prefix_table,
-            'duplicate_prefix_table': duplicate_prefix_table,
         }
+        if duplicate_prefixes.exists():
+            context['duplicate_prefix_table'] = duplicate_prefix_table
+        return context
 
 
 @register_model_view(Prefix, 'prefixes')
-class PrefixPrefixesView(generic.ObjectChildrenView):
+class PrefixPrefixesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Prefix.objects.all()
     child_model = Prefix
     table = tables.PrefixTable
@@ -639,13 +882,21 @@ class PrefixPrefixesView(generic.ObjectChildrenView):
         show_available = bool(request.GET.get('show_available', 'true') == 'true')
         show_assigned = bool(request.GET.get('show_assigned', 'true') == 'true')
 
+        if show_available and self._has_active_child_filters(request):
+            show_available = False
+
         return add_requested_prefixes(parent.prefix, queryset, show_available, show_assigned)
 
     def get_extra_context(self, request, instance):
+        show_available = (
+            bool(request.GET.get('show_available', 'true') == 'true') and
+            not self._has_active_child_filters(request)
+        )
+
         return {
             'bulk_querystring': f"vrf_id={instance.vrf.pk if instance.vrf else '0'}&within={instance.prefix}",
             'first_available_prefix': instance.get_first_available_prefix(),
-            'show_available': bool(request.GET.get('show_available', 'true') == 'true'),
+            'show_available': show_available,
             'show_assigned': bool(request.GET.get('show_assigned', 'true') == 'true'),
         }
 
@@ -678,7 +929,7 @@ class PrefixIPRangesView(generic.ObjectChildrenView):
 
 
 @register_model_view(Prefix, 'ipaddresses', path='ip-addresses')
-class PrefixIPAddressesView(generic.ObjectChildrenView):
+class PrefixIPAddressesView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = Prefix.objects.all()
     child_model = IPAddress
     table = tables.AnnotatedIPAddressTable
@@ -696,9 +947,13 @@ class PrefixIPAddressesView(generic.ObjectChildrenView):
         return parent.get_child_ips().restrict(request.user, 'view').prefetch_related('vrf', 'tenant', 'tenant__group')
 
     def prep_table_data(self, request, queryset, parent):
-        if not request.GET.get('q') and not get_table_ordering(request, self.table):
-            return annotate_ip_space(parent)
-        return queryset
+        # Ordering is checked first: it reads request.GET directly, so a sorted request never
+        # builds the detection filterset.
+        if not get_table_ordering(request, self.table) and not self._has_active_child_filters(request):
+            ip_ranges = parent.get_child_ranges(mark_populated=True).restrict(request.user, 'view')
+            return annotate_ip_space(parent, ip_addresses=queryset, ip_ranges=ip_ranges)
+
+        return super().prep_table_data(request, queryset, parent)
 
     def get_extra_context(self, request, instance):
         return {
@@ -712,11 +967,21 @@ class PrefixIPAddressesView(generic.ObjectChildrenView):
 class PrefixEditView(generic.ObjectEditView):
     queryset = Prefix.objects.all()
     form = forms.PrefixForm
+    template_name = 'ipam/prefix_edit.html'
 
 
 @register_model_view(Prefix, 'delete')
 class PrefixDeleteView(generic.ObjectDeleteView):
     queryset = Prefix.objects.all()
+
+
+@register_model_view(Prefix, 'bulk_add', path='bulk-add', detail=False)
+class PrefixBulkCreateView(generic.BulkCreateView):
+    queryset = Prefix.objects.all()
+    form = forms.IPNetworkBulkCreateForm
+    model_form = forms.PrefixBulkAddForm
+    pattern_target = 'prefix'
+    template_name = 'ipam/prefix_bulk_add.html'
 
 
 @register_model_view(Prefix, 'bulk_import', path='import', detail=False)
@@ -754,7 +1019,24 @@ class IPRangeListView(generic.ObjectListView):
 
 @register_model_view(IPRange)
 class IPRangeView(generic.ObjectView):
+    template_name = 'generic/object.html'
     queryset = IPRange.objects.all()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('vrf', url=filtered_list_url('ipam:iprange_list', 'vrf_id')),
+        ],
+        left_panels=[
+            panels.IPRangePanel(),
+        ],
+        right_panels=[
+            TagsPanel(),
+            CustomFieldsPanel(),
+            CommentsPanel(),
+        ],
+        bottom_panels=[
+            ContextTablePanel('parent_prefixes_table', title=_('Parent prefixes')),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
 
@@ -851,7 +1133,28 @@ class IPAddressListView(generic.ObjectListView):
 
 @register_model_view(IPAddress)
 class IPAddressView(generic.ObjectView):
+    template_name = 'generic/object.html'
     queryset = IPAddress.objects.prefetch_related('vrf__tenant', 'tenant')
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('vrf', url=filtered_list_url('ipam:ipaddress_list', 'vrf_id')),
+        ],
+        left_panels=[
+            panels.IPAddressPanel(),
+            TagsPanel(),
+            CustomFieldsPanel(),
+            CommentsPanel(),
+        ],
+        right_panels=[
+            ContextTablePanel('parent_prefixes_table', title=_('Parent prefixes')),
+            ContextTablePanel('duplicate_ips_table', title=_('Duplicate IPs')),
+            ObjectsTablePanel(
+                'ipam.service',
+                filters={'ip_address_id': lambda ctx: ctx['object'].pk},
+                title=_('Application services'),
+            ),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         # Parent prefixes table
@@ -884,10 +1187,12 @@ class IPAddressView(generic.ObjectView):
         duplicate_ips_table = tables.IPAddressTable(duplicate_ips[:10], orderable=False)
         duplicate_ips_table.configure(request)
 
-        return {
+        context = {
             'parent_prefixes_table': parent_prefixes_table,
-            'duplicate_ips_table': duplicate_ips_table,
         }
+        if duplicate_ips.exists():
+            context['duplicate_ips_table'] = duplicate_ips_table
+        return context
 
 
 @register_model_view(IPAddress, 'add', detail=False)
@@ -922,14 +1227,14 @@ class IPAddressEditView(generic.ObjectEditView):
     def get_extra_addanother_params(self, request):
         if 'interface' in request.GET:
             return {'interface': request.GET['interface']}
-        elif 'vminterface' in request.GET:
+        if 'vminterface' in request.GET:
             return {'vminterface': request.GET['vminterface']}
         return {}
 
 
 # TODO: Standardize or remove this view
 @register_model_view(IPAddress, 'assign', path='assign', detail=False)
-class IPAddressAssignView(generic.ObjectView):
+class IPAddressAssignView(GetReturnURLMixin, generic.ObjectView):
     """
     Search for IPAddresses to be assigned to an Interface.
     """
@@ -948,7 +1253,7 @@ class IPAddressAssignView(generic.ObjectView):
 
         return render(request, 'ipam/ipaddress_assign.html', {
             'form': form,
-            'return_url': request.GET.get('return_url', ''),
+            'return_url': self.get_return_url(request),
         })
 
     def post(self, request):
@@ -965,7 +1270,7 @@ class IPAddressAssignView(generic.ObjectView):
         return render(request, 'ipam/ipaddress_assign.html', {
             'form': form,
             'table': table,
-            'return_url': request.GET.get('return_url'),
+            'return_url': self.get_return_url(request),
         })
 
 
@@ -977,7 +1282,7 @@ class IPAddressDeleteView(generic.ObjectDeleteView):
 @register_model_view(IPAddress, 'bulk_add', path='bulk-add', detail=False)
 class IPAddressBulkCreateView(generic.BulkCreateView):
     queryset = IPAddress.objects.all()
-    form = forms.IPAddressBulkCreateForm
+    form = forms.IPNetworkBulkCreateForm
     model_form = forms.IPAddressBulkAddForm
     pattern_target = 'address'
     template_name = 'ipam/ipaddress_bulk_add.html'
@@ -1037,6 +1342,20 @@ class VLANGroupListView(generic.ObjectListView):
 @register_model_view(VLANGroup)
 class VLANGroupView(GetRelatedModelsMixin, generic.ObjectView):
     queryset = VLANGroup.objects.annotate_utilization()
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('scope'),
+        ],
+        left_panels=[
+            panels.VLANGroupPanel(),
+            TagsPanel(),
+        ],
+        right_panels=[
+            RelatedObjectsPanel(),
+            CommentsPanel(),
+            CustomFieldsPanel(),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         return {
@@ -1084,7 +1403,7 @@ class VLANGroupBulkDeleteView(generic.BulkDeleteView):
 
 
 @register_model_view(VLANGroup, 'vlans')
-class VLANGroupVLANsView(generic.ObjectChildrenView):
+class VLANGroupVLANsView(ChildAvailabilityMixin, generic.ObjectChildrenView):
     queryset = VLANGroup.objects.all()
     child_model = VLAN
     table = tables.VLANTable
@@ -1104,9 +1423,11 @@ class VLANGroupVLANsView(generic.ObjectChildrenView):
         )
 
     def prep_table_data(self, request, queryset, parent):
-        if not get_table_ordering(request, self.table):
+        # Skip synthetic available rows under active filters: filtered-out VLANs would otherwise look available.
+        if not get_table_ordering(request, self.table) and not self._has_active_child_filters(request):
             return add_available_vlans(queryset, parent)
-        return queryset
+
+        return super().prep_table_data(request, queryset, parent)
 
 
 #
@@ -1124,19 +1445,34 @@ class VLANTranslationPolicyListView(generic.ObjectListView):
 
 
 @register_model_view(VLANTranslationPolicy)
-class VLANTranslationPolicyView(GetRelatedModelsMixin, generic.ObjectView):
+class VLANTranslationPolicyView(generic.ObjectView):
     queryset = VLANTranslationPolicy.objects.all()
-
-    def get_extra_context(self, request, instance):
-        vlan_translation_table = VLANTranslationRuleTable(
-            data=instance.rules.all(),
-            orderable=False
-        )
-        vlan_translation_table.configure(request)
-
-        return {
-            'vlan_translation_table': vlan_translation_table,
-        }
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.VLANTranslationPolicyPanel(),
+        ],
+        right_panels=[
+            TagsPanel(),
+            CustomFieldsPanel(),
+            CommentsPanel(),
+        ],
+        bottom_panels=[
+            ObjectsTablePanel(
+                'ipam.vlantranslationrule',
+                filters={'policy_id': lambda ctx: ctx['object'].pk},
+                title=_('VLAN translation rules'),
+                exclude_columns=['policy'],
+                actions=[
+                    actions.AddObject(
+                        'ipam.vlantranslationrule',
+                        url_params={'policy': lambda ctx: ctx['object'].pk},
+                        label=_('Add Rule'),
+                    ),
+                ],
+            ),
+        ],
+    )
 
 
 @register_model_view(VLANTranslationPolicy, 'add', detail=False)
@@ -1192,13 +1528,18 @@ class VLANTranslationRuleListView(generic.ObjectListView):
 
 
 @register_model_view(VLANTranslationRule)
-class VLANTranslationRuleView(GetRelatedModelsMixin, generic.ObjectView):
+class VLANTranslationRuleView(generic.ObjectView):
     queryset = VLANTranslationRule.objects.all()
-
-    def get_extra_context(self, request, instance):
-        return {
-            'related_models': self.get_related_models(request, instance),
-        }
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.VLANTranslationRulePanel(),
+        ],
+        right_panels=[
+            TagsPanel(),
+            CustomFieldsPanel(),
+        ],
+    )
 
 
 @register_model_view(VLANTranslationRule, 'add', detail=False)
@@ -1250,7 +1591,36 @@ class FHRPGroupListView(generic.ObjectListView):
 
 @register_model_view(FHRPGroup)
 class FHRPGroupView(GetRelatedModelsMixin, generic.ObjectView):
-    queryset = FHRPGroup.objects.all()
+    queryset = FHRPGroup.objects.annotate(
+        member_count=count_related(FHRPGroupAssignment, 'group')
+    )
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.FHRPGroupPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+        right_panels=[
+            panels.FHRPGroupAuthPanel(),
+            RelatedObjectsPanel(),
+            CustomFieldsPanel(),
+        ],
+        bottom_panels=[
+            ObjectsTablePanel(
+                'ipam.ipaddress',
+                filters={'fhrpgroup_id': lambda ctx: ctx['object'].pk},
+                title=_('Virtual IP addresses'),
+                actions=[
+                    actions.AddObject(
+                        'ipam.ipaddress',
+                        url_params={'fhrpgroup': lambda ctx: ctx['object'].pk},
+                        label=_('Add IP Address'),
+                    ),
+                ],
+            ),
+            ContextTablePanel('members_table', title=_('Members')),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         # Get assigned interfaces
@@ -1275,7 +1645,6 @@ class FHRPGroupView(GetRelatedModelsMixin, generic.ObjectView):
                 ),
             ),
             'members_table': members_table,
-            'member_count': FHRPGroupAssignment.objects.filter(group=instance).count(),
         }
 
 
@@ -1378,17 +1747,44 @@ class VLANListView(generic.ObjectListView):
 @register_model_view(VLAN)
 class VLANView(generic.ObjectView):
     queryset = VLAN.objects.all()
-
-    def get_extra_context(self, request, instance):
-        prefixes = Prefix.objects.restrict(request.user, 'view').filter(vlan=instance).prefetch_related(
-            'vrf', 'scope', 'role', 'tenant'
-        )
-        prefix_table = tables.PrefixTable(list(prefixes), exclude=('vlan', 'utilization'), orderable=False)
-        prefix_table.configure(request)
-
-        return {
-            'prefix_table': prefix_table,
-        }
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        breadcrumbs=[
+            Breadcrumb('site', url=filtered_list_url('ipam:vlan_list', 'site_id')),
+            Breadcrumb('group', url=filtered_list_url('ipam:vlan_list', 'group_id')),
+        ],
+        left_panels=[
+            panels.VLANPanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+        bottom_panels=[
+            ObjectsTablePanel(
+                'ipam.prefix',
+                filters={'vlan_id': lambda ctx: ctx['object'].pk},
+                title=_('Prefixes'),
+                exclude_columns=['vlan'],
+                actions=[
+                    actions.AddObject(
+                        'ipam.prefix',
+                        url_params={
+                            'tenant': lambda ctx: ctx['object'].tenant_id,
+                            'scope_content_type': lambda ctx: (
+                                ContentType.objects.get_for_model(Site).pk if ctx['object'].site_id else None
+                            ),
+                            'scope_object_id': lambda ctx: ctx['object'].site_id,
+                            'vlan': lambda ctx: ctx['object'].pk,
+                        },
+                        label=_('Add a Prefix'),
+                    ),
+                ],
+            ),
+            panels.VLANCustomerVLANsPanel(),
+        ],
+    )
 
 
 @register_model_view(VLAN, 'interfaces')
@@ -1440,6 +1836,16 @@ class VLANDeleteView(generic.ObjectDeleteView):
     queryset = VLAN.objects.all()
 
 
+@register_model_view(VLAN, 'bulk_add', path='bulk-add', detail=False)
+class VLANBulkCreateView(generic.BulkCreateView):
+    queryset = VLAN.objects.all()
+    form = forms.VLANIDBulkCreateForm
+    model_form = forms.VLANBulkAddForm
+    pattern_target = 'vid'
+    pattern_template_fields = ('name',)
+    template_name = 'ipam/vlan_bulk_add.html'
+
+
 @register_model_view(VLAN, 'bulk_import', path='import', detail=False)
 class VLANBulkImportView(generic.BulkImportView):
     queryset = VLAN.objects.all()
@@ -1482,6 +1888,17 @@ class ServiceTemplateListView(generic.ObjectListView):
 @register_model_view(ServiceTemplate)
 class ServiceTemplateView(generic.ObjectView):
     queryset = ServiceTemplate.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.ServiceTemplatePanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+    )
 
 
 @register_model_view(ServiceTemplate, 'add', detail=False)
@@ -1502,8 +1919,23 @@ class ServiceTemplateBulkImportView(generic.BulkImportView):
     model_form = forms.ServiceTemplateImportForm
 
 
+class ServicePortMappingsBulkEditMixin:
+    """
+    Fold the ``add_port_mappings`` / ``remove_port_mappings`` bulk-edit deltas into each object before it
+    is validated and saved, keeping the model unaware of the bulk-edit form's fields.
+    """
+    def pre_save_operations(self, form, obj):
+        super().pre_save_operations(form, obj)
+        add = form.cleaned_data.get('add_port_mappings')
+        remove = form.cleaned_data.get('remove_port_mappings')
+        if add:
+            obj._add_port_mappings(add)
+        if remove:
+            obj._remove_port_mappings(remove)
+
+
 @register_model_view(ServiceTemplate, 'bulk_edit', path='edit', detail=False)
-class ServiceTemplateBulkEditView(generic.BulkEditView):
+class ServiceTemplateBulkEditView(ServicePortMappingsBulkEditMixin, generic.BulkEditView):
     queryset = ServiceTemplate.objects.all()
     filterset = filtersets.ServiceTemplateFilterSet
     table = tables.ServiceTemplateTable
@@ -1538,6 +1970,16 @@ class ServiceListView(generic.ObjectListView):
 @register_model_view(Service)
 class ServiceView(generic.ObjectView):
     queryset = Service.objects.all()
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.ServicePanel(),
+        ],
+        right_panels=[
+            CustomFieldsPanel(),
+            TagsPanel(),
+            CommentsPanel(),
+        ],
+    )
 
     def get_extra_context(self, request, instance):
         context = {}
@@ -1576,7 +2018,7 @@ class ServiceBulkImportView(generic.BulkImportView):
 
 
 @register_model_view(Service, 'bulk_edit', path='edit', detail=False)
-class ServiceBulkEditView(generic.BulkEditView):
+class ServiceBulkEditView(ServicePortMappingsBulkEditMixin, generic.BulkEditView):
     queryset = Service.objects.prefetch_related('parent')
     filterset = filtersets.ServiceFilterSet
     table = tables.ServiceTable

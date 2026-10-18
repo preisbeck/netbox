@@ -3,15 +3,16 @@ from django.utils.translation import gettext_lazy as _
 
 from utilities.forms import form_from_model
 from utilities.forms.fields import ExpandableNameField
-from virtualization.models import VirtualDisk, VMInterface, VirtualMachine
+from utilities.forms.mixins import BackgroundJobMixin
+from virtualization.models import VirtualDisk, VirtualMachine, VMInterface
 
 __all__ = (
-    'VirtualDiskBulkCreateForm',
     'VMInterfaceBulkCreateForm',
+    'VirtualDiskBulkCreateForm',
 )
 
 
-class VirtualMachineBulkAddComponentForm(forms.Form):
+class VirtualMachineBulkAddComponentForm(BackgroundJobMixin, forms.Form):
     pk = forms.ModelMultipleChoiceField(
         queryset=VirtualMachine.objects.all(),
         widget=forms.MultipleHiddenInput()

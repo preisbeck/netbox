@@ -4,7 +4,9 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from netbox.api.fields import RelatedObjectCountField
 from utilities.api import get_related_object_by_attrs
+
 from .fields import NetBoxAPIHyperlinkedIdentityField, NetBoxURLHyperlinkedIdentityField
 
 __all__ = (
@@ -48,7 +50,9 @@ class BaseModelSerializer(serializers.ModelSerializer):
         # identifying a related object.
         if self.nested:
             queryset = self.Meta.model.objects.all()
-            return get_related_object_by_attrs(queryset, data)
+            request = self.context.get('request')
+            user = request.user if request else None
+            return get_related_object_by_attrs(queryset, data, user=user)
 
         return super().to_internal_value(data)
 
@@ -68,6 +72,15 @@ class BaseModelSerializer(serializers.ModelSerializer):
         for field_name in set(self._omit_fields):
             fields.pop(field_name, None)
 
+        # Related object counts are populated by annotations applied to the viewset's queryset, but these
+        # annotations are not applied when the object is represented as a nested (brief) related object. Omit
+        # these fields when serializing a nested object to avoid advertising fields that will never be populated
+        # (and which would otherwise be declared as required in the generated OpenAPI schema). See #22154.
+        if self.nested:
+            for field_name, field in list(fields.items()):
+                if isinstance(field, RelatedObjectCountField):
+                    fields.pop(field_name)
+
         return fields
 
     @extend_schema_field(OpenApiTypes.STR)
@@ -79,6 +92,10 @@ class ValidatedModelSerializer(BaseModelSerializer):
     """
     Extends the built-in ModelSerializer to enforce calling full_clean() on a copy of the associated instance during
     validation. (DRF does not do this by default; see https://github.com/encode/django-rest-framework/issues/3144)
+
+    Serializers may declare `model_clean_fields` in Meta, naming scalar model fields whose clean()-normalized values
+    must reach the database. DRF builds a fresh instance from the validated data on create, discarding what clean()
+    wrote.
     """
 
     # Bypass DRF's built-in validation of unique constraints due to DRF bug #9410. Rely instead
@@ -93,9 +110,6 @@ class ValidatedModelSerializer(BaseModelSerializer):
             return data
 
         attrs = data.copy()
-
-        # Remove custom field data (if any) prior to model validation
-        attrs.pop('custom_fields', None)
 
         # Skip ManyToManyFields
         opts = self.Meta.model._meta
@@ -114,5 +128,12 @@ class ValidatedModelSerializer(BaseModelSerializer):
         instance._m2m_values = m2m_values
         # Skip uniqueness validation of individual fields inside `full_clean()` (this is handled by the serializer)
         instance.full_clean(validate_unique=False)
+
+        # Preserve any normalization performed by model.clean() (e.g. stale custom field pruning)
+        if 'custom_field_data' in attrs:
+            data['custom_field_data'] = instance.custom_field_data
+
+        for field_name in getattr(self.Meta, 'model_clean_fields', ()):
+            data[field_name] = getattr(instance, field_name)
 
         return data

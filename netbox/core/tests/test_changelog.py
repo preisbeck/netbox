@@ -1,13 +1,31 @@
+import logging
+import uuid
+from datetime import timedelta
+from unittest.mock import patch
+
 from django.contrib.contenttypes.models import ContentType
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 
 from core.choices import ObjectChangeActionChoices
+from core.jobs import SystemHousekeepingJob
 from core.models import ObjectChange, ObjectType
-from dcim.choices import InterfaceTypeChoices, ModuleStatusChoices, SiteStatusChoices
+from dcim.choices import InterfaceTypeChoices, ModuleStatusChoices, PortTypeChoices, SiteStatusChoices
 from dcim.models import (
-    Cable, CableTermination, Device, DeviceRole, DeviceType, Manufacturer, Module, ModuleBay, ModuleType, Interface,
+    Cable,
+    CableTermination,
+    Device,
+    DeviceRole,
+    DeviceType,
+    Interface,
+    Manufacturer,
+    Module,
+    ModuleBay,
+    ModuleType,
+    PortMapping,
+    RearPort,
     Site,
 )
 from extras.choices import *
@@ -17,7 +35,7 @@ from utilities.testing.utils import create_tags, create_test_device, post_data
 from utilities.testing.views import ModelViewTestCase
 
 
-class ChangeLogViewTest(ModelViewTestCase):
+class ChangeLogViewTestCase(ModelViewTestCase):
     model = Site
 
     @classmethod
@@ -381,7 +399,7 @@ class ChangeLogViewTest(ModelViewTestCase):
         self.assertEqual(objectchanges.count(), 2)
 
 
-class ChangeLogAPITest(APITestCase):
+class ChangeLogAPITestCase(APITestCase):
 
     @classmethod
     def setUpTestData(cls):
@@ -433,7 +451,7 @@ class ChangeLogAPITest(APITestCase):
         }
         self.assertEqual(ObjectChange.objects.count(), 0)
         url = reverse('dcim-api:site-list')
-        self.add_permissions('dcim.add_site')
+        self.add_permissions('dcim.add_site', 'extras.view_tag')
 
         response = self.client.post(url, data, format='json', **self.header)
         self.assertHttpStatus(response, status.HTTP_201_CREATED)
@@ -465,7 +483,7 @@ class ChangeLogAPITest(APITestCase):
             ]
         }
         self.assertEqual(ObjectChange.objects.count(), 0)
-        self.add_permissions('dcim.change_site')
+        self.add_permissions('dcim.change_site', 'extras.view_tag')
         url = reverse('dcim-api:site-detail', kwargs={'pk': site.pk})
 
         response = self.client.put(url, data, format='json', **self.header)
@@ -685,3 +703,149 @@ class ChangeLogAPITest(APITestCase):
         self.assertEqual(changes[3].changed_object_type, ContentType.objects.get_for_model(Module))
         self.assertEqual(changes[3].changed_object_id, module.pk)
         self.assertEqual(changes[3].action, ObjectChangeActionChoices.ACTION_DELETE)
+
+    def test_list_changes_for_object_without_serializer(self):
+        """
+        Listing ObjectChanges for a change-logged model which has no REST API serializer (e.g. PortMapping)
+        should not raise an exception.
+        """
+        device = create_test_device('device1')
+        rear_port = RearPort.objects.create(device=device, name='Rear Port 1', type=PortTypeChoices.TYPE_8P8C)
+        self.add_permissions('dcim.add_frontport', 'core.view_objectchange')
+
+        # Create a FrontPort mapped to the RearPort (creates a PortMapping)
+        data = {
+            'device': device.pk,
+            'name': 'Front Port 1',
+            'type': PortTypeChoices.TYPE_8P8C,
+            'rear_ports': [
+                {'position': 1, 'rear_port': rear_port.pk, 'rear_port_position': 1},
+            ],
+        }
+        url = reverse('dcim-api:frontport-list')
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        port_mapping = PortMapping.objects.get(front_port_id=response.data['id'])
+        self.assertTrue(
+            ObjectChange.objects.filter(
+                changed_object_type=ContentType.objects.get_for_model(PortMapping),
+                changed_object_id=port_mapping.pk,
+            ).exists()
+        )
+
+        front_port_id = response.data['id']
+
+        url = reverse('core-api:objectchange-list')
+        response = self.client.get(url, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        # The FrontPort has a serializer, so its nested representation should be included
+        result = next(
+            r for r in response.data['results']
+            if r['changed_object_type'] == 'dcim.frontport' and r['changed_object_id'] == front_port_id
+        )
+        self.assertEqual(result['changed_object']['id'], front_port_id)
+
+        # The PortMapping has no serializer, so changed_object should be null
+        result = next(
+            r for r in response.data['results']
+            if r['changed_object_type'] == 'dcim.portmapping' and r['changed_object_id'] == port_mapping.pk
+        )
+        self.assertIsNone(result['changed_object'])
+        self.assertEqual(result['object_repr'], str(port_mapping))
+
+
+class ChangelogPruneRetentionTestCase(TestCase):
+    """Test suite for Changelog pruning retention settings."""
+
+    @staticmethod
+    def _make_oc(*, ct, obj_id, action, ts):
+        oc = ObjectChange.objects.create(
+            changed_object_type=ct,
+            changed_object_id=obj_id,
+            action=action,
+            user_name='test',
+            request_id=uuid.uuid4(),
+            object_repr=f'Object {obj_id}',
+        )
+        ObjectChange.objects.filter(pk=oc.pk).update(time=ts)
+        return oc.pk
+
+    @staticmethod
+    def _run_prune(*, retention_days, retain_create_last_update):
+        job = SystemHousekeepingJob.__new__(SystemHousekeepingJob)
+        job.logger = logging.getLogger('netbox.tests.changelog_prune')
+
+        with patch('core.jobs.Config') as MockConfig:
+            cfg = MockConfig.return_value
+            cfg.CHANGELOG_RETENTION = retention_days
+            cfg.CHANGELOG_RETAIN_CREATE_LAST_UPDATE = retain_create_last_update
+            job.prune_changelog()
+
+    def test_prune_retain_create_last_update_excludes_deleted_objects(self):
+        ct = ContentType.objects.get_for_model(Site)
+
+        retention_days = 90
+        now = timezone.now()
+        cutoff = now - timedelta(days=retention_days)
+
+        expired_old = cutoff - timedelta(days=10)
+        expired_newer = cutoff - timedelta(days=1)
+        not_expired = cutoff + timedelta(days=1)
+
+        # A) Not deleted: should keep CREATE + latest UPDATE, prune intermediate UPDATEs
+        a_create = self._make_oc(ct=ct, obj_id=1, action=ObjectChangeActionChoices.ACTION_CREATE, ts=expired_old)
+        a_update1 = self._make_oc(ct=ct, obj_id=1, action=ObjectChangeActionChoices.ACTION_UPDATE, ts=expired_old)
+        a_update2 = self._make_oc(ct=ct, obj_id=1, action=ObjectChangeActionChoices.ACTION_UPDATE, ts=expired_newer)
+
+        # B) Deleted (all expired): should keep NOTHING
+        b_create = self._make_oc(ct=ct, obj_id=2, action=ObjectChangeActionChoices.ACTION_CREATE, ts=expired_old)
+        b_update = self._make_oc(ct=ct, obj_id=2, action=ObjectChangeActionChoices.ACTION_UPDATE, ts=expired_newer)
+        b_delete = self._make_oc(ct=ct, obj_id=2, action=ObjectChangeActionChoices.ACTION_DELETE, ts=expired_newer)
+
+        # C) Deleted but delete is not expired: create/update expired should be pruned; delete remains
+        c_create = self._make_oc(ct=ct, obj_id=3, action=ObjectChangeActionChoices.ACTION_CREATE, ts=expired_old)
+        c_update = self._make_oc(ct=ct, obj_id=3, action=ObjectChangeActionChoices.ACTION_UPDATE, ts=expired_newer)
+        c_delete = self._make_oc(ct=ct, obj_id=3, action=ObjectChangeActionChoices.ACTION_DELETE, ts=not_expired)
+
+        self._run_prune(retention_days=retention_days, retain_create_last_update=True)
+
+        remaining = set(ObjectChange.objects.values_list('pk', flat=True))
+
+        # A) Not deleted -> create + latest update remain
+        self.assertIn(a_create, remaining)
+        self.assertIn(a_update2, remaining)
+        self.assertNotIn(a_update1, remaining)
+
+        # B) Deleted (all expired) -> nothing remains
+        self.assertNotIn(b_create, remaining)
+        self.assertNotIn(b_update, remaining)
+        self.assertNotIn(b_delete, remaining)
+
+        # C) Deleted, delete not expired -> delete remains, but create/update are pruned
+        self.assertNotIn(c_create, remaining)
+        self.assertNotIn(c_update, remaining)
+        self.assertIn(c_delete, remaining)
+
+    def test_prune_disabled_deletes_all_expired(self):
+        ct = ContentType.objects.get_for_model(Site)
+
+        retention_days = 90
+        now = timezone.now()
+        cutoff = now - timedelta(days=retention_days)
+        expired = cutoff - timedelta(days=1)
+        not_expired = cutoff + timedelta(days=1)
+
+        # expired create/update should be deleted when feature disabled
+        x_create = self._make_oc(ct=ct, obj_id=10, action=ObjectChangeActionChoices.ACTION_CREATE, ts=expired)
+        x_update = self._make_oc(ct=ct, obj_id=10, action=ObjectChangeActionChoices.ACTION_UPDATE, ts=expired)
+
+        # non-expired delete should remain regardless
+        y_delete = self._make_oc(ct=ct, obj_id=11, action=ObjectChangeActionChoices.ACTION_DELETE, ts=not_expired)
+
+        self._run_prune(retention_days=retention_days, retain_create_last_update=False)
+
+        remaining = set(ObjectChange.objects.values_list('pk', flat=True))
+        self.assertNotIn(x_create, remaining)
+        self.assertNotIn(x_update, remaining)
+        self.assertIn(y_delete, remaining)

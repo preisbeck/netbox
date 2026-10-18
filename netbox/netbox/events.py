@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from netbox.registry import registry
+from utilities.choices import Choice
 
 EVENT_TYPE_KIND_INFO = 'info'
 EVENT_TYPE_KIND_SUCCESS = 'success'
@@ -13,9 +14,9 @@ __all__ = (
     'EVENT_TYPE_KIND_SUCCESS',
     'EVENT_TYPE_KIND_WARNING',
     'EventType',
+    'get_event_text',
     'get_event_type',
     'get_event_type_choices',
-    'get_event_text',
 )
 
 
@@ -31,7 +32,7 @@ def get_event_text(name):
 
 def get_event_type_choices():
     return [
-        (event.name, event.text) for event in registry['event_types'].values()
+        Choice(event.name, event.text) for event in registry['event_types'].values()
     ]
 
 

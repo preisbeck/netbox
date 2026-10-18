@@ -3,17 +3,17 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from django.utils.translation import gettext as _
 
-from core.models import DataSource, ObjectType
+from core.models import DataFile, DataSource, ObjectType
 from dcim.models import DeviceRole, DeviceType, Location, Platform, Region, Site, SiteGroup
+from netbox.event_rules import get_event_rule_action_choices, get_event_rule_action_slugs
 from netbox.filtersets import BaseFilterSet, ChangeLoggedModelFilterSet, NetBoxModelFilterSet, PrimaryModelFilterSet
 from tenancy.models import Tenant, TenantGroup
 from users.filterset_mixins import OwnerFilterMixin
 from users.models import Group, User
-from utilities.filters import (
-    MultiValueCharFilter, MultiValueContentTypeFilter, MultiValueNumberFilter
-)
+from utilities.filters import MultiValueCharFilter, MultiValueContentTypeFilter, MultiValueNumberFilter
 from utilities.filtersets import register_filterset
 from virtualization.models import Cluster, ClusterGroup, ClusterType
+
 from .choices import *
 from .filters import TagFilter, TagIDFilter
 from .models import *
@@ -83,7 +83,7 @@ class WebhookFilterSet(OwnerFilterMixin, NetBoxModelFilterSet):
         model = Webhook
         fields = (
             'id', 'name', 'payload_url', 'http_method', 'http_content_type', 'secret', 'ssl_verification',
-            'ca_file_path', 'description',
+            'ca_file_path', 'timeout', 'description',
         )
 
     def search(self, queryset, name, value):
@@ -113,8 +113,12 @@ class EventRuleFilterSet(OwnerFilterMixin, NetBoxModelFilterSet):
         method='filter_event_type'
     )
     action_type = django_filters.MultipleChoiceFilter(
-        choices=EventRuleActionChoices,
+        choices=get_event_rule_action_choices,
         distinct=False,
+    )
+    action_is_available = django_filters.BooleanFilter(
+        method='filter_action_is_available',
+        label=_('Action available'),
     )
     action_object_type = MultiValueContentTypeFilter()
     action_object_id = MultiValueNumberFilter()
@@ -136,6 +140,12 @@ class EventRuleFilterSet(OwnerFilterMixin, NetBoxModelFilterSet):
 
     def filter_event_type(self, queryset, name, value):
         return queryset.filter(event_types__overlap=value)
+
+    def filter_action_is_available(self, queryset, name, value):
+        registered_slugs = get_event_rule_action_slugs()
+        if value:
+            return queryset.filter(action_type__in=registered_slugs)
+        return queryset.exclude(action_type__in=registered_slugs)
 
 
 @register_filterset
@@ -176,8 +186,8 @@ class CustomFieldFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet):
         model = CustomField
         fields = (
             'id', 'name', 'label', 'group_name', 'required', 'unique', 'search_weight', 'filter_logic', 'ui_visible',
-            'ui_editable', 'weight', 'is_cloneable', 'description', 'validation_minimum', 'validation_maximum',
-            'validation_regex',
+            'ui_editable', 'weight', 'is_cloneable', 'nulls_first', 'description', 'validation_minimum',
+            'validation_maximum', 'validation_regex', 'status',
         )
 
     def search(self, queryset, name, value):
@@ -201,6 +211,12 @@ class CustomFieldChoiceSetFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet
     choice = MultiValueCharFilter(
         method='filter_by_choice'
     )
+    choice_colors = django_filters.MultipleChoiceFilter(
+        choices=CustomFieldChoiceColorChoices,
+        method='filter_by_choice_colors',
+        label=_('Choice colors'),
+        distinct=False,
+    )
 
     class Meta:
         model = CustomFieldChoiceSet
@@ -219,6 +235,25 @@ class CustomFieldChoiceSetFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet
     def filter_by_choice(self, queryset, name, value):
         # TODO: Support case-insensitive matching
         return queryset.filter(extra_choices__overlap=value)
+
+    def filter_by_choice_colors(self, queryset, name, value):
+        if not value:
+            return queryset
+
+        choice_color_keys = set()
+        for choice_colors in queryset.values_list('choice_colors', flat=True):
+            if isinstance(choice_colors, dict):
+                choice_color_keys.update(choice_colors.keys())
+
+        if not choice_color_keys:
+            return queryset.none()
+
+        params = Q()
+        for key in choice_color_keys:
+            for color in value:
+                params |= Q(choice_colors__contains={key: color})
+
+        return queryset.filter(params)
 
 
 @register_filterset
@@ -271,7 +306,7 @@ class ExportTemplateFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet):
         label=_('Data source (ID)'),
     )
     data_file_id = django_filters.ModelMultipleChoiceFilter(
-        queryset=DataSource.objects.all(),
+        queryset=DataFile.objects.all(),
         distinct=False,
         label=_('Data file (ID)'),
     )
@@ -482,7 +517,9 @@ class ImageAttachmentFilterSet(ChangeLoggedModelFilterSet):
 
     class Meta:
         model = ImageAttachment
-        fields = ('id', 'object_type_id', 'object_id', 'name', 'description', 'image_width', 'image_height')
+        fields = (
+            'id', 'object_type_id', 'object_id', 'name', 'description', 'image_width', 'image_height', 'image_size',
+        )
 
     def search(self, queryset, name, value):
         if not value.strip():
@@ -641,7 +678,7 @@ class ConfigContextProfileFilterSet(PrimaryModelFilterSet):
         label=_('Data source (ID)'),
     )
     data_file_id = django_filters.ModelMultipleChoiceFilter(
-        queryset=DataSource.objects.all(),
+        queryset=DataFile.objects.all(),
         distinct=False,
         label=_('Data file (ID)'),
     )
@@ -817,7 +854,7 @@ class ConfigContextFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet):
         label=_('Data source (ID)'),
     )
     data_file_id = django_filters.ModelMultipleChoiceFilter(
-        queryset=DataSource.objects.all(),
+        queryset=DataFile.objects.all(),
         distinct=False,
         label=_('Data file (ID)'),
     )
@@ -848,7 +885,7 @@ class ConfigTemplateFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet):
         label=_('Data source (ID)'),
     )
     data_file_id = django_filters.ModelMultipleChoiceFilter(
-        queryset=DataSource.objects.all(),
+        queryset=DataFile.objects.all(),
         distinct=False,
         label=_('Data file (ID)'),
     )
@@ -858,7 +895,7 @@ class ConfigTemplateFilterSet(OwnerFilterMixin, ChangeLoggedModelFilterSet):
     class Meta:
         model = ConfigTemplate
         fields = (
-            'id', 'name', 'description', 'mime_type', 'file_name', 'file_extension', 'as_attachment',
+            'id', 'name', 'description', 'mime_type', 'file_name', 'file_extension', 'as_attachment', 'debug',
             'auto_sync_enabled', 'data_synced'
         )
 

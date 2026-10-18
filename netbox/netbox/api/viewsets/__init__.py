@@ -1,25 +1,28 @@
 import logging
+import warnings
 from functools import cached_property
 
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db import router, transaction
 from django.db.models import ProtectedError, RestrictedError
-from django_pglocks import advisory_lock
 from rest_framework import mixins as drf_mixins
 from rest_framework import status
+from rest_framework.exceptions import MethodNotAllowed
+from rest_framework.permissions import SAFE_METHODS
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
 from netbox.api.serializers.features import ChangeLogMessageSerializer
-from netbox.constants import ADVISORY_LOCK_KEYS
-from utilities.api import get_annotations_for_serializer, get_prefetches_for_serializer
-from utilities.exceptions import AbortRequest
+from utilities.api import get_annotations_for_serializer, get_fields_for_serializer, get_prefetches_for_serializer
+from utilities.exceptions import AbortRequest, PreconditionFailed
 from utilities.query import reapply_model_ordering
+
 from . import mixins
 
 __all__ = (
-    'NetBoxReadOnlyModelViewSet',
+    'MPTTLockedMixin',
     'NetBoxModelViewSet',
+    'NetBoxReadOnlyModelViewSet',
 )
 
 HTTP_ACTIONS = {
@@ -33,14 +36,67 @@ HTTP_ACTIONS = {
 }
 
 
+class ETagMixin:
+    """
+    Adds ETag header support to ViewSets. Generates weak ETags (W/ prefix per
+    RFC 7232 §2.1) from `last_updated` (or `created` if unavailable). Weak ETags
+    are appropriate here because the tag is derived from a modification timestamp
+    rather than a hash of the serialized payload.
+    """
+
+    @staticmethod
+    def _get_etag(obj):
+        """Return a weak ETag string for the given object, or None."""
+        if ts := getattr(obj, 'last_updated', None) or getattr(obj, 'created', None):
+            return f'W/"{ts.isoformat()}"'
+        return None
+
+    @staticmethod
+    def _get_if_match(request):
+        """Return the list of If-Match header values (if specified)."""
+        if (if_match := request.META.get('HTTP_IF_MATCH')) and if_match != '*':
+            return [e.strip() for e in if_match.split(',')]
+        return []
+
+    def _validate_etag(self, request, instance):
+        """Validate the request's ETag"""
+        if provided := self._get_if_match(request):
+            current_etag = self._get_etag(instance)
+            if current_etag and current_etag not in provided:
+                raise PreconditionFailed(etag=current_etag)
+
+    def handle_exception(self, exc):
+        response = super().handle_exception(exc)
+        if isinstance(exc, PreconditionFailed) and exc.etag:
+            response['ETag'] = exc.etag
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        response = Response(serializer.data)
+        if etag := self._get_etag(instance):
+            response['ETag'] = etag
+        return response
+
+
 class BaseViewSet(GenericViewSet):
     """
     Base class for all API ViewSets. This is responsible for the enforcement of object-based permissions.
     """
     brief = False
+    # Prefetches dynamic resolution cannot derive (method fields, model properties), keyed by the fields reading them
+    field_prefetches = {}
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
+
+        # Reject any method for which no action has been declared, rather than proceeding against an
+        # unrestricted QuerySet. (A method mapped to None, e.g. OPTIONS, is permitted: it needs no
+        # restriction.) This is the same 405 DRF would return when resolving the handler for an unmapped
+        # method, but it also covers a handler bound to such a method (e.g. @action(methods=['trace'])).
+        if request.method not in HTTP_ACTIONS:
+            raise MethodNotAllowed(request.method)
 
         # Restrict the view's QuerySet to allow only the permitted objects
         if request.user.is_authenticated:
@@ -58,6 +114,10 @@ class BaseViewSet(GenericViewSet):
         qs = super().get_queryset()
         serializer_class = self.get_serializer_class()
 
+        # Declared lookups precede the dynamic ones, so a declared Prefetch queryset wins on a shared path
+        if prefetch := self.get_field_prefetches():
+            qs = qs.prefetch_related(*prefetch)
+
         # Dynamically resolve prefetches for included serializer fields and attach them to the queryset
         if prefetch := get_prefetches_for_serializer(serializer_class, **self.field_kwargs):
             qs = qs.prefetch_related(*prefetch)
@@ -67,6 +127,23 @@ class BaseViewSet(GenericViewSet):
             qs = qs.annotate(**annotations)
 
         return qs
+
+    def get_field_prefetches(self, fields=None):
+        """Return the declared prefetches of given fields, by default the response's (all for exports and writes)."""
+        if not self.field_prefetches:
+            return []
+        if fields is None:
+            # Exports and writes render whole objects (templates, event payloads), so they load every declaration
+            if 'export' in self.request.query_params or self.request.method not in SAFE_METHODS:
+                fields = set().union(*self.field_prefetches)
+            else:
+                fields = self.response_fields
+        return [
+            lookup
+            for field_names, lookups in self.field_prefetches.items()
+            if not fields.isdisjoint(field_names)
+            for lookup in lookups
+        ]
 
     def get_serializer(self, *args, **kwargs):
         # Pass the fields/omit kwargs (if specified by the request) to the serializer
@@ -92,8 +169,14 @@ class BaseViewSet(GenericViewSet):
 
         return {}
 
+    @cached_property
+    def response_fields(self):
+        """Return the serializer field names rendered for this request, as selected by field_kwargs."""
+        return frozenset(get_fields_for_serializer(self.get_serializer_class(), **self.field_kwargs))
+
 
 class NetBoxReadOnlyModelViewSet(
+    ETagMixin,
     mixins.CustomFieldsMixin,
     mixins.ExportTemplatesMixin,
     drf_mixins.RetrieveModelMixin,
@@ -104,6 +187,9 @@ class NetBoxReadOnlyModelViewSet(
 
 
 class NetBoxModelViewSet(
+    ETagMixin,
+    mixins.BackgroundOperationMixin,
+    mixins.BulkCreateModelMixin,
     mixins.BulkUpdateModelMixin,
     mixins.BulkDestroyModelMixin,
     mixins.ObjectValidationMixin,
@@ -168,29 +254,63 @@ class NetBoxModelViewSet(
                 **kwargs
             )
 
+    def exception_to_response(self, exc):
+        """
+        Translate a NetBox/Django exception that is not a DRF APIException into the same
+        Response that dispatch() would return for it. Returns None if the exception is not
+        one this method handles (the caller should then re-raise or defer to DRF).
+
+        This mirrors the except clauses in dispatch(); it is also called by the background
+        job runner (netbox.jobs.AsyncAPIJob), which executes action methods directly and so
+        bypasses dispatch(). NOTE: dispatch() does not yet call this helper itself; the two
+        should be consolidated into a single source of truth in a future change.
+        """
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+        if isinstance(exc, (ProtectedError, RestrictedError)):
+            if type(exc) is ProtectedError:
+                protected_objects = list(exc.protected_objects)
+            else:
+                protected_objects = list(exc.restricted_objects)
+            msg = f'Unable to delete object. {len(protected_objects)} dependent objects were found: '
+            msg += ', '.join([f'{obj} ({obj.pk})' for obj in protected_objects])
+            logger.warning(msg)
+            return Response({'detail': msg}, status=409)
+        if isinstance(exc, AbortRequest):
+            logger.debug(exc.message)
+            return Response({'detail': exc.message}, status=400)
+        return None
+
     # Creates
 
     def create(self, request, *args, **kwargs):
+        # If background processing was requested for a bulk (list) create, enqueue a job and
+        # return immediately. Single-object creates always run synchronously.
+        if (response := self._handle_background_request(request, 'create')) is not None:
+            return response
+
+        # Creating multiple objects, which are validated and saved one at a time in order to
+        # collect per-object errors (see BulkCreateModelMixin)
+        if isinstance(request.data, list):
+            return self.bulk_create(request, *args, **kwargs)
+
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        bulk_create = getattr(serializer, 'many', False)
         self.perform_create(serializer)
 
-        # After creating the instance(s), re-initialize the serializer with a queryset
+        # After creating the instance, re-initialize the serializer with a queryset
         # to ensure related objects are prefetched.
-        if bulk_create:
-            instance_pks = [obj.pk for obj in serializer.instance]
-            # Order by PK to ensure that the ordering of objects in the response
-            # matches the ordering of those in the request.
-            qs = self.get_queryset().filter(pk__in=instance_pks).order_by('pk')
-        else:
-            qs = self.get_queryset().get(pk=serializer.instance.pk)
+        qs = self.get_queryset().get(pk=serializer.instance.pk)
 
-        # Re-serialize the instance(s) with prefetched data
-        serializer = self.get_serializer(qs, many=bulk_create)
+        # Re-serialize the instance with prefetched data
+        serializer = self.get_serializer(qs)
 
         headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        response = Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+        if etag := self._get_etag(qs):
+            response['ETag'] = etag
+
+        return response
 
     def perform_create(self, serializer):
         model = self.queryset.model
@@ -198,8 +318,9 @@ class NetBoxModelViewSet(
         logger.info(f"Creating new {model._meta.verbose_name}")
 
         # Enforce object-level permissions on save()
+        using = router.db_for_write(model)
         try:
-            with transaction.atomic(using=router.db_for_write(model)):
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
                 instance = serializer.save()
                 self._validate_objects(instance)
         except ObjectDoesNotExist:
@@ -210,6 +331,10 @@ class NetBoxModelViewSet(
     def update(self, request, *args, **kwargs):
         partial = kwargs.pop('partial', False)
         instance = self.get_object_with_snapshot()
+
+        # Enforce If-Match precondition (RFC 9110 §13.1.1)
+        self._validate_etag(self.request, instance)
+
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
@@ -220,8 +345,12 @@ class NetBoxModelViewSet(
 
         # Re-serialize the instance(s) with prefetched data
         serializer = self.get_serializer(qs)
+        response = Response(serializer.data)
 
-        return Response(serializer.data)
+        if etag := self._get_etag(qs):
+            response['ETag'] = etag
+
+        return response
 
     def perform_update(self, serializer):
         model = self.queryset.model
@@ -229,8 +358,14 @@ class NetBoxModelViewSet(
         logger.info(f"Updating {model._meta.verbose_name} {serializer.instance} (PK: {serializer.instance.pk})")
 
         # Enforce object-level permissions on save()
+        using = router.db_for_write(model)
         try:
-            with transaction.atomic(using=router.db_for_write(model)):
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
+                # Re-check the If-Match ETag under a row-level lock to close the TOCTOU window
+                # between the initial check in update() and the actual write.
+                if self._get_if_match(self.request):
+                    locked = model.objects.select_for_update().get(pk=serializer.instance.pk)
+                    self._validate_etag(self.request, locked)
                 instance = serializer.save()
                 self._validate_objects(instance)
         except ObjectDoesNotExist:
@@ -240,6 +375,9 @@ class NetBoxModelViewSet(
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object_with_snapshot()
+
+        # Enforce If-Match precondition (RFC 9110 §13.1.1)
+        self._validate_etag(request, instance)
 
         # Attach changelog message (if any)
         serializer = ChangeLogMessageSerializer(data=request.data)
@@ -255,23 +393,38 @@ class NetBoxModelViewSet(
         logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
         logger.info(f"Deleting {model._meta.verbose_name} {instance} (PK: {instance.pk})")
 
-        return super().perform_destroy(instance)
+        using = router.db_for_write(model)
+        try:
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
+                # Re-check the If-Match ETag under a row-level lock to close the TOCTOU window
+                # between the initial check in destroy() and the actual delete.
+                if self._get_if_match(self.request):
+                    locked = model.objects.select_for_update().get(pk=instance.pk)
+                    self._validate_etag(self.request, locked)
+                super().perform_destroy(instance)
+        except ObjectDoesNotExist:
+            raise PermissionDenied()
 
 
+# TODO: Remove this in NetBox v5.0
 class MPTTLockedMixin:
     """
-    Puts pglock on objects that derive from MPTTModel for parallel API calling.
-    Note: If adding this to a view, must add the model name to ADVISORY_LOCK_KEYS
+    Deprecated no-op mixin retained for backward compatibility.
+
+    Historically this acquired a pglock around create/update/destroy to serialize
+    concurrent writes to MPTT-based tree models. NetBox no longer uses MPTT: tree
+    integrity is now maintained by the PostgreSQL ltree triggers (see
+    `utilities.ltree`), which take per-tree advisory locks at the database level.
+    This mixin is therefore now a transparent pass-through and may be removed in a
+    future release. Plugins should stop inheriting from it.
     """
 
-    def create(self, request, *args, **kwargs):
-        with advisory_lock(ADVISORY_LOCK_KEYS[self.queryset.model._meta.model_name]):
-            return super().create(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        with advisory_lock(ADVISORY_LOCK_KEYS[self.queryset.model._meta.model_name]):
-            return super().update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        with advisory_lock(ADVISORY_LOCK_KEYS[self.queryset.model._meta.model_name]):
-            return super().destroy(request, *args, **kwargs)
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        warnings.warn(
+            "MPTTLockedMixin is deprecated and no longer does anything; tree write "
+            "concurrency is now handled by ltree database triggers. Remove it from "
+            f"{cls.__name__}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )

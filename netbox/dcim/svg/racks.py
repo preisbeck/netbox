@@ -1,24 +1,24 @@
 import decimal
-import svgwrite
-from svgwrite.container import Hyperlink
-from svgwrite.image import Image
-from svgwrite.gradients import LinearGradient
-from svgwrite.masking import ClipPath
-from svgwrite.shapes import Rect
-from svgwrite.text import Text
 
+import svgwrite
 from django.conf import settings
-from django.core.exceptions import FieldError
+from django.core.exceptions import ValidationError
+from django.core.validators import ProhibitNullCharactersValidator
 from django.db.models import Q
 from django.template.defaultfilters import floatformat
 from django.urls import reverse
 from django.utils.http import urlencode
+from svgwrite.container import Hyperlink
+from svgwrite.gradients import LinearGradient
+from svgwrite.image import Image
+from svgwrite.masking import ClipPath
+from svgwrite.shapes import Rect
+from svgwrite.text import Text
 
+from dcim.constants import RACK_ELEVATION_BORDER_WIDTH
 from netbox.config import get_config
 from utilities.data import array_to_ranges
 from utilities.html import foreground_color
-from dcim.constants import RACK_ELEVATION_BORDER_WIDTH
-
 
 __all__ = (
     'RackElevationSVG',
@@ -120,11 +120,18 @@ class RackElevationSVG:
         if highlight_params:
             q = Q()
             for k, v in highlight_params:
+                # Ignore any unsupported attributes (including related fields & lookups)
+                if k not in ('id', 'name'):
+                    continue
+                try:
+                    # Validate the value against the field before including it
+                    ProhibitNullCharactersValidator()(v)
+                    permitted_devices.model._meta.get_field(k).get_prep_value(v)
+                except (TypeError, ValueError, ValidationError):
+                    continue
                 q |= Q(**{k: v})
-            try:
+            if q:
                 self.highlight_devices = permitted_devices.filter(q)
-            except FieldError:
-                pass
 
     @staticmethod
     def _add_gradient(drawing, id_, color):

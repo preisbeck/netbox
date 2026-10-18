@@ -5,11 +5,11 @@ from dcim.models import *
 from dcim.utils import object_to_path_node
 
 __all__ = (
-    'CablePathTestCase',
+    'BaseCablePathTestCase',
 )
 
 
-class CablePathTestCase(TestCase):
+class BaseCablePathTestCase(TestCase):
     """
     Base class for test cases for cable paths.
     """
@@ -63,6 +63,21 @@ class CablePathTestCase(TestCase):
         """
         cablepath = self._get_cablepath(nodes, **kwargs)
         self.assertIsNone(cablepath, msg='Unexpected CablePath found')
+
+    def assertCurrentPathExists(self, nodes, **kwargs):
+        """
+        Assert that the first node references a CablePath with the given route via _path, and return it.
+
+        :param nodes: Iterable of steps, the first being the originating path endpoint object
+        """
+        origin = type(nodes[0]).objects.get(pk=nodes[0].pk)
+        self.assertIsNotNone(origin._path_id, msg=f'No path set on originating endpoint {origin}')
+        # Matched on the route alone, so a flag mismatch does not report itself as a wrong route
+        cablepath = self._get_cablepath(nodes, pk=origin._path_id)
+        self.assertIsNotNone(cablepath, msg=f'Path #{origin._path_id} on {origin} does not match the expected route')
+        for attr, expected in kwargs.items():
+            self.assertEqual(getattr(cablepath, attr), expected, msg=f'Path #{cablepath.pk} on {origin}: {attr}')
+        return cablepath
 
     def assertPathIsSet(self, origin, cablepath, msg=None):
         """

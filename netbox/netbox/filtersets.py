@@ -1,13 +1,14 @@
 import json
+from copy import deepcopy
 
 import django_filters
-from copy import deepcopy
+from django.contrib.auth.models import AnonymousUser
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.db.models import Q
+from django.utils.translation import gettext as _
 from django_filters.exceptions import FieldLookupError
 from django_filters.utils import get_model_field, resolve_field
-from django.utils.translation import gettext as _
 
 from core.choices import ObjectChangeActionChoices
 from core.models import ObjectChange
@@ -15,12 +16,16 @@ from extras.choices import CustomFieldFilterLogicChoices
 from extras.filters import TagFilter, TagIDFilter
 from extras.models import CustomField, SavedFilter
 from users.filterset_mixins import OwnerFilterMixin
+from utilities import filters
 from utilities.constants import (
-    FILTER_CHAR_BASED_LOOKUP_MAP, FILTER_NEGATION_LOOKUP_MAP, FILTER_TREENODE_NEGATION_LOOKUP_MAP,
-    FILTER_NUMERIC_BASED_LOOKUP_MAP
+    FILTER_ARRAY_BASED_LOOKUP_MAP,
+    FILTER_CHAR_BASED_LOOKUP_MAP,
+    FILTER_NEGATION_LOOKUP_MAP,
+    FILTER_NUMERIC_BASED_LOOKUP_MAP,
+    FILTER_TAG_LOOKUP_MAP,
+    FILTER_TREENODE_NEGATION_LOOKUP_MAP,
 )
 from utilities.forms.fields import MACAddressField
-from utilities import filters
 
 __all__ = (
     'AttributeFiltersMixin',
@@ -37,6 +42,12 @@ STANDARD_LOOKUPS = (
     'iexact',
     'in',
     'contains',
+)
+
+# Lookup expressions which take a boolean value
+BOOLEAN_LOOKUPS = (
+    'empty',
+    'isnull',
 )
 
 
@@ -106,9 +117,22 @@ class BaseFilterSet(django_filters.FilterSet):
         # Apply any referenced SavedFilters
         if data and ('filter' in data or 'filter_id' in data):
             data = data.copy()  # Get a mutable copy
-            saved_filters = SavedFilter.objects.filter(
+
+            # Coerce filter_id values to integers, ignoring any which are not valid (see #22568)
+            filter_ids = []
+            for f_id in data.pop('filter_id', []):
+                try:
+                    filter_ids.append(int(f_id))
+                except (ValueError, TypeError):
+                    pass
+
+            # Only apply SavedFilters the requesting user is permitted to see (#22790). Fall back to
+            # anonymous visibility (shared filters only) when no request is available.
+            request = kwargs.get('request')
+            user = request.user if request else AnonymousUser()
+            saved_filters = SavedFilter.objects.restrict_to_shared(user).filter(
                 Q(slug__in=data.pop('filter', [])) |
-                Q(pk__in=data.pop('filter_id', []))
+                Q(pk__in=filter_ids)
             )
             for sf in saved_filters:
                 for key, value in sf.parameters.items():
@@ -136,26 +160,34 @@ class BaseFilterSet(django_filters.FilterSet):
         )):
             return FILTER_NUMERIC_BASED_LOOKUP_MAP
 
-        elif isinstance(existing_filter, (
+        if isinstance(existing_filter, (
             filters.TreeNodeMultipleChoiceFilter,
         )):
             # TreeNodeMultipleChoiceFilter only support negation but must maintain the `in` lookup expression
             return FILTER_TREENODE_NEGATION_LOOKUP_MAP
 
-        elif isinstance(existing_filter, (
+        if isinstance(existing_filter, (TagFilter, TagIDFilter)):
+            # Tags additionally support an "any of" (OR) mode, unlike other model choice filters
+            return FILTER_TAG_LOOKUP_MAP
+
+        if isinstance(existing_filter, (
             django_filters.ModelChoiceFilter,
             django_filters.ModelMultipleChoiceFilter,
-            TagFilter
         )):
             # These filter types support only negation
             return FILTER_NEGATION_LOOKUP_MAP
 
-        elif isinstance(existing_filter, (
+        if isinstance(existing_filter, (
+            filters.MultiValueArrayFilter,
+        )):
+            # Must precede the char-based branch below, which would otherwise shadow this subclass
+            return FILTER_ARRAY_BASED_LOOKUP_MAP
+
+        if isinstance(existing_filter, (
             django_filters.filters.CharFilter,
             django_filters.ChoiceFilter,
             django_filters.MultipleChoiceFilter,
             filters.MultiValueCharFilter,
-            filters.MultiValueMACAddressFilter
         )):
             return FILTER_CHAR_BASED_LOOKUP_MAP
 
@@ -186,7 +218,6 @@ class BaseFilterSet(django_filters.FilterSet):
         # Create new filters for each lookup expression in the map
         for lookup_name, lookup_expr in lookup_map.items():
             new_filter_name = f'{existing_filter_name}__{lookup_name}'
-            existing_filter_extra = deepcopy(existing_filter.extra)
 
             try:
                 if existing_filter_name in cls.declared_filters:
@@ -196,11 +227,14 @@ class BaseFilterSet(django_filters.FilterSet):
                     if field is None:
                         raise ValueError('Invalid field name/lookup on {}: {}'.format(existing_filter_name, field_name))
                     resolve_field(field, lookup_expr)  # Will raise FieldLookupError if the lookup is invalid
-                    filter_cls = type(existing_filter)
-                    if lookup_expr == 'empty':
+                    if lookup_expr in BOOLEAN_LOOKUPS:
+                        # Boolean lookups take a true/false value regardless of the declared filter's type. The
+                        # declared filter's extra kwargs (e.g. min_value, max_digits) don't apply to a BooleanFilter.
                         filter_cls = django_filters.BooleanFilter
-                        for param_to_remove in ('choices', 'null_value'):
-                            existing_filter_extra.pop(param_to_remove, None)
+                        existing_filter_extra = {}
+                    else:
+                        filter_cls = type(existing_filter)
+                        existing_filter_extra = deepcopy(existing_filter.extra)
                     new_filter = filter_cls(
                         field_name=field_name,
                         lookup_expr=lookup_expr,
@@ -225,6 +259,10 @@ class BaseFilterSet(django_filters.FilterSet):
                 # This is a negation filter which requires a queryset.exclude() clause
                 # Of course setting the negation of the existing filter's exclude attribute handles both cases
                 new_filter.exclude = not existing_filter.exclude
+
+            if lookup_name == 'any' and isinstance(new_filter, (TagFilter, TagIDFilter)):
+                # "Any of" is an OR match, whereas TagFilter/TagIDFilter default to AND (conjoined=True)
+                new_filter.conjoined = False
 
             new_filters[new_filter_name] = new_filter
 
@@ -385,7 +423,7 @@ class AttributeFiltersMixin:
 
     def _get_field_lookup(self, key):
         if not key.startswith(self.attribute_filter_prefix):
-            return
+            return None
         lookup = key.split(self.attribute_filter_prefix, 1)[1]  # Strip prefix
         return f'{self.attributes_field_name}__{lookup}'
 

@@ -6,7 +6,10 @@
 
 Default: `('file', 'ftp', 'ftps', 'http', 'https', 'irc', 'mailto', 'sftp', 'ssh', 'tel', 'telnet', 'tftp', 'vnc', 'xmpp')`
 
-A list of permitted URL schemes referenced when rendering links within NetBox. Note that only the schemes specified in this list will be accepted: If adding your own, be sure to replicate all the default values as well (excluding those schemes which are not desirable).
+A list of permitted URL schemes referenced when rendering links within NetBox. This list is also enforced when validating the value of URL custom fields. Note that only the schemes specified in this list will be accepted: If adding your own, be sure to replicate all the default values as well (excluding those schemes which are not desirable).
+
+!!! note
+    Image sources (`<img src="...">`) are limited to HTTP(S) and relative URLs, subject to `ALLOWED_URL_SCHEMES`.
 
 ---
 
@@ -153,7 +156,7 @@ EXEMPT_VIEW_PERMISSIONS = ['*']
 
 Default: `False`
 
-If `True`, the lifetime of a user's authentication session will be automatically reset upon each valid request. For example, if [`LOGIN_TIMEOUT`](#login_timeout) is configured to 14 days (the default), and a user whose session is due to expire in five days makes a NetBox request (with a valid session cookie), the session's lifetime will be reset to 14 days.
+If `True`, the lifetime of a user's authentication session will be automatically reset upon each valid request. For example, if [`LOGIN_TIMEOUT`](#login_timeout) is configured to 14 days, and a user whose session is due to expire in five days makes a NetBox request (with a valid session cookie), the session's lifetime will be reset to 14 days.
 
 Note that enabling this setting causes NetBox to update a user's session in the database (or file, as configured per [`SESSION_FILE_PATH`](#session_file_path)) with each request, which may introduce significant overhead in very active environments. It also permits an active user to remain authenticated to NetBox indefinitely.
 
@@ -161,20 +164,20 @@ Note that enabling this setting causes NetBox to update a user's session in the 
 
 ## LOGIN_REQUIRED
 
+!!! warning "Legacy Configuration Parameter"
+    The `LOGIN_REQUIRED` configuration parameter is deprecated and will be removed in NetBox v5.0. Unauthenticated access to the application will no longer be supported once this configuration parameter is removed.
+
 Default: `True`
 
 When enabled, only authenticated users are permitted to access any part of NetBox. Disabling this will allow unauthenticated users to access most areas of NetBox (but not make any changes).
-
-!!! info "Changed in NetBox v4.0.2"
-    Prior to NetBox v4.0.2, this setting was disabled by default.
 
 ---
 
 ## LOGIN_TIMEOUT
 
-Default: `1209600` seconds (14 days)
+Default: `None`
 
-The lifetime (in seconds) of the authentication cookie issued to a NetBox user upon login.
+The lifetime (in seconds) of the authentication cookie issued to a NetBox user upon login. If set to `None` (the default), Django's [`SESSION_COOKIE_AGE`](https://docs.djangoproject.com/en/stable/ref/settings/#session-cookie-age) is used, which defaults to two weeks (1,209,600 seconds).
 
 ---
 

@@ -5,7 +5,7 @@ from django.utils.safestring import mark_safe
 from core.models import ObjectType
 from extras.models import CustomLink
 from netbox.choices import ButtonColorChoices
-
+from utilities.request import get_safe_request_context
 
 register = template.Library()
 
@@ -34,8 +34,9 @@ def custom_links(context, obj):
     """
     Render all applicable links for the given object.
     """
+    user = context['request'].user
     object_type = ObjectType.objects.get_for_model(obj)
-    custom_links = CustomLink.objects.filter(object_types=object_type, enabled=True)
+    custom_links = CustomLink.objects.restrict(user, 'view').filter(object_types=object_type, enabled=True)
     if not custom_links:
         return ''
 
@@ -43,7 +44,7 @@ def custom_links(context, obj):
     link_context = {
         'object': obj,
         'debug': context.get('debug', False),  # django.template.context_processors.debug
-        'request': context['request'],  # django.template.context_processors.request
+        'request': get_safe_request_context(context['request']),  # Sanitized subset of the request
         'user': context['user'],  # django.contrib.auth.context_processors.auth
         'perms': context['perms'],  # django.contrib.auth.context_processors.auth
     }
@@ -67,8 +68,8 @@ def custom_links(context, obj):
                         rendered['link'], rendered['link_target'], button_class, rendered['text']
                     )
             except Exception as e:
-                template_code += f'<a class="btn btn-sm btn-outline-secondary" disabled="disabled" title="{e}">' \
-                                 f'<i class="mdi mdi-alert"></i> {cl.name}</a>\n'
+                template_code += f'<a class="btn btn-sm btn-outline-secondary" disabled="disabled" ' \
+                                 f'title="{escape(e)}"><i class="mdi mdi-alert"></i> {escape(cl.name)}</a>\n'
 
     # Add grouped links to template
     for group, links in group_names.items():
@@ -83,8 +84,8 @@ def custom_links(context, obj):
                     )
             except Exception as e:
                 links_rendered.append(
-                    f'<li><a class="dropdown-item" disabled="disabled" title="{e}"><span class="text-muted">'
-                    f'<i class="mdi mdi-alert"></i> {cl.name}</span></a></li>'
+                    f'<li><a class="dropdown-item" disabled="disabled" title="{escape(e)}"><span class="text-muted">'
+                    f'<i class="mdi mdi-alert"></i> {escape(cl.name)}</span></a></li>'
                 )
 
         if links_rendered:

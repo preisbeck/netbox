@@ -15,12 +15,13 @@ from dcim.constants import *
 from dcim.svg import RackElevationSVG
 from netbox.choices import ColorChoices
 from netbox.models import OrganizationalModel, PrimaryModel
-from netbox.models.mixins import WeightMixin
 from netbox.models.features import ContactsMixin, ImageAttachmentsMixin
+from netbox.models.mixins import WeightMixin
 from utilities.conversion import to_grams
 from utilities.data import array_to_string, drange
 from utilities.fields import ColorField, CounterCacheField
 from utilities.tracking import TrackingModelMixin
+
 from .device_components import PowerPort
 from .devices import Device
 from .modules import Module
@@ -28,14 +29,30 @@ from .power import PowerFeed
 
 __all__ = (
     'Rack',
+    'RackGroup',
     'RackReservation',
     'RackRole',
     'RackType',
 )
 
+#
+# Rack Organization
+#
+
+
+class RackGroup(OrganizationalModel):
+    """
+    Racks can be grouped by physical placement within a Location.
+    """
+
+    class Meta:
+        ordering = ('name',)
+        verbose_name = _('rack group')
+        verbose_name_plural = _('rack groups')
+
 
 #
-# Rack Types
+# Rack Base
 #
 
 class RackBase(WeightMixin, PrimaryModel):
@@ -118,9 +135,34 @@ class RackBase(WeightMixin, PrimaryModel):
         null=True
     )
 
+    # Cooling
+    cooling_capability = models.CharField(
+        verbose_name=_('cooling capability'),
+        max_length=50,
+        choices=RackCoolingCapabilityChoices,
+        blank=True,
+        null=True
+    )
+    cooling_capacity = models.DecimalField(
+        verbose_name=_('cooling capacity'),
+        max_digits=10,
+        decimal_places=2,
+        blank=True,
+        null=True,
+        validators=[MinValueValidator(0)],
+        help_text=_('Cooling capacity (kW)')
+    )
+
     class Meta:
         abstract = True
 
+    def get_cooling_capability_color(self):
+        return RackCoolingCapabilityChoices.colors.get(self.cooling_capability)
+
+
+#
+# Rack Types
+#
 
 class RackType(ImageAttachmentsMixin, RackBase):
     """
@@ -153,7 +195,8 @@ class RackType(ImageAttachmentsMixin, RackBase):
 
     clone_fields = (
         'manufacturer', 'form_factor', 'width', 'u_height', 'desc_units', 'outer_width', 'outer_height', 'outer_depth',
-        'outer_unit', 'mounting_depth', 'weight', 'max_weight', 'weight_unit',
+        'outer_unit', 'mounting_depth', 'weight', 'max_weight', 'weight_unit', 'cooling_capability',
+        'cooling_capacity',
     )
     prerequisite_models = (
         'dcim.Manufacturer',
@@ -248,7 +291,8 @@ class Rack(ContactsMixin, ImageAttachmentsMixin, TrackingModelMixin, RackBase):
     # Fields which cannot be set locally if a RackType is assigned
     RACKTYPE_FIELDS = (
         'form_factor', 'width', 'u_height', 'starting_unit', 'desc_units', 'outer_width', 'outer_height',
-        'outer_depth', 'outer_unit', 'mounting_depth', 'weight', 'weight_unit', 'max_weight',
+        'outer_depth', 'outer_unit', 'mounting_depth', 'weight', 'weight_unit', 'max_weight', 'cooling_capability',
+        'cooling_capacity',
     )
 
     form_factor = models.CharField(
@@ -288,6 +332,14 @@ class Rack(ContactsMixin, ImageAttachmentsMixin, TrackingModelMixin, RackBase):
         related_name='racks',
         blank=True,
         null=True
+    )
+    group = models.ForeignKey(
+        to='dcim.RackGroup',
+        on_delete=models.PROTECT,
+        related_name='racks',
+        blank=True,
+        null=True,
+        help_text=_('physical grouping')
     )
     tenant = models.ForeignKey(
         to='tenancy.Tenant',
@@ -340,9 +392,9 @@ class Rack(ContactsMixin, ImageAttachmentsMixin, TrackingModelMixin, RackBase):
     )
 
     clone_fields = (
-        'site', 'location', 'tenant', 'status', 'role', 'form_factor', 'width', 'airflow', 'u_height', 'desc_units',
-        'outer_width', 'outer_height', 'outer_depth', 'outer_unit', 'mounting_depth', 'weight', 'max_weight',
-        'weight_unit',
+        'site', 'location', 'tenant', 'status', 'role', 'form_factor', 'width', 'airflow', 'cooling_capability',
+        'cooling_capacity', 'u_height', 'desc_units', 'outer_width', 'outer_height', 'outer_depth',
+        'outer_unit', 'mounting_depth', 'weight', 'max_weight', 'weight_unit',
     )
     prerequisite_models = (
         'dcim.Site',
@@ -360,6 +412,9 @@ class Rack(ContactsMixin, ImageAttachmentsMixin, TrackingModelMixin, RackBase):
                 fields=('location', 'facility_id'),
                 name='%(app_label)s_%(class)s_unique_location_facility_id'
             ),
+        )
+        indexes = (
+            models.Index(fields=('site', 'location', 'name', 'id')),  # Default ordering
         )
         verbose_name = _('rack')
         verbose_name_plural = _('racks')
@@ -606,9 +661,6 @@ class Rack(ContactsMixin, ImageAttachmentsMixin, TrackingModelMixin, RackBase):
 
         return elevation.render(face)
 
-    def get_0u_devices(self):
-        return self.devices.filter(position=0)
-
     def get_utilization(self):
         """
         Determine the utilization rate of the rack and return it as a percentage. Occupied and reserved units both count
@@ -709,6 +761,9 @@ class RackReservation(PrimaryModel):
 
     class Meta:
         ordering = ['created', 'pk']
+        indexes = (
+            models.Index(fields=('created', 'id')),  # Default ordering
+        )
         verbose_name = _('rack reservation')
         verbose_name_plural = _('rack reservations')
 

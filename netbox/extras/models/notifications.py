@@ -12,6 +12,7 @@ from netbox.models import ChangeLoggedModel
 from netbox.models.features import has_feature
 from netbox.registry import registry
 from users.models import User
+from utilities.choices import Choice
 from utilities.querysets import RestrictedQuerySet
 
 __all__ = (
@@ -26,7 +27,7 @@ def get_event_type_choices():
     Compile a list of choices from all registered event types
     """
     return [
-        (name, event.text)
+        Choice(name, event.text)
         for name, event in registry['event_types'].items()
     ]
 
@@ -73,6 +74,7 @@ class Notification(models.Model):
     class Meta:
         ordering = ('-created', 'pk')
         indexes = (
+            models.Index(fields=('-created', 'id')),  # Default ordering
             models.Index(fields=('object_type', 'object_id')),
         )
         constraints = (
@@ -215,6 +217,7 @@ class Subscription(models.Model):
     class Meta:
         ordering = ('-created', 'user')
         indexes = (
+            models.Index(fields=('-created', 'user')),  # Default ordering
             models.Index(fields=('object_type', 'object_id')),
         )
         constraints = (

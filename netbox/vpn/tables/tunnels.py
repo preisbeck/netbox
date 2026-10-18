@@ -7,8 +7,8 @@ from tenancy.tables import ContactsColumnMixin, TenancyColumnsMixin
 from vpn.models import *
 
 __all__ = (
-    'TunnelTable',
     'TunnelGroupTable',
+    'TunnelTable',
     'TunnelTerminationTable',
 )
 
@@ -66,7 +66,7 @@ class TunnelTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
         model = Tunnel
         fields = (
             'pk', 'id', 'name', 'group', 'status', 'encapsulation', 'ipsec_profile', 'tenant', 'tenant_group',
-            'tunnel_id', 'termination_count', 'description', 'contacts', 'comments', 'tags', 'created',
+            'tunnel_id', 'terminations_count', 'description', 'contacts', 'comments', 'tags', 'created',
             'last_updated',
         )
         default_columns = ('pk', 'name', 'group', 'status', 'encapsulation', 'tenant', 'terminations_count')

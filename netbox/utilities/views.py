@@ -1,11 +1,13 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from django.conf import settings
 from django.contrib.auth.mixins import AccessMixin
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models import QuerySet
 from django.http import HttpResponseForbidden
+from django.template import TemplateDoesNotExist
+from django.template.loader import get_template
 from django.urls import reverse
 from django.urls.exceptions import NoReverseMatch
 from django.utils.translation import gettext_lazy as _
@@ -17,6 +19,7 @@ from netbox.registry import registry
 from utilities.relations import get_related_models
 from utilities.request import safe_for_redirect
 from utilities.string import title
+
 from .permissions import resolve_permission
 
 __all__ = (
@@ -28,6 +31,8 @@ __all__ = (
     'TokenConditionalLoginRequiredMixin',
     'ViewTab',
     'get_action_url',
+    'get_default_template',
+    'get_view',
     'get_viewname',
     'register_model_view',
 )
@@ -195,7 +200,7 @@ class GetRelatedModelsMixin:
         def name(self):
             return self.label or title(_(self.queryset.model._meta.verbose_name_plural))
 
-    def get_related_models(self, request, instance, omit=None, extra=None):
+    def get_related_models(self, request, instance, omit=None, extra=None, include_hidden=False):
         """
         Get related models of the view's `queryset` model without those listed in `omit`. Will be sorted alphabetical.
 
@@ -207,12 +212,13 @@ class GetRelatedModelsMixin:
                 provide a `_list` view.
             extra: Add extra models to the list of automatically determined related models. Can be used to add indirect
                 relationships.
+            include_hidden: Also match relationships declared with `related_name='+'`.
         """
         omit = omit or []
         model = self.queryset.model
         related = filter(
             lambda m: m[0] is not model and m[0] not in omit,
-            get_related_models(model, False)
+            get_related_models(model, ordered=False, include_hidden=include_hidden)
         )
 
         related_models = [
@@ -334,6 +340,19 @@ def get_action_url(model, action=None, rest_api=False, kwargs=None):
     return reverse(get_viewname(model, action, rest_api), kwargs=kwargs)
 
 
+def get_default_template(model):
+    """
+    Return the base template for the given model. If the presumed "{app}/{model}.html" template
+    does not exist, fall back to "generic/object.html".
+    """
+    template_name = f'{model._meta.app_label}/{model._meta.model_name}.html'
+    try:
+        get_template(template_name)
+        return template_name
+    except TemplateDoesNotExist:
+        return 'generic/object.html'
+
+
 def register_model_view(model, name='', path=None, detail=True, kwargs=None):
     """
     This decorator can be used to "attach" a view to any model in NetBox. This is typically used to inject
@@ -372,3 +391,18 @@ def register_model_view(model, name='', path=None, detail=True, kwargs=None):
         return cls
 
     return _wrapper
+
+
+def get_view(model, name=''):
+    """
+    Return the view class registered for a model under the given name, or None if no matching view is registered.
+
+    Args:
+        model: A model class or instance whose registered view should be returned.
+        name: The name under which the view was registered (see `register_model_view()`). Defaults to the
+            model's base (detail) view.
+    """
+    app_label = model._meta.app_label
+    model_name = model._meta.model_name
+    views = registry['views'].get(app_label, {}).get(model_name, [])
+    return next((v['view'] for v in views if v['name'] == name), None)

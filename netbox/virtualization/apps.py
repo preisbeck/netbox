@@ -7,11 +7,12 @@ class VirtualizationConfig(AppConfig):
     def ready(self):
         from netbox.models.features import register_models
         from utilities.counters import connect_counters
+
         from . import search, signals  # noqa: F401
-        from .models import VirtualMachine
+        from .models import VirtualMachine, VirtualMachineType
 
         # Register models
         register_models(*self.get_models())
 
         # Register counters
-        connect_counters(VirtualMachine)
+        connect_counters(VirtualMachine, VirtualMachineType)

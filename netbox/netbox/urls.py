@@ -4,12 +4,12 @@ from django.urls import path
 from django.views.decorators.cache import cache_page
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
-from account.views import LoginView, LogoutView
+from account.views import LoginView, LogoutView, SocialAuthBeginView
 from netbox.api.views import APIRootView, AuthenticationCheckView, StatusView
 from netbox.graphql.schema import schema
 from netbox.graphql.views import NetBoxGraphQLView
-from netbox.plugins.urls import plugin_patterns, plugin_api_patterns
-from netbox.views import HomeView, MediaView, StaticMediaFailureView, SearchView, htmx
+from netbox.plugins.urls import plugin_api_patterns, plugin_patterns
+from netbox.views import HomeView, MediaView, SearchView, StaticMediaFailureView, htmx
 
 _patterns = [
 
@@ -20,6 +20,7 @@ _patterns = [
     # Login/logout
     path('login/', LoginView.as_view(), name='login'),
     path('logout/', LogoutView.as_view(), name='logout'),
+    path('oauth/begin/<str:backend>/', SocialAuthBeginView.as_view(), name='social_auth_begin'),
     path('oauth/', include('social_django.urls', namespace='social')),
 
     # Apps

@@ -3,6 +3,7 @@ from functools import cache
 from django.utils.translation import gettext_lazy as _
 
 from netbox.registry import registry
+
 from . import *
 
 #
@@ -49,13 +50,19 @@ RACKS_MENU = Menu(
             label=_('Racks'),
             items=(
                 get_model_item('dcim', 'rack', _('Racks')),
-                get_model_item('dcim', 'rackrole', _('Rack Roles')),
                 get_model_item('dcim', 'rackreservation', _('Reservations')),
                 MenuItem(
                     link='dcim:rack_elevation_list',
                     link_text=_('Elevations'),
                     permissions=['dcim.view_rack']
                 ),
+            ),
+        ),
+        MenuGroup(
+            label=_('Rack Organization'),
+            items=(
+                get_model_item('dcim', 'rackgroup', _('Rack Groups')),
+                get_model_item('dcim', 'rackrole', _('Rack Roles')),
             ),
         ),
         MenuGroup(
@@ -88,6 +95,7 @@ DEVICES_MENU = Menu(
                 get_model_item('dcim', 'devicetype', _('Device Types')),
                 get_model_item('dcim', 'moduletype', _('Module Types')),
                 get_model_item('dcim', 'moduletypeprofile', _('Module Type Profiles')),
+                get_model_item('dcim', 'modulebaytype', _('Module Bay Types')),
                 get_model_item('dcim', 'manufacturer', _('Manufacturers')),
             ),
         ),
@@ -101,6 +109,8 @@ DEVICES_MENU = Menu(
                 get_model_item('dcim', 'consoleserverport', _('Console Server Ports')),
                 get_model_item('dcim', 'powerport', _('Power Ports')),
                 get_model_item('dcim', 'poweroutlet', _('Power Outlets')),
+                get_model_item('dcim', 'coolingintake', _('Cooling Intakes')),
+                get_model_item('dcim', 'coolingoutflow', _('Cooling Outflows')),
                 get_model_item('dcim', 'modulebay', _('Module Bays')),
                 get_model_item('dcim', 'devicebay', _('Device Bays')),
                 get_model_item('dcim', 'inventoryitem', _('Inventory Items')),
@@ -124,6 +134,7 @@ CONNECTIONS_MENU = Menu(
             label=_('Connections'),
             items=(
                 get_model_item('dcim', 'cable', _('Cables')),
+                get_model_item('dcim', 'cablebundle', _('Cable Bundles')),
                 get_model_item('wireless', 'wirelesslink', _('Wireless Links')),
                 MenuItem(
                     link='dcim:interface_connections_list',
@@ -260,6 +271,7 @@ VIRTUALIZATION_MENU = Menu(
                 get_model_item('virtualization', 'virtualmachine', _('Virtual Machines')),
                 get_model_item('virtualization', 'vminterface', _('Interfaces')),
                 get_model_item('virtualization', 'virtualdisk', _('Virtual Disks')),
+                get_model_item('virtualization', 'virtualmachinetype', _('Virtual Machine Types')),
             ),
         ),
         MenuGroup(
@@ -320,6 +332,20 @@ POWER_MENU = Menu(
             items=(
                 get_model_item('dcim', 'powerfeed', _('Power Feeds')),
                 get_model_item('dcim', 'powerpanel', _('Power Panels')),
+            ),
+        ),
+    ),
+)
+
+COOLING_MENU = Menu(
+    label=_('Cooling'),
+    icon_class='mdi mdi-snowflake',
+    groups=(
+        MenuGroup(
+            label=_('Cooling'),
+            items=(
+                get_model_item('dcim', 'coolingsource', _('Cooling Sources')),
+                get_model_item('dcim', 'coolingfeed', _('Cooling Feeds')),
             ),
         ),
     ),
@@ -472,6 +498,7 @@ def get_menus():
         VIRTUALIZATION_MENU,
         CIRCUITS_MENU,
         POWER_MENU,
+        COOLING_MENU,
         PROVISIONING_MENU,
         CUSTOMIZATION_MENU,
         OPERATIONS_MENU,

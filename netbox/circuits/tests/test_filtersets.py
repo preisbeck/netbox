@@ -1,3 +1,4 @@
+from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
 
 from circuits.choices import *
@@ -5,15 +6,24 @@ from circuits.filtersets import *
 from circuits.models import *
 from dcim.choices import InterfaceTypeChoices, LocationStatusChoices
 from dcim.models import (
-    Cable, Device, DeviceRole, DeviceType, Interface, Location, Manufacturer, Region, Site, SiteGroup
+    Cable,
+    Device,
+    DeviceRole,
+    DeviceType,
+    Interface,
+    Location,
+    Manufacturer,
+    Region,
+    Site,
+    SiteGroup,
 )
 from ipam.models import ASN, RIR
 from netbox.choices import DistanceUnitChoices
 from tenancy.models import Tenant, TenantGroup
-from utilities.testing import ChangeLoggedFilterSetTests
+from utilities.testing import ChangeLoggedFilterSetTestMixin
 
 
-class ProviderTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ProviderTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Provider.objects.all()
     filterset = ProviderFilterSet
 
@@ -125,7 +135,7 @@ class ProviderTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class CircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
+class CircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = CircuitType.objects.all()
     filterset = CircuitTypeFilterSet
 
@@ -155,7 +165,7 @@ class CircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class CircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
+class CircuitTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Circuit.objects.all()
     filterset = CircuitFilterSet
 
@@ -360,6 +370,8 @@ class CircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
         provider_accounts = ProviderAccount.objects.all()[:2]
         params = {'provider_account_id': [provider_accounts[0].pk, provider_accounts[1].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+        params = {'provider_account': [provider_accounts[0].account, provider_accounts[1].account]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
     def test_provider_network(self):
         provider_networks = ProviderNetwork.objects.all()[:2]
@@ -430,7 +442,7 @@ class CircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
 
-class CircuitTerminationTestCase(TestCase, ChangeLoggedFilterSetTests):
+class CircuitTerminationTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = CircuitTermination.objects.all()
     filterset = CircuitTerminationFilterSet
     ignore_fields = ('cable', 'cable_positions')
@@ -599,7 +611,7 @@ class CircuitTerminationTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)
 
 
-class CircuitGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
+class CircuitGroupTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = CircuitGroup.objects.all()
     filterset = CircuitGroupFilterSet
 
@@ -657,7 +669,7 @@ class CircuitGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
 
-class CircuitGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
+class CircuitGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = CircuitGroupAssignment.objects.all()
     filterset = CircuitGroupAssignmentFilterSet
 
@@ -749,6 +761,33 @@ class CircuitGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
         )
         CircuitGroupAssignment.objects.bulk_create(assignments)
 
+    def test_q(self):
+        """Search by circuit CID, virtual circuit CID or group name."""
+        params = {'q': 'Circuit 1'}  # Also matches Virtual Circuit 1
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'q': 'Virtual Circuit 1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'q': 'Group 1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'q': 'foobar'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+
+    def test_q_member_type(self):
+        """A CID match is limited to its member type, so a matching ID of another type is excluded."""
+        virtual_circuit = VirtualCircuit.objects.get(cid='Virtual Circuit 1')
+        circuit_type = ContentType.objects.get_for_model(Circuit)
+        virtual_circuit_type = ContentType.objects.get_for_model(VirtualCircuit)
+        expected = self.queryset.get(member_type=virtual_circuit_type, member_id=virtual_circuit.pk)
+
+        # A circuit assignment sharing the virtual circuit's object ID must not match
+        group = CircuitGroup.objects.create(name='Circuit Group 4', slug='circuit-group-4')
+        CircuitGroupAssignment.objects.create(
+            group=group, member_type=circuit_type, member_id=virtual_circuit.pk
+        )
+
+        params = {'q': 'Virtual Circuit 1'}
+        self.assertEqual(list(self.filterset(params, self.queryset).qs), [expected])
+
     def test_group(self):
         groups = CircuitGroup.objects.all()[:2]
         params = {'group_id': [groups[0].pk, groups[1].pk]}
@@ -770,6 +809,30 @@ class CircuitGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'virtual_circuit': [virtual_circuits[0].cid, virtual_circuits[1].cid]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_member_type(self):
+        params = {'member_type': ['circuits.circuit']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'member_type_id': [ContentType.objects.get_for_model(Circuit).pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'member_type_id': [ContentType.objects.get_for_model(VirtualCircuit).pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_member(self):
+        """The member type and ID are matched together, so a matching ID of another type is excluded."""
+        circuit = Circuit.objects.first()
+        circuit_type = ContentType.objects.get_for_model(Circuit)
+        virtual_circuit_type = ContentType.objects.get_for_model(VirtualCircuit)
+        expected = self.queryset.get(member_type=circuit_type, member_id=circuit.pk)
+
+        # A virtual circuit assignment sharing the circuit's object ID must not match
+        group = CircuitGroup.objects.create(name='Circuit Group 4', slug='circuit-group-4')
+        CircuitGroupAssignment.objects.create(
+            group=group, member_type=virtual_circuit_type, member_id=circuit.pk
+        )
+
+        params = {'member_type_id': [circuit_type.pk], 'member_id': [circuit.pk]}
+        self.assertEqual(list(self.filterset(params, self.queryset).qs), [expected])
+
     def test_provider(self):
         providers = Provider.objects.all()[:2]
         params = {'provider_id': [providers[0].pk, providers[1].pk]}
@@ -778,7 +841,7 @@ class CircuitGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
 
-class ProviderNetworkTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ProviderNetworkTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ProviderNetwork.objects.all()
     filterset = ProviderNetworkFilterSet
 
@@ -819,7 +882,7 @@ class ProviderNetworkTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ProviderAccountTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ProviderAccountTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ProviderAccount.objects.all()
     filterset = ProviderAccountFilterSet
 
@@ -864,7 +927,7 @@ class ProviderAccountTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VirtualCircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VirtualCircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VirtualCircuitType.objects.all()
     filterset = VirtualCircuitTypeFilterSet
 
@@ -894,7 +957,7 @@ class VirtualCircuitTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VirtualCircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VirtualCircuitTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VirtualCircuit.objects.all()
     filterset = VirtualCircuitFilterSet
 
@@ -994,6 +1057,8 @@ class VirtualCircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
         provider_accounts = ProviderAccount.objects.all()[:2]
         params = {'provider_account_id': [provider_accounts[0].pk, provider_accounts[1].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'provider_account': [provider_accounts[0].account, provider_accounts[1].account]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_provider_network(self):
         provider_networks = ProviderNetwork.objects.all()[:2]
@@ -1030,7 +1095,7 @@ class VirtualCircuitTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VirtualCircuitTerminationTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VirtualCircuitTerminationTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VirtualCircuitTermination.objects.all()
     filterset = VirtualCircuitTerminationFilterSet
 

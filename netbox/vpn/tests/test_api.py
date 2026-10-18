@@ -9,7 +9,7 @@ from vpn.choices import *
 from vpn.models import *
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
         url = reverse('vpn-api:api-root')
@@ -18,7 +18,7 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class TunnelGroupTest(APIViewTestCases.APIViewTestCase):
+class TunnelGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = TunnelGroup
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'tunnel_count', 'url']
     create_data = (
@@ -38,6 +38,9 @@ class TunnelGroupTest(APIViewTestCases.APIViewTestCase):
     bulk_update_data = {
         'description': 'New description',
     }
+    bulk_update_invalid_data = {
+        'owner': 99999,
+    }
 
     @classmethod
     def setUpTestData(cls):
@@ -50,13 +53,16 @@ class TunnelGroupTest(APIViewTestCases.APIViewTestCase):
         TunnelGroup.objects.bulk_create(tunnel_groups)
 
 
-class TunnelTest(APIViewTestCases.APIViewTestCase):
+class TunnelTestCase(APIViewTestCases.APIViewTestCase):
     model = Tunnel
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
         'status': TunnelStatusChoices.STATUS_PLANNED,
         'encapsulation': TunnelEncapsulationChoices.ENCAP_GRE,
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
     }
 
     @classmethod
@@ -111,11 +117,14 @@ class TunnelTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class TunnelTerminationTest(APIViewTestCases.APIViewTestCase):
+class TunnelTerminationTestCase(APIViewTestCases.APIViewTestCase):
     model = TunnelTermination
     brief_fields = ['display', 'id', 'url']
     bulk_update_data = {
         'role': TunnelTerminationRoleChoices.ROLE_PEER,
+    }
+    bulk_update_invalid_data = {
+        'role': 'not-a-valid-role',
     }
     user_permissions = ('vpn.view_tunnel', )
 
@@ -179,7 +188,7 @@ class TunnelTerminationTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class IKEProposalTest(APIViewTestCases.APIViewTestCase):
+class IKEProposalTestCase(APIViewTestCases.APIViewTestCase):
     model = IKEProposal
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -188,6 +197,9 @@ class IKEProposalTest(APIViewTestCases.APIViewTestCase):
         'authentication_algorithm': AuthenticationAlgorithmChoices.AUTH_HMAC_MD5,
         'group': DHGroupChoices.GROUP_19,
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'authentication_algorithm': 'not-a-valid-authentication-algorithm',
     }
 
     @classmethod
@@ -243,7 +255,7 @@ class IKEProposalTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class IKEPolicyTest(APIViewTestCases.APIViewTestCase):
+class IKEPolicyTestCase(APIViewTestCases.APIViewTestCase):
     model = IKEPolicy
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
@@ -251,6 +263,9 @@ class IKEPolicyTest(APIViewTestCases.APIViewTestCase):
         'mode': IKEModeChoices.AGGRESSIVE,
         'description': 'New description',
         'preshared_key': 'New key',
+    }
+    bulk_update_invalid_data = {
+        'version': 'not-a-valid-version',
     }
 
     @classmethod
@@ -317,13 +332,16 @@ class IKEPolicyTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class IPSecProposalTest(APIViewTestCases.APIViewTestCase):
+class IPSecProposalTestCase(APIViewTestCases.APIViewTestCase):
     model = IPSecProposal
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
         'encryption_algorithm': EncryptionAlgorithmChoices.ENCRYPTION_AES192_CBC,
         'authentication_algorithm': AuthenticationAlgorithmChoices.AUTH_HMAC_MD5,
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'encryption_algorithm': 'not-a-valid-encryption-algorithm',
     }
 
     @classmethod
@@ -367,12 +385,15 @@ class IPSecProposalTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class IPSecPolicyTest(APIViewTestCases.APIViewTestCase):
+class IPSecPolicyTestCase(APIViewTestCases.APIViewTestCase):
     model = IPSecPolicy
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
         'pfs_group': DHGroupChoices.GROUP_5,
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'pfs_group': 'not-a-valid-pfs-group',
     }
 
     @classmethod
@@ -429,7 +450,7 @@ class IPSecPolicyTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class IPSecProfileTest(APIViewTestCases.APIViewTestCase):
+class IPSecProfileTestCase(APIViewTestCases.APIViewTestCase):
     model = IPSecProfile
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     user_permissions = ('vpn.view_ikepolicy', 'vpn.view_ipsecpolicy')
@@ -519,8 +540,12 @@ class IPSecProfileTest(APIViewTestCases.APIViewTestCase):
             'description': 'New description',
         }
 
+        cls.bulk_update_invalid_data = {
+            'mode': 'not-a-valid-mode',
+        }
 
-class L2VPNTest(APIViewTestCases.APIViewTestCase):
+
+class L2VPNTestCase(APIViewTestCases.APIViewTestCase):
     model = L2VPN
     brief_fields = ['description', 'display', 'id', 'identifier', 'name', 'slug', 'type', 'url']
     create_data = [
@@ -548,6 +573,9 @@ class L2VPNTest(APIViewTestCases.APIViewTestCase):
     ]
     bulk_update_data = {
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
     }
 
     @classmethod
@@ -601,8 +629,28 @@ class L2VPNTest(APIViewTestCases.APIViewTestCase):
         self.assertHttpStatus(response, status.HTTP_200_OK)
         self.assertEqual(response_data['count'], 1)
 
+    def test_type_required(self):
+        """
+        type must be reported as required by OPTIONS, and a POST omitting it must
+        be rejected with a normal "required" validation error rather than a
+        model-level "cannot be blank" error.
+        """
+        self.add_permissions('vpn.add_l2vpn')
 
-class L2VPNTerminationTest(APIViewTestCases.APIViewTestCase):
+        response = self.client.options(self._get_list_url(), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertTrue(response.data['actions']['POST']['type']['required'])
+
+        data = {
+            'name': 'L2VPN Missing Type',
+            'slug': 'l2vpn-missing-type',
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data['type'][0].code, 'required')
+
+
+class L2VPNTerminationTestCase(APIViewTestCases.APIViewTestCase):
     model = L2VPNTermination
     brief_fields = ['display', 'id', 'l2vpn', 'url']
     user_permissions = ('dcim.view_location', 'vpn.view_l2vpn')
@@ -655,4 +703,8 @@ class L2VPNTerminationTest(APIViewTestCases.APIViewTestCase):
 
         cls.bulk_update_data = {
             'l2vpn': l2vpns[2].pk
+        }
+
+        cls.bulk_update_invalid_data = {
+            'l2vpn': 99999,
         }

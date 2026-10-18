@@ -5,10 +5,14 @@ from django.conf import settings
 from django.contrib import auth, messages
 from django.contrib.auth.middleware import RemoteUserMiddleware as RemoteUserMiddleware_
 from django.core.exceptions import ImproperlyConfigured
-from django.db import connection, ProgrammingError
+from django.core.signals import got_request_exception
+from django.db import ProgrammingError, connection
 from django.db.utils import InternalError
 from django.http import Http404, HttpResponseRedirect
+from django.middleware.common import CommonMiddleware as DjangoCommonMiddleware
+from django.utils.translation import gettext_lazy as _
 from django_prometheus import middleware
+from social_django.middleware import SocialAuthExceptionMiddleware as SocialAuthExceptionMiddleware_
 
 from netbox.config import clear_config, get_config
 from netbox.metrics import Metrics
@@ -18,12 +22,31 @@ from utilities.error_handlers import handle_rest_api_exception
 from utilities.request import apply_request_processors
 
 __all__ = (
+    'CommonMiddleware',
     'CoreMiddleware',
     'MaintenanceModeMiddleware',
     'PrometheusAfterMiddleware',
     'PrometheusBeforeMiddleware',
     'RemoteUserMiddleware',
+    'SocialAuthExceptionMiddleware',
 )
+
+
+class CommonMiddleware(DjangoCommonMiddleware):
+    """
+    Subclass of Django's CommonMiddleware that suppresses the APPEND_SLASH
+    redirect for REST API requests using an unsafe HTTP method. Redirecting a
+    POST/PUT/PATCH/DELETE to a trailing-slash URL would either drop the request
+    body (clients downgrade to GET on a 302) or raise a RuntimeError when
+    DEBUG is enabled. Letting the original 404 propagate gives the caller a
+    clear, actionable error instead.
+    """
+    UNSAFE_METHODS = frozenset(('DELETE', 'PATCH', 'POST', 'PUT'))
+
+    def should_redirect_with_slash(self, request):
+        if request.method in self.UNSAFE_METHODS and is_api_request(request):
+            return False
+        return super().should_redirect_with_slash(request)
 
 
 class CoreMiddleware:
@@ -40,15 +63,24 @@ class CoreMiddleware:
         with apply_request_processors(request):
             response = self.get_response(request)
 
-        # Check if language cookie should be renewed
-        if request.user.is_authenticated and settings.SESSION_SAVE_EVERY_REQUEST:
-            if language := request.user.config.get('locale.language'):
-                response.set_cookie(
-                    key=settings.LANGUAGE_COOKIE_NAME,
-                    value=language,
-                    max_age=request.session.get_expiry_age(),
-                    secure=settings.SESSION_COOKIE_SECURE,
-                )
+        # Set or renew the language cookie based on the user's preference. This handles two cases:
+        # 1. The user just logged in (via any auth backend): the user_logged_in signal stores the preferred language on
+        #    the request so we set the cookie here on the login response.
+        # 2. SESSION_SAVE_EVERY_REQUEST is enabled: renew the language cookie on every request to keep it in sync with
+        #    the session expiry.
+        if hasattr(request, '_language_cookie'):
+            language = request._language_cookie
+        elif request.user.is_authenticated and settings.SESSION_SAVE_EVERY_REQUEST:
+            language = request.user.config.get('locale.language')
+        else:
+            language = None
+        if language:
+            response.set_cookie(
+                key=settings.LANGUAGE_COOKIE_NAME,
+                value=language,
+                max_age=request.session.get_expiry_age(),
+                secure=settings.SESSION_COOKIE_SECURE,
+            )
 
         # Attach the unique request ID as an HTTP header.
         response['X-Request-ID'] = request.id
@@ -71,15 +103,18 @@ class CoreMiddleware:
         """
         # Don't catch exceptions when in debug mode
         if settings.DEBUG:
-            return
+            return None
 
-        # Cleanly handle exceptions that occur from REST API requests
-        if is_api_request(request):
+        # Cleanly handle exceptions that occur from REST or GraphQL API requests
+        if is_api_request(request) or is_graphql_request(request):
+            # Fire Django's got_request_exception signal so error-tracking
+            # integrations (e.g. Sentry) capture the exception.
+            got_request_exception.send(sender=self.__class__, request=request)
             return handle_rest_api_exception(request)
 
         # Ignore Http404s (defer to Django's built-in 404 handling)
         if isinstance(exception, Http404):
-            return
+            return None
 
         # Determine the type of exception. If it's a common issue, return a custom error page with instructions.
         custom_template = None
@@ -92,7 +127,11 @@ class CoreMiddleware:
 
         # Return a custom error message, or fall back to Django's default 500 error handling
         if custom_template:
+            # Fire Django's got_request_exception signal so error-tracking
+            # integrations (e.g. Sentry) capture the exception.
+            got_request_exception.send(sender=self.__class__, request=request)
             return handler_500(request, template_name=custom_template)
+        return None
 
 
 class RemoteUserMiddleware(RemoteUserMiddleware_):
@@ -139,10 +178,9 @@ class RemoteUserMiddleware(RemoteUserMiddleware_):
         if request.user.is_authenticated:
             if request.user.get_username() == self.clean_username(username, request):
                 return self.get_response(request)
-            else:
-                # An authenticated user is associated with the request, but
-                # it does not match the authorized user in the header.
-                self._remove_invalid_user(request)
+            # An authenticated user is associated with the request, but
+            # it does not match the authorized user in the header.
+            self._remove_invalid_user(request)
 
         # We are seeing this user for the first time in this session, attempt
         # to authenticate the user.
@@ -245,8 +283,19 @@ class MaintenanceModeMiddleware:
             error_message = 'NetBox is currently operating in maintenance mode and is unable to perform write ' \
                             'operations. Please try again later.'
 
-            if is_api_request(request):
+            if is_api_request(request) or is_graphql_request(request):
                 return handle_rest_api_exception(request, error=error_message)
 
             messages.error(request, error_message)
             return HttpResponseRedirect(request.path_info)
+        return None
+
+
+class SocialAuthExceptionMiddleware(SocialAuthExceptionMiddleware_):
+    """
+    Subclass of python-social-auth's exception middleware which surfaces a generic, user-friendly
+    message rather than exposing the raw social_core exception text to (typically unauthenticated)
+    users when an SSO/SAML login fails.
+    """
+    def get_message(self, request, exception):
+        return _("Single sign-on failed. Please try again or contact your administrator.")

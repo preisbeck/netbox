@@ -1,14 +1,16 @@
 import re
 
+import netaddr
 from django import forms
 from django.utils.translation import gettext_lazy as _
 
 from utilities.forms.constants import *
-from utilities.forms.utils import expand_alphanumeric_pattern, expand_ipaddress_pattern
+from utilities.forms.utils import expand_alphanumeric_pattern, expand_ipnetwork_pattern
 
 __all__ = (
-    'ExpandableIPAddressField',
+    'ExpandableIPNetworkField',
     'ExpandableNameField',
+    'ExpandableNumericField',
 )
 
 
@@ -34,22 +36,51 @@ class ExpandableNameField(forms.CharField):
         return [value]
 
 
-class ExpandableIPAddressField(forms.CharField):
+class ExpandableNumericField(ExpandableNameField):
     """
-    A field which allows for expansion of IP address ranges
-      Example: '192.0.2.[1-254]/24' => ['192.0.2.1/24', '192.0.2.2/24', '192.0.2.3/24' ... '192.0.2.254/24']
+    An ExpandableNameField intended for numeric values, yielding integer-compatible strings suitable for bulk creation.
+      Example: '[1-3]' => ['1', '2', '3']
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Replace the inherited alphanumeric default with numeric-specific guidance (unless one was supplied)
+        if not kwargs.get('help_text'):
+            self.help_text = _("Numeric ranges are supported for bulk creation (example: <code>[1-24]</code>).")
+
+
+class ExpandableIPNetworkField(forms.CharField):
+    """
+    A CharField that expands numeric range patterns in IPv4/IPv6 CIDR notation into multiple entries.
+
+    Examples:
+        '192.0.2.[1-254]/32' => ['192.0.2.1/32', '192.0.2.2/32', ...]
+        '10.[0-3,10-13].0.0/16' => ['10.0.0.0/16', '10.1.0.0/16', ..., '10.10.0.0/16', ...]
+        '2001:db8:[0-f]::/64' => ['2001:db8:0::/64', '2001:db8:1::/64', ...]
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.help_text:
-            self.help_text = _('Specify a numeric range to create multiple IPs.<br />'
-                               'Example: <code>192.0.2.[1,5,100-254]/24</code>')
+            self.help_text = _(
+                'Use bracket notation to specify numeric ranges for bulk creation (CIDR required).<br />'
+                'Examples: <code>192.0.2.[1-10]/32</code>, <code>10.[0-3,10-13].0.0/16</code>, '
+                '<code>2001:db8:[a-f]::/64</code>'
+            )
 
     def to_python(self, value):
-        # Hackish address family detection but it's all we have to work with
-        if '.' in value and re.search(IP4_EXPANSION_PATTERN, value):
-            return list(expand_ipaddress_pattern(value, 4))
-        elif ':' in value and re.search(IP6_EXPANSION_PATTERN, value):
-            return list(expand_ipaddress_pattern(value, 6))
+        if not value:
+            return [value]
+
+        # Replace expansion brackets with a neutral value to get a parseable IP/CIDR
+        stripped = re.sub(r'(?>\[[^\]]+\])', '0', value)
+        try:
+            family = netaddr.IPNetwork(stripped).version
+        except (netaddr.AddrFormatError, ValueError):
+            return [value]
+
+        if family == 4 and re.search(IP4_EXPANSION_PATTERN, value):
+            return list(expand_ipnetwork_pattern(value, 4))
+        if family == 6 and re.search(IP6_EXPANSION_PATTERN, value):
+            return list(expand_ipnetwork_pattern(value.lower(), 6))
         return [value]

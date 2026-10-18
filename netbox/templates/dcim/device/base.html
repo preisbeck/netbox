@@ -20,7 +20,7 @@
             <button id="add-components" type="button" class="btn btn-primary dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
                 <i class="mdi mdi-plus-thick" aria-hidden="true"></i> {% trans "Add Components" %}
             </button>
-            <ul class="dropdown-menu" aria-labeled-by="add-components">
+            <ul class="dropdown-menu" aria-labelledby="add-components">
                 {% if perms.dcim.add_consoleport %}
                     <li><a class="dropdown-item" href="{% url 'dcim:consoleport_add' %}?device={{ object.pk }}&return_url={% url 'dcim:device_consoleports' pk=object.pk %}">{% trans "Console Ports" %}</a></li>
                 {% endif %}
@@ -32,6 +32,12 @@
                 {% endif %}
                 {% if perms.dcim.add_poweroutlet %}
                     <li><a class="dropdown-item" href="{% url 'dcim:poweroutlet_add' %}?device={{ object.pk }}&return_url={% url 'dcim:device_poweroutlets' pk=object.pk %}">{% trans "Power Outlets" %}</a></li>
+                {% endif %}
+                {% if perms.dcim.add_coolingintake %}
+                    <li><a class="dropdown-item" href="{% url 'dcim:coolingintake_add' %}?device={{ object.pk }}&return_url={% url 'dcim:device_coolingintakes' pk=object.pk %}">{% trans "Cooling Intakes" %}</a></li>
+                {% endif %}
+                {% if perms.dcim.add_coolingoutflow %}
+                    <li><a class="dropdown-item" href="{% url 'dcim:coolingoutflow_add' %}?device={{ object.pk }}&return_url={% url 'dcim:device_coolingoutflows' pk=object.pk %}">{% trans "Cooling Outflows" %}</a></li>
                 {% endif %}
                 {% if perms.dcim.add_interface %}
                     <li><a class="dropdown-item" href="{% url 'dcim:interface_add' %}?device={{ object.pk }}&return_url={% url 'dcim:device_interfaces' pk=object.pk %}">{% trans "Interfaces" %}</a></li>

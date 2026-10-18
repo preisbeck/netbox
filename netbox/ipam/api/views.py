@@ -5,7 +5,7 @@ from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db import router, transaction
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
-from django_pglocks import advisory_lock
+from django_pg_utils import advisory_lock
 from drf_spectacular.utils import extend_schema
 from netaddr import IPSet
 from rest_framework import status
@@ -19,11 +19,12 @@ from ipam import filtersets
 from ipam.models import *
 from ipam.utils import get_next_available_prefix
 from netbox.api.viewsets import NetBoxModelViewSet
-from netbox.api.viewsets.mixins import ObjectValidationMixin
+from netbox.api.viewsets.mixins import ObjectValidationMixin, discard_events_on_rollback
 from netbox.config import get_config
 from netbox.constants import ADVISORY_LOCK_KEYS
-from utilities.api import get_serializer_for_model
+from utilities.api import get_positional_errors, get_serializer_for_model
 from virtualization.models import VMInterface
+
 from . import serializers
 
 
@@ -264,8 +265,10 @@ class AvailableObjectsView(ObjectValidationMixin, APIView):
             **self.get_extra_context(parent),
         })
         if not serializer.is_valid():
+            # Report the errors by the position of each entry in the request, as the serializer is
+            # always bound to a list (a single object having been wrapped in one above)
             return Response(
-                serializer.errors,
+                get_positional_errors(serializer.errors, len(requested_objects)),
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -291,11 +294,17 @@ class AvailableObjectsView(ObjectValidationMixin, APIView):
                 serializer = serializer_class(data=requested_objects[0], context=context)
 
             if not serializer.is_valid():
-                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                # A list request is reported by position; a single object carries no position, and
+                # its errors pass through unchanged
+                return Response(
+                    get_positional_errors(serializer.errors, len(requested_objects)),
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             # Create the new IP address(es)
+            using = router.db_for_write(self.queryset.model)
             try:
-                with transaction.atomic(using=router.db_for_write(self.queryset.model)):
+                with transaction.atomic(using=using), discard_events_on_rollback(self, using=using):
                     created = serializer.save()
                     self._validate_objects(created)
             except ObjectDoesNotExist:
@@ -391,7 +400,7 @@ class AvailablePrefixesView(AvailableObjectsView):
     @extend_schema(
         methods=["post"],
         responses={201: serializers.PrefixSerializer(many=True)},
-        request=serializers.PrefixSerializer(many=True),
+        request=serializers.CreateAvailablePrefixSerializer(many=True),
     )
     def post(self, request, pk):
         return super().post(request, pk)
@@ -406,7 +415,7 @@ class AvailableIPAddressesView(AvailableObjectsView):
     def get_available_objects(self, parent, limit=None):
         # Calculate available IPs within the parent
         ip_list = []
-        for index, ip in enumerate(parent.get_available_ips(), start=1):
+        for index, ip in enumerate(parent.iter_available_ips(), start=1):
             ip_list.append(ip)
             if index == limit:
                 break
@@ -487,7 +496,7 @@ class AvailableVLANsView(AvailableObjectsView):
     @extend_schema(
         methods=["post"],
         responses={201: serializers.VLANSerializer(many=True)},
-        request=serializers.VLANSerializer(many=True),
+        request=serializers.CreateAvailableVLANSerializer(many=True),
     )
     def post(self, request, pk):
         return super().post(request, pk)

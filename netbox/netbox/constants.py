@@ -29,29 +29,11 @@ ADVISORY_LOCK_KEYS = {
     'available-vlans': 100300,
     'available-asns': 100400,
 
-    # MPTT locks
-    'region': 105100,
-    'sitegroup': 105200,
-    'location': 105300,
-    'tenantgroup': 105400,
-    'contactgroup': 105500,
-    'wirelesslangroup': 105600,
-    'inventoryitem': 105700,
-    'inventoryitemtemplate': 105800,
-    'platform': 105900,
-
     # Jobs
     'job-schedules': 110100,
-}
 
-# TODO: Remove in NetBox v4.5
-# Legacy default view action permission mapping
-DEFAULT_ACTION_PERMISSIONS = {
-    'add': {'add'},
-    'export': {'view'},
-    'bulk_import': {'add'},
-    'bulk_edit': {'change'},
-    'bulk_delete': {'delete'},
+    # Custom field data
+    'custom-field-data': 115100,
 }
 
 # General-purpose tokens
@@ -60,3 +42,10 @@ CENSOR_TOKEN_CHANGED = '***CHANGED***'
 
 # Placeholder text for empty tables
 EMPTY_TABLE_TEXT = 'No results found'
+
+# Batch size for deleting a JobsMixin object's associated jobs during cascade deletion. Job
+# cannot be fast-deleted (a global pre_delete receiver forces per-instance signals), so deleting
+# in chunks bounds the work per delete cycle rather than building one huge collection and running
+# one long DELETE. 1000 matches EXPORT_CHUNK_SIZE and, in benchmarking a 200k-job deletion, was
+# the fastest of 100/1000/5000 while keeping peak memory flat. See #22812.
+JOB_DELETE_BATCH_SIZE = 1000

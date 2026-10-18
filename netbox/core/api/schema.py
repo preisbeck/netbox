@@ -1,22 +1,56 @@
+import copy
 import re
 import typing
 from collections import OrderedDict
 
-from drf_spectacular.extensions import OpenApiSerializerFieldExtension, OpenApiSerializerExtension, _SchemaType
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.translation import gettext_lazy as _
+from drf_spectacular.contrib.django_filters import DjangoFilterExtension
+from drf_spectacular.extensions import OpenApiSerializerExtension, OpenApiSerializerFieldExtension, _SchemaType
 from drf_spectacular.openapi import AutoSchema
 from drf_spectacular.plumbing import (
-    build_basic_type, build_choice_field, build_media_type_object, build_object_type, get_doc,
+    build_basic_type,
+    build_choice_field,
+    build_media_type_object,
+    build_object_type,
+    follow_field_source,
+    get_doc,
 )
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import Direction
+from drf_spectacular.utils import Direction, OpenApiParameter, OpenApiResponse
+from rest_framework.fields import ReadOnlyField
+from rest_framework.utils import model_meta
 
 from netbox.api.fields import ChoiceField
-from netbox.api.serializers import WritableNestedSerializer
+from netbox.api.serializers import BulkOperationErrorSerializer, WritableNestedSerializer
 from netbox.api.viewsets import NetBoxModelViewSet
 
 # see netbox.api.routers.NetBoxRouter
 BULK_ACTIONS = ("bulk_destroy", "bulk_partial_update", "bulk_update")
 WRITABLE_ACTIONS = ("PATCH", "POST", "PUT")
+
+
+class NetBoxDjangoFilterExtension(DjangoFilterExtension):
+    """
+    Overrides drf-spectacular's DjangoFilterExtension to fix a regression in v0.29.0 where
+    _get_model_field() incorrectly double-appends to_field_name when field_name already ends
+    with that value (e.g. field_name='tags__slug', to_field_name='slug' produces the invalid
+    path ['tags', 'slug', 'slug']). This caused hundreds of spurious warnings during schema
+    generation for filters such as TagFilter, TenancyFilterSet.tenant, and OwnerFilterMixin.owner.
+
+    See: https://github.com/netbox-community/netbox/issues/20787
+         https://github.com/tfranzel/drf-spectacular/issues/1475
+    """
+    priority = 1
+
+    def _get_model_field(self, filter_field, model):
+        if not filter_field.field_name:
+            return None
+        path = filter_field.field_name.split('__')
+        to_field_name = filter_field.extra.get('to_field_name')
+        if to_field_name is not None and path[-1] != to_field_name:
+            path.append(to_field_name)
+        return follow_field_source(model, path, emit_warnings=False)
 
 
 class FixTimeZoneSerializerField(OpenApiSerializerFieldExtension):
@@ -35,7 +69,7 @@ class ChoiceFieldFix(OpenApiSerializerFieldExtension):
         if direction == 'request':
             return build_cf
 
-        elif direction == "response":
+        if direction == "response":
             value = build_cf
             label = {
                 **build_basic_type(OpenApiTypes.STR),
@@ -48,6 +82,10 @@ class ChoiceFieldFix(OpenApiSerializerFieldExtension):
                     "label": label
                 }
             )
+
+        # TODO: This function should never implicitly/explicitly return `None`
+        # The fallback should be well-defined (drf-spectacular expects request/response naming).
+        return None
 
 
 def viewset_handles_bulk_create(view):
@@ -71,8 +109,7 @@ class NetBoxAutoSchema(AutoSchema):
     def is_bulk_action(self):
         if hasattr(self.view, "action") and self.view.action in BULK_ACTIONS:
             return True
-        else:
-            return False
+        return False
 
     def get_operation_id(self):
         """
@@ -106,14 +143,30 @@ class NetBoxAutoSchema(AutoSchema):
         return super().get_operation_id()
 
     def get_request_serializer(self) -> typing.Any:
-        # bulk operations should specify a list
         serializer = super().get_request_serializer()
 
+        # Bulk update/partial-update has a special request shape: a list of
+        # writable objects plus a required `id` field. The normal writable
+        # serializer omits `id` because it is read-only, so don't use the generic
+        # bulk handling for these actions.
+        action = getattr(self.view, 'action', None)
+        if action in ('bulk_update', 'bulk_partial_update'):
+            get_bulk_update_request_serializer = getattr(
+                self.view,
+                'get_bulk_update_request_serializer',
+                None,
+            )
+            if get_bulk_update_request_serializer is not None:
+                return get_bulk_update_request_serializer(
+                    partial=(action == 'bulk_partial_update' or self.method == 'PATCH')
+                )
+
+        # Bulk creates/deletes should specify a list.
         if self.is_bulk_action:
             return type(serializer)(many=True)
 
-        # handle mapping for Writable serializers - adapted from dansheps original code
-        # for drf-yasg
+        # handle mapping for Writable serializers - adapted from dansheps original
+        # code for drf-yasg.
         if serializer is not None and self.method in WRITABLE_ACTIONS:
             writable_class = self.get_writable_class(serializer)
             if writable_class is not None:
@@ -133,6 +186,106 @@ class NetBoxAutoSchema(AutoSchema):
             return type(response_serializers)(many=True)
 
         return response_serializers
+
+    def _get_bulk_error_responses(self, direction) -> typing.Any:
+        """
+        Return the error responses of the current bulk write action, keyed by status code, or an
+        empty dict if this action is not a bulk write.
+
+        A failed bulk write returns a structured body correlating each failure with the object (or,
+        where no object could be identified, the request position) responsible for it. This is a
+        documented part of the API contract, but drf-spectacular cannot infer it: responses are
+        derived from the request/response serializer alone, which describes only the success case.
+        """
+        action = getattr(self.view, 'action', None)
+
+        if action in ('bulk_update', 'bulk_partial_update'):
+            return {
+                '400': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "One or more of the objects specified could not be updated. No objects were "
+                        "modified: a bulk update is an all-or-none operation."
+                    ),
+                ),
+                '403': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "The requesting user is not permitted to apply one or more of the "
+                        "modifications specified. No objects were modified."
+                    ),
+                ),
+            }
+
+        if action == 'bulk_destroy':
+            return {
+                '400': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "The request was malformed, one or more of the objects specified could not "
+                        "be found, or the deletion of one of them was prevented by a protection "
+                        "rule. No objects were deleted."
+                    ),
+                ),
+                '403': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "The requesting user is not permitted to delete one or more of the objects "
+                        "specified. No objects were deleted."
+                    ),
+                ),
+                '409': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "One or more of the objects specified could not be deleted, because a "
+                        "dependent object prevents it. No objects were deleted: a bulk deletion is "
+                        "an all-or-none operation."
+                    ),
+                ),
+            }
+
+        if action == 'create' and viewset_handles_bulk_create(self.view):
+            # A POST to a list endpoint accepts either a single object or a list of them (see
+            # _get_request_for_media_type()), so its error body takes one of two shapes
+            # accordingly: field-keyed errors for a single object, or the bulk envelope for a list.
+            component = self.resolve_serializer(BulkOperationErrorSerializer, direction)
+            return {
+                '400': OpenApiResponse(
+                    response={
+                        'oneOf': [
+                            build_basic_type(OpenApiTypes.OBJECT),
+                            component.ref if component else build_basic_type(OpenApiTypes.OBJECT),
+                        ],
+                    },
+                    description=_(
+                        "The object could not be created. Where a list was submitted, no objects "
+                        "were created: a bulk creation is an all-or-none operation."
+                    ),
+                ),
+                # A 403 always carries a `detail`, and BulkOperationError's `errors` is optional, so
+                # the one component covers both the single-object and the bulk shape here.
+                '403': OpenApiResponse(
+                    response=BulkOperationErrorSerializer,
+                    description=_(
+                        "The requesting user is not permitted to create one or more of the objects "
+                        "specified. No objects were created."
+                    ),
+                ),
+            }
+
+        return {}
+
+    def _get_response_bodies(self, direction='response') -> typing.Any:
+        responses = super()._get_response_bodies(direction=direction)
+
+        # Document the error responses of the bulk write actions, which cannot be inferred (see
+        # _get_bulk_error_responses). A status code already present -- for instance one declared
+        # via @extend_schema on a custom action -- is left as it is.
+        for code, response in self._get_bulk_error_responses(direction).items():
+            if code not in responses:
+                responses[code] = self._get_response_for_code(response, code, direction=direction)
+
+        return responses
 
     def _get_request_for_media_type(self, serializer, direction='request'):
         """
@@ -167,8 +320,10 @@ class NetBoxAutoSchema(AutoSchema):
     def _get_serializer_name(self, serializer, direction, bypass_extensions=False) -> str:
         name = super()._get_serializer_name(serializer, direction, bypass_extensions)
 
-        # If this serializer is nested, prepend its name with "Brief"
-        if getattr(serializer, 'nested', False):
+        # If this serializer is nested, prepend its name with "Brief". Serializers which declare an explicit
+        # Meta.ref_name are exempt: those are brief by design and have no complete form in the schema, so the
+        # prefix would only rename an existing component to no purpose. See #22989.
+        if getattr(serializer, 'nested', False) and not getattr(getattr(serializer, 'Meta', None), 'ref_name', None):
             name = f'Brief{name}'
 
         return name
@@ -190,6 +345,36 @@ class NetBoxAutoSchema(AutoSchema):
                 ref_name = ref_name[: -len('Serializer')]
         return ref_name
 
+    @staticmethod
+    def _rebuilds_as_writable(serializer, field_name):
+        """
+        Return True if DRF would rebuild the named field in writable form if the field declared on
+        the serializer class were removed (see get_writable_class()).
+
+        This defers to ModelSerializer.build_field(), which is what get_fields() itself calls for
+        any field not explicitly declared on the class -- rather than testing the model for a field
+        of that name, which is a weaker condition. A name backed only by a model property, by a
+        non-editable model field, or by a generic foreign key (which lives in Meta.private_fields
+        and so is absent from DRF's field info) is rebuilt read-only, and is then dropped from the
+        request body altogether.
+        """
+        model = getattr(getattr(serializer, 'Meta', None), 'model', None)
+        if model is None or not hasattr(serializer, 'build_field'):
+            return False
+
+        depth = getattr(serializer.Meta, 'depth', 0)
+        try:
+            field_class, field_kwargs = serializer.build_field(
+                field_name, model_meta.get_field_info(model), model, depth
+            )
+        except ImproperlyConfigured:
+            # build_unknown_field(): the model has nothing of this name at all
+            return False
+
+        if isinstance(field_class, type) and issubclass(field_class, ReadOnlyField):
+            return False
+        return not field_kwargs.get('read_only', False)
+
     def get_writable_class(self, serializer):
         properties = {}
         fields = {} if hasattr(serializer, 'child') else serializer.fields
@@ -203,7 +388,19 @@ class NetBoxAutoSchema(AutoSchema):
             if 'read_only' in dir(child) and child.read_only:
                 remove_fields.append(child_name)
             if isinstance(child, (ChoiceField, WritableNestedSerializer)):
-                properties[child_name] = None
+                if child.read_only or self._rebuilds_as_writable(serializer, child_name):
+                    properties[child_name] = None
+                else:
+                    # DRF cannot rebuild this one writably: it is backed by a read-only property
+                    # (e.g. Service.protocol, derived from port_mappings). Nulling it would leave
+                    # DRF to rebuild it as a ReadOnlyField, which is then omitted from the request
+                    # body altogether -- silently dropping a field the serializer does accept on
+                    # write. Keep the declared field instead; ChoiceFieldFix already renders it
+                    # correctly for the request direction. The copy leaves the bound original
+                    # untouched (Field.__deepcopy__ returns an unbound field built from the same
+                    # arguments), and keeps `properties` non-empty so the writable variant is still
+                    # generated rather than collapsing to None below.
+                    properties[child_name] = copy.deepcopy(child)
 
         if not properties:
             return None
@@ -225,6 +422,37 @@ class NetBoxAutoSchema(AutoSchema):
 
         writable_class = self.writable_serializers[type(serializer)]
         return writable_class
+
+    def get_override_parameters(self):
+        params = super().get_override_parameters()
+        # Expose the ?fields, ?omit, and ?brief query parameters supported by NetBoxModelViewSet
+        # for all non-bulk GET operations (both list and detail).
+        if not self.is_bulk_action and self.method == 'GET':
+            params = list(params) + [
+                OpenApiParameter(
+                    name='fields',
+                    location=OpenApiParameter.QUERY,
+                    required=False,
+                    type=OpenApiTypes.STR,
+                    description='Comma-separated list of fields to include in the response. Example: `fields=id,name`.',
+                ),
+                OpenApiParameter(
+                    name='omit',
+                    location=OpenApiParameter.QUERY,
+                    required=False,
+                    type=OpenApiTypes.STR,
+                    description='Comma-separated list of fields to exclude from the response. '
+                                'Example: `omit=description,tags`.',
+                ),
+                OpenApiParameter(
+                    name='brief',
+                    location=OpenApiParameter.QUERY,
+                    required=False,
+                    type=OpenApiTypes.BOOL,
+                    description='Return only brief fields for each object.',
+                ),
+            ]
+        return params
 
     def get_filter_backends(self):
         # bulk operations don't have filter params
@@ -310,10 +538,13 @@ class FixSerializedPKRelatedField(OpenApiSerializerFieldExtension):
 
     def map_serializer_field(self, auto_schema, direction):
         if direction == "response":
-            component = auto_schema.resolve_serializer(self.target.serializer, direction)
+            # Resolve an instance of the serializer carrying the field's nested setting, so that the brief
+            # component is referenced wherever the field renders a brief representation. (The field's
+            # to_representation() passes nested in the same manner.) See #22989.
+            serializer = self.target.serializer(nested=self.target.nested)
+            component = auto_schema.resolve_serializer(serializer, direction)
             return component.ref if component else None
-        else:
-            return build_basic_type(OpenApiTypes.INT)
+        return build_basic_type(OpenApiTypes.INT)
 
 
 class FixIntegerRangeSerializerSchema(OpenApiSerializerExtension):

@@ -1,8 +1,11 @@
+from functools import cached_property
+
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from dcim.models import FrontPort, FrontPortTemplate, PortMapping, PortTemplateMapping, RearPort, RearPortTemplate
+from dcim.utils import reconcile_port_mappings
 from utilities.api import get_serializer_for_model
 
 __all__ = (
@@ -23,6 +26,11 @@ class ConnectedEndpointsSerializer(serializers.ModelSerializer):
     def get_connected_endpoints_type(self, obj):
         if endpoints := obj.connected_endpoints:
             return f'{endpoints[0]._meta.app_label}.{endpoints[0]._meta.model_name}'
+        return None
+
+    @cached_property
+    def _connected_endpoint_serializers(self):
+        return {}
 
     @extend_schema_field(serializers.ListField(allow_null=True))
     def get_connected_endpoints(self, obj):
@@ -30,13 +38,25 @@ class ConnectedEndpointsSerializer(serializers.ModelSerializer):
         Return the appropriate serializer for the type of connected object.
         """
         if endpoints := obj.connected_endpoints:
-            serializer = get_serializer_for_model(endpoints[0])
-            context = {'request': self.context['request']}
-            return serializer(endpoints, nested=True, many=True, context=context).data
+            serializer_class = get_serializer_for_model(endpoints[0])
+            if serializer_class not in self._connected_endpoint_serializers:
+                self._connected_endpoint_serializers[serializer_class] = serializer_class(
+                    nested=True, many=True, context={'request': self.context['request']}
+                )
+            return self._connected_endpoint_serializers[serializer_class].to_representation(endpoints)
+        return None
 
     @extend_schema_field(serializers.BooleanField)
     def get_connected_endpoints_reachable(self, obj):
-        return obj._path and obj._path.is_complete and obj._path.is_active
+        """
+        Return whether the connected endpoints are reachable via a complete, active cable path.
+        """
+        # Use the public `path` accessor rather than dereferencing `_path`
+        # directly. `path` already handles the stale in-memory relation case
+        # that can occur while CablePath rows are rebuilt during cable edits.
+        if path := obj.path:
+            return path.is_complete and path.is_active
+        return False
 
 
 class PortSerializer(serializers.ModelSerializer):
@@ -58,17 +78,25 @@ class PortSerializer(serializers.ModelSerializer):
             return PortTemplateMapping, 'rear_port'
         raise ValueError(f"Could not determine mapping details for {self.__class__}")
 
+    def _reconcile_mappings(self, instance, mappings):
+        mapping_model, fk_name = self._mapper
+        other_field = 'rear_port' if fk_name == 'front_port' else 'front_port'
+
+        # Normalize the opposite-port FK from a model instance to its id so the mappings can be
+        # reconciled by value.
+        desired = []
+        for attrs in mappings:
+            attrs = dict(attrs)
+            if other_field in attrs:
+                attrs[f'{other_field}_id'] = attrs.pop(other_field).pk
+            desired.append(attrs)
+
+        reconcile_port_mappings(mapping_model, parent_field=fk_name, parent=instance, desired=desired)
+
     def create(self, validated_data):
         mappings = validated_data.pop('mappings', [])
         instance = super().create(validated_data)
-
-        # Create port mappings
-        mapping_model, fk_name = self._mapper
-        for attrs in mappings:
-            mapping_model.objects.create(**{
-                fk_name: instance,
-                **attrs,
-            })
+        self._reconcile_mappings(instance, mappings)
 
         return instance
 
@@ -76,14 +104,9 @@ class PortSerializer(serializers.ModelSerializer):
         mappings = validated_data.pop('mappings', None)
         instance = super().update(instance, validated_data)
 
+        # Only reconcile when the client supplied rear_ports; a PATCH that omits it leaves the
+        # existing mappings untouched.
         if mappings is not None:
-            # Update port mappings
-            mapping_model, fk_name = self._mapper
-            mapping_model.objects.filter(**{fk_name: instance}).delete()
-            for attrs in mappings:
-                mapping_model.objects.create(**{
-                    fk_name: instance,
-                    **attrs,
-                })
+            self._reconcile_mappings(instance, mappings)
 
         return instance

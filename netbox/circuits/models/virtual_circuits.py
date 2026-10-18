@@ -8,7 +8,8 @@ from django.utils.translation import gettext_lazy as _
 
 from circuits.choices import *
 from netbox.models import ChangeLoggedModel, PrimaryModel
-from netbox.models.features import CustomFieldsMixin, CustomLinksMixin, ExportTemplatesMixin, TagsMixin
+from netbox.models.features import ContactsMixin, CustomFieldsMixin, CustomLinksMixin, ExportTemplatesMixin, TagsMixin
+
 from .base import BaseCircuitType
 
 __all__ = (
@@ -29,7 +30,7 @@ class VirtualCircuitType(BaseCircuitType):
         verbose_name_plural = _('virtual circuit types')
 
 
-class VirtualCircuit(PrimaryModel):
+class VirtualCircuit(ContactsMixin, PrimaryModel):
     """
     A virtual connection between two or more endpoints, delivered across one or more physical circuits.
     """
@@ -96,6 +97,9 @@ class VirtualCircuit(PrimaryModel):
                 name='%(app_label)s_%(class)s_unique_provideraccount_cid'
             ),
         )
+        indexes = (
+            models.Index(fields=('provider_network', 'provider_account', 'cid')),  # Default ordering
+        )
         verbose_name = _('virtual circuit')
         verbose_name_plural = _('virtual circuits')
 
@@ -149,6 +153,9 @@ class VirtualCircuitTermination(
 
     class Meta:
         ordering = ['virtual_circuit', 'role', 'pk']
+        indexes = (
+            models.Index(fields=('virtual_circuit', 'role', 'id')),  # Default ordering
+        )
         verbose_name = _('virtual circuit termination')
         verbose_name_plural = _('virtual circuit terminations')
 
@@ -184,6 +191,8 @@ class VirtualCircuitTermination(
             return self.virtual_circuit.terminations.filter(
                 role=VirtualCircuitTerminationRoleChoices.ROLE_HUB
             )
+        # Fallback for unexpected roles
+        return self.virtual_circuit.terminations.none()
 
     def clean(self):
         super().clean()

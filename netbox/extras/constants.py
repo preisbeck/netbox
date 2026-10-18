@@ -1,8 +1,19 @@
+from jinja2 import ChainableUndefined, DebugUndefined, StrictUndefined, Undefined
+
 from core.events import *
 from extras.choices import LogLevelChoices
 
 # Custom fields
 CUSTOMFIELD_EMPTY_VALUES = (None, '', [])
+
+# Timeout (in seconds) applied to the background jobs which provision and purge custom field data.
+# These jobs exist precisely because the work is too large for the request which triggered it, so
+# the default RQ timeout -- being of the same order as the request timeout being escaped -- would
+# reimpose the limit they were introduced to avoid. A timeout is recoverable, as each job commits
+# its batches independently and both are idempotent, but it leaves the field pending until the job
+# is run again. Three hours is well beyond what a batched update of any real table takes, while
+# still releasing a worker blocked on an unresponsive database.
+CUSTOMFIELD_JOB_TIMEOUT = 10800
 
 # ImageAttachment
 IMAGE_ATTACHMENT_IMAGE_FORMATS = {
@@ -18,6 +29,11 @@ IMAGE_ATTACHMENT_IMAGE_FORMATS = {
 # Template Export
 DEFAULT_MIME_TYPE = 'text/plain; charset=utf-8'
 
+# Scripts
+# Prefix applied to dynamically-loaded script/report module names so that a script whose filename
+# matches a core app or package (e.g. "circuits.py") cannot shadow it in sys.modules.
+SCRIPT_MODULE_NAME_PREFIX = '_netbox_script_module_'
+
 # Webhooks
 HTTP_CONTENT_TYPE_JSON = 'application/json'
 
@@ -32,11 +48,47 @@ WEBHOOK_EVENT_TYPES = {
     JOB_ERRORED: 'job_ended',
 }
 
-# Jinja environment parameters which support path imports
-JINJA_ENV_PARAMS_WITH_PATH_IMPORT = (
-    'undefined',
-    'finalize',
-)
+# Allowed Jinja2 environment parameters and their permitted values.
+# Only keys listed here may appear in a template's environment_params.
+#   None  = any JSON-serializable value accepted (scalars, booleans, etc.)
+#   dict  = only dict keys accepted; dict values are the resolved Python objects
+#
+# Note: 'finalize' is intentionally absent. It is deprecated and handled as a
+# legacy carve-out in RenderTemplateMixin (blocked from new use, but existing
+# stored values continue to resolve via import_string at render time).
+JINJA_ENV_PARAMS_ALLOWED = {
+    # Boolean / scalar params (accept any JSON-serializable value)
+    'auto_reload': None,
+    'autoescape': None,
+    'cache_size': None,
+    'enable_async': None,
+    'keep_trailing_newline': None,
+    'lstrip_blocks': None,
+    'optimized': None,
+    'trim_blocks': None,
+    # String params (template syntax delimiters)
+    'block_start_string': None,
+    'block_end_string': None,
+    'comment_start_string': None,
+    'comment_end_string': None,
+    'line_comment_prefix': None,
+    'line_statement_prefix': None,
+    'newline_sequence': None,
+    'variable_start_string': None,
+    'variable_end_string': None,
+    # Mapped params (value must be a key in the dict; resolved to the dict value)
+    'undefined': {
+        'jinja2.ChainableUndefined': ChainableUndefined,
+        'jinja2.DebugUndefined': DebugUndefined,
+        'jinja2.StrictUndefined': StrictUndefined,
+        'jinja2.Undefined': Undefined,
+    },
+    # Excluded (dangerous — accept callables or trigger imports):
+    #   'bytecode_cache' — accepts arbitrary object
+    #   'extensions'     — Jinja2 internally calls import_string() on string entries
+    #   'finalize'       — deprecated; legacy carve-out in RenderTemplateMixin
+    #   'loader'         — accepts arbitrary object
+}
 
 # Dashboard
 DEFAULT_DASHBOARD = [
@@ -162,4 +214,16 @@ LOG_LEVEL_RANK = {
     LogLevelChoices.LOG_SUCCESS: 2,
     LogLevelChoices.LOG_WARNING: 3,
     LogLevelChoices.LOG_FAILURE: 4,
+}
+
+# Config context cache: fields whose modification on an object requires re-rendering its config
+# context cache, keyed by model label.
+CC_FIELDS_BY_MODEL = {
+    'dcim.device': (
+        'site_id', 'location_id', 'device_type_id', 'role_id', 'tenant_id', 'platform_id',
+        'cluster_id', 'local_context_data',
+    ),
+    'virtualization.virtualmachine': (
+        'site_id', 'cluster_id', 'tenant_id', 'platform_id', 'role_id', 'local_context_data',
+    ),
 }

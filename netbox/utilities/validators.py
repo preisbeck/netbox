@@ -1,5 +1,6 @@
 import decimal
 import re
+from urllib.parse import urlparse
 
 from django.core.exceptions import ValidationError
 from django.core.validators import BaseValidator, RegexValidator, URLValidator, _lazy_re_compile
@@ -12,6 +13,7 @@ __all__ = (
     'EnhancedURLValidator',
     'ExclusionValidator',
     'MultipleOfValidator',
+    'url_scheme_is_allowed',
     'validate_regex',
 )
 
@@ -31,11 +33,11 @@ class EnhancedURLValidator(URLValidator):
     fqdn_re = URLValidator.hostname_re + URLValidator.domain_re + URLValidator.tld_re
     host_res = [URLValidator.ipv4_re, URLValidator.ipv6_re, fqdn_re, URLValidator.hostname_re]
     regex = _lazy_re_compile(
-        r'^(?:[a-z0-9\.\-\+]*)://'          # Scheme (enforced separately)
-        r'(?:\S+(?::\S*)?@)?'               # HTTP basic authentication
-        r'(?:' + '|'.join(host_res) + ')'   # IPv4, IPv6, FQDN, or hostname
-        r'(?::\d{2,5})?'                    # Port number
-        r'(?:[/?#][^\s]*)?'                 # Path
+        r'^(?:[a-z0-9\.\-\+]*)://'           # Scheme (enforced separately)
+        r'(?:[^\s:@/]+(?::[^\s:@/]*)?@)?'    # HTTP basic authentication
+        r'(?:' + '|'.join(host_res) + ')'    # IPv4, IPv6, FQDN, or hostname
+        r'(?::\d{1,5})?'                     # Port number
+        r'(?:[/?#][^\s]*)?'                  # Path
         r'\Z', re.IGNORECASE)
     schemes = None
 
@@ -70,6 +72,23 @@ class MultipleOfValidator(BaseValidator):
             raise ValidationError(
                 _("{value} must be a multiple of {multiple}.").format(value=value, multiple=self.multiple)
             )
+
+
+def url_scheme_is_allowed(value):
+    """
+    Return True if the URL's scheme is permitted by ALLOWED_URL_SCHEMES. A schemeless (relative) value
+    is considered permitted.
+
+    The scheme is compared in lower case. A percent-encoded scheme (e.g. "javascript%3A…") yields no
+    scheme, matching browser behavior: a browser does not decode the scheme portion of an href, so such
+    a value is inert and is treated as relative. A malformed URL which cannot be parsed (e.g.
+    "http://[::1/foo") likewise yields no scheme.
+    """
+    try:
+        scheme = urlparse(value).scheme.lower()
+    except ValueError:
+        scheme = ''
+    return not scheme or scheme in get_config().ALLOWED_URL_SCHEMES
 
 
 def validate_regex(value):

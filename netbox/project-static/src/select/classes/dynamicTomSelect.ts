@@ -1,24 +1,36 @@
-import { RecursivePartial, TomOption, TomSettings } from 'tom-select/dist/types/types';
-import { TomInput } from 'tom-select/dist/cjs/types/core';
-import { addClasses } from 'tom-select/src/vanilla.ts';
+import type { RecursivePartial, TomOption, TomSettings, TomInput } from 'tom-select/dist/cjs/types';
+import { addClasses, removeClasses } from 'tom-select/src/vanilla.ts';
 import queryString from 'query-string';
-import TomSelect from 'tom-select';
 import type { Stringifiable } from 'query-string';
 import { DynamicParamsMap } from './dynamicParamsMap';
+import { NetBoxTomSelect } from './netboxTomSelect';
 
 // Transitional
 import { QueryFilter, PathFilter } from '../types';
 import { getElement, replaceAll } from '../../util';
 
-// Extends TomSelect to provide enhanced fetching of options via the REST API
-export class DynamicTomSelect extends TomSelect {
+// Extends NetBoxTomSelect to provide enhanced fetching of options via the REST API
+export class DynamicTomSelect extends NetBoxTomSelect {
   public readonly nullOption: Nullable<TomOption> = null;
 
   // Transitional code from APISelect
+  public api_url: string | null = null;
   private readonly queryParams: QueryFilter = new Map();
   private readonly staticParams: QueryFilter = new Map();
   private readonly dynamicParams: DynamicParamsMap = new DynamicParamsMap();
   private readonly pathValues: PathFilter = new Map();
+
+  // Incremented on every load() call. Lets us detect and discard stale responses: if a
+  // newer load() has started (e.g. because two dependencies changed in quick succession)
+  // before an older request's response arrives, the older response is out of date and
+  // must not be allowed to overwrite state set by the newer one.
+  private loadSequence = 0;
+
+  // Tracks a previous selection that still needs to be restored once a settled request wins.
+  // Stored on the instance rather than only as a `load()` parameter -- if the request carrying
+  // it is itself superseded by a later cascading load() call before it resolves, the value
+  // isn't lost; whichever request's response ultimately wins can still attempt to restore it.
+  private pendingRestoreValue?: string | string[];
 
   /**
    * Overrides
@@ -28,7 +40,7 @@ export class DynamicTomSelect extends TomSelect {
     super(input_arg, user_settings);
 
     // Glean the REST API endpoint URL from the <select> element
-    this.api_url = this.input.getAttribute('data-url') as string;
+    this.api_url = this.input.getAttribute('data-url');
 
     // Override any field names set as widget attributes
     this.valueField = this.input.getAttribute('ts-value-field') || this.settings.valueField;
@@ -72,8 +84,38 @@ export class DynamicTomSelect extends TomSelect {
     this.addEventListeners();
   }
 
-  load(value: string) {
+  load(value: string, preserveValue?: string | string[]) {
     const self = this;
+
+    // Record which request this is. Incremented unconditionally, before any early return
+    // below, so that an already-in-flight request from a previous call is always correctly
+    // invalidated by any newer call to load() -- even one that itself aborts early (e.g. no
+    // valid URL). If another load() call starts before this one's response comes back,
+    // `self.loadSequence` will have moved on and this response is stale -- it must be
+    // discarded rather than applied.
+    self.loadSequence += 1;
+    const sequence = self.loadSequence;
+
+    // Remember any value that still needs to be restored, without erasing a value captured
+    // by an earlier, still-in-flight call. If this particular call has nothing new to
+    // preserve (e.g. its dependency was already cleared by a cascaded change), an earlier
+    // call's pending value should still get a chance to be restored by whichever request
+    // ends up winning. An empty array (e.g. a multi-select cleared by clear()) doesn't count
+    // as something worth preserving.
+    const hasValue = Array.isArray(preserveValue)
+      ? preserveValue.length > 0
+      : preserveValue !== undefined;
+    if (hasValue) {
+      self.pendingRestoreValue = preserveValue;
+    }
+
+    // No API endpoint is configured yet (e.g. a generic object selector before a content type
+    // is chosen). No options can be shown under this state, so any pending value carried from
+    // an earlier call is no longer relevant to restore here.
+    if (!self.api_url) {
+      self.pendingRestoreValue = undefined;
+      return;
+    }
 
     // Automatically clear any cached options. (Only options included
     // in the API response should be present.)
@@ -84,9 +126,12 @@ export class DynamicTomSelect extends TomSelect {
       self.addOption(self.nullOption);
     }
 
-    // Get the API request URL. If none is provided, abort as no request can be made.
+    // Get the API request URL. If none is provided, abort as no request can be made. No
+    // options can be shown for this field under its current (invalid) filter, so any
+    // pending value carried from an earlier call is no longer relevant to restore here.
     const url = self.getRequestUrl(value);
     if (!url) {
+      self.pendingRestoreValue = undefined;
       return;
     }
 
@@ -107,9 +152,32 @@ export class DynamicTomSelect extends TomSelect {
       })
       // Pass the options to the callback function
       .then(options => {
+        // A newer load() has since been issued (e.g. two dependencies changed in quick
+        // succession). This response is stale; applying it now would risk clobbering
+        // state already set by the newer, still-in-flight or already-resolved request.
+        if (sequence !== self.loadSequence) {
+          self.finalizeStaleLoad();
+          return;
+        }
         self.loadCallback(options, []);
+        // Restore the previous selection if it is still valid under the new filter.
+        if (self.pendingRestoreValue !== undefined) {
+          const values = Array.isArray(self.pendingRestoreValue)
+            ? self.pendingRestoreValue
+            : [self.pendingRestoreValue];
+          const validValues = values.filter(v => v !== '' && v in self.options);
+          if (validValues.length > 0) {
+            self.setValue(validValues.length === 1 ? validValues[0] : validValues, true);
+          }
+          self.pendingRestoreValue = undefined;
+        }
       })
       .catch(() => {
+        if (sequence !== self.loadSequence) {
+          self.finalizeStaleLoad();
+          return;
+        }
+        self.pendingRestoreValue = undefined;
         self.loadCallback([], []);
       });
   }
@@ -118,9 +186,24 @@ export class DynamicTomSelect extends TomSelect {
    * Custom methods
    */
 
+  // Finalizes Tom Select's loading state after a superseded (stale) response settles: clears
+  // the loading counter and, once it reaches zero, removes the wrapper's loading class and
+  // refreshes the dropdown to drop any stale loading indicator rendered internally.
+  private finalizeStaleLoad(): void {
+    this.loading = Math.max(this.loading - 1, 0);
+    if (!this.loading) {
+      removeClasses(this.wrapper, this.settings.loadingClass);
+      this.refreshOptions(false);
+    }
+  }
+
   // Formulate and return the complete URL for an API request, including any query parameters.
   getRequestUrl(search: string): string {
-    let url = this.api_url;
+    if (!this.api_url) {
+      return '';
+    }
+    const apiUrl = this.api_url;
+    let url = apiUrl;
 
     // Create new URL query parameters based on the current state of `queryParams` and create an
     // updated API query URL.
@@ -131,7 +214,7 @@ export class DynamicTomSelect extends TomSelect {
 
     // Replace any variables in the URL with values from `pathValues` if set.
     for (const [key, value] of this.pathValues.entries()) {
-      for (const result of this.api_url.matchAll(new RegExp(`({{${key}}})`, 'g'))) {
+      for (const result of apiUrl.matchAll(new RegExp(`({{${key}}})`, 'g'))) {
         if (value) {
           url = replaceAll(url, result[1], value.toString());
         } else {
@@ -222,6 +305,10 @@ export class DynamicTomSelect extends TomSelect {
   // values. As those keys' corresponding form fields' values change, `pathValues` will be
   // updated to reflect the new value.
   private getPathKeys() {
+    // A generic object selector has no data-url until a content type is chosen; nothing to parse.
+    if (!this.api_url) {
+      return;
+    }
     for (const result of this.api_url.matchAll(new RegExp(`{{(.+)}}`, 'g'))) {
       this.pathValues.set(result[1], '');
     }
@@ -289,6 +376,10 @@ export class DynamicTomSelect extends TomSelect {
 
   // Update `pathValues` based on the form value of another element.
   private updatePathValues(id: string): void {
+    if (!this.api_url) {
+      return;
+    }
+    const apiUrl = this.api_url;
     const key = replaceAll(id, /^id_/i, '');
     const element = getElement<HTMLSelectElement>(`id_${key}`);
     if (element !== null) {
@@ -296,8 +387,8 @@ export class DynamicTomSelect extends TomSelect {
       // value. For example, if the dependency is the `rack` field, and the `rack` field's value
       // is `1`, this element's URL would change from `/dcim/racks/{{rack}}/` to `/dcim/racks/1/`.
       const hasReplacement =
-        this.api_url.includes(`{{`) &&
-        Boolean(this.api_url.match(new RegExp(`({{(${id})}})`, 'g')));
+        apiUrl.includes(`{{`) &&
+        Boolean(apiUrl.match(new RegExp(`({{(${id})}})`, 'g')));
 
       if (hasReplacement) {
         if (element.value) {
@@ -339,6 +430,9 @@ export class DynamicTomSelect extends TomSelect {
   private handleEvent(event: Event): void {
     const target = event.target as HTMLSelectElement;
 
+    // Save the current selection so we can restore it after loading if it remains valid.
+    const previousValue = this.getValue();
+
     // Update the element's URL after any changes to a dependency.
     this.updateQueryParams(target.name);
     this.updatePathValues(target.name);
@@ -346,7 +440,8 @@ export class DynamicTomSelect extends TomSelect {
     // Clear any previous selection(s) as the parent filter has changed
     this.clear();
 
-    // Load new data.
-    this.load(this.lastValue);
+    // Load new data, restoring the previous selection if it is still valid under the new filter.
+    const preserve = previousValue !== '' && previousValue !== null ? previousValue : undefined;
+    this.load(this.lastValue, preserve);
   }
 }

@@ -2,7 +2,7 @@ from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 
 from dcim.models import Device, Interface
-from ipam.models import IPAddress, VLAN
+from ipam.models import VLAN, IPAddress
 from netbox.forms import NetBoxModelImportForm, OrganizationalModelImportForm, PrimaryModelImportForm
 from tenancy.models import Tenant
 from utilities.forms.fields import CSVChoiceField, CSVModelChoiceField, CSVModelMultipleChoiceField
@@ -18,8 +18,8 @@ __all__ = (
     'IPSecProposalImportForm',
     'L2VPNImportForm',
     'L2VPNTerminationImportForm',
-    'TunnelImportForm',
     'TunnelGroupImportForm',
+    'TunnelImportForm',
     'TunnelTerminationImportForm',
 )
 

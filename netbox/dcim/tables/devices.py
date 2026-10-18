@@ -1,10 +1,17 @@
+from urllib.parse import quote
+
 import django_tables2 as tables
+from django.middleware.csrf import get_token
+from django.urls import reverse
+from django.utils.html import format_html
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django_tables2.utils import Accessor
 
 from dcim import models
 from netbox.tables import NestedGroupModelTable, NetBoxTable, OrganizationalModelTable, PrimaryModelTable, columns
 from tenancy.tables import ContactsColumnMixin, TenancyColumnsMixin
+
 from .template_code import *
 
 __all__ = (
@@ -20,14 +27,14 @@ __all__ = (
     'DeviceInterfaceTable',
     'DeviceInventoryItemTable',
     'DeviceModuleBayTable',
-    'DevicePowerPortTable',
     'DevicePowerOutletTable',
+    'DevicePowerPortTable',
     'DeviceRearPortTable',
     'DeviceRoleTable',
     'DeviceTable',
     'FrontPortTable',
-    'InterfaceTable',
     'InterfaceLAGMemberTable',
+    'InterfaceTable',
     'InventoryItemRoleTable',
     'InventoryItemTable',
     'MACAddressTable',
@@ -249,6 +256,12 @@ class DeviceTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
     power_outlet_count = tables.Column(
         verbose_name=_('Power outlets')
     )
+    cooling_intake_count = tables.Column(
+        verbose_name=_('Cooling intakes')
+    )
+    cooling_outflow_count = tables.Column(
+        verbose_name=_('Cooling outflows')
+    )
     interface_count = tables.Column(
         verbose_name=_('Interfaces')
     )
@@ -267,13 +280,17 @@ class DeviceTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
     inventory_item_count = tables.Column(
         verbose_name=_('Inventory items')
     )
+    cooling_method = columns.ChoiceFieldColumn(
+        verbose_name=_('Cooling Method'),
+    )
 
     class Meta(PrimaryModelTable.Meta):
         model = models.Device
         fields = (
             'pk', 'id', 'name', 'status', 'tenant', 'tenant_group', 'role', 'manufacturer', 'device_type',
             'serial', 'asset_tag', 'region', 'site_group', 'site', 'location', 'rack', 'parent_device',
-            'device_bay_position', 'position', 'face', 'latitude', 'longitude', 'airflow', 'primary_ip', 'primary_ip4',
+            'device_bay_position', 'position', 'face', 'latitude', 'longitude', 'airflow', 'cooling_method',
+            'primary_ip', 'primary_ip4',
             'primary_ip6', 'oob_ip', 'cluster', 'virtual_chassis', 'vc_position', 'vc_priority', 'description',
             'config_template', 'comments', 'contacts', 'tags', 'created', 'last_updated',
         )
@@ -380,6 +397,17 @@ class PathEndpointTable(CableTerminationTable):
         verbose_name=_('Connection'),
         orderable=False
     )
+
+    def value_connection(self, value):
+        if value:
+            connections = []
+            for termination in value:
+                if hasattr(termination, 'parent_object'):
+                    connections.append(f'{termination.parent_object} > {termination}')
+                else:
+                    connections.append(str(termination))
+            return ', '.join(connections)
+        return None
 
 
 class ConsolePortTable(ModularDeviceComponentTable, PathEndpointTable):
@@ -682,15 +710,24 @@ class InterfaceTable(BaseInterfaceTable, ModularDeviceComponentTable, PathEndpoi
         orderable=False
     )
 
+    def value_connection(self, record, value):
+        if record.is_virtual and hasattr(record, 'virtual_circuit_termination') and record.virtual_circuit_termination:
+            connections = [
+                f"{t.interface.parent_object} > {t.interface} via {t.parent_object}"
+                for t in record.connected_endpoints
+            ]
+            return ', '.join(connections)
+        return super().value_connection(value)
+
     class Meta(DeviceComponentTable.Meta):
         model = models.Interface
         fields = (
-            'pk', 'id', 'name', 'device', 'module_bay', 'module', 'label', 'enabled', 'type', 'mgmt_only', 'mtu',
-            'speed', 'speed_formatted', 'duplex', 'mode', 'mac_addresses', 'primary_mac_address', 'wwn',
-            'poe_mode', 'poe_type', 'rf_role', 'rf_channel', 'rf_channel_frequency', 'rf_channel_width', 'tx_power',
-            'description', 'mark_connected', 'cable', 'cable_color', 'wireless_link', 'wireless_lans', 'link_peer',
-            'connection', 'tags', 'vdcs', 'vrf', 'l2vpn', 'tunnel', 'ip_addresses', 'fhrp_groups',
-            'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'inventory_items', 'created', 'last_updated',
+            'pk', 'id', 'name', 'device', 'module_bay', 'module', 'label', 'enabled', 'type', 'channels',
+            'channel_id', 'mgmt_only', 'mtu', 'speed', 'speed_formatted', 'duplex', 'mode', 'mac_addresses',
+            'primary_mac_address', 'wwn', 'poe_mode', 'poe_type', 'rf_role', 'rf_channel', 'rf_channel_frequency',
+            'rf_channel_width', 'tx_power', 'description', 'mark_connected', 'cable', 'cable_color', 'wireless_link',
+            'wireless_lans', 'link_peer', 'connection', 'tags', 'vdcs', 'vrf', 'l2vpn', 'tunnel', 'ip_addresses',
+            'fhrp_groups', 'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'inventory_items', 'created', 'last_updated',
             'vlan_translation_policy',
         )
         default_columns = ('pk', 'name', 'device', 'label', 'enabled', 'type', 'description')
@@ -768,8 +805,6 @@ class DeviceInterfaceTable(InterfaceTable):
             'data-virtual': lambda record: "true" if record.is_virtual else "false",
             'data-mark-connected': lambda record: "true" if record.mark_connected else "false",
             'data-cable-status': lambda record: record.cable.status if record.cable else "",
-            'data-type': lambda record: record.type,
-            'data-connected': lambda record: "connected" if record.mark_connected or record.cable else "disconnected"
         }
 
 
@@ -887,6 +922,9 @@ class DeviceBayTable(DeviceComponentTable):
             'args': [Accessor('device_id')],
         }
     )
+    enabled = columns.BooleanColumn(
+        verbose_name=_('Enabled'),
+    )
     status = tables.TemplateColumn(
         verbose_name=_('Status'),
         template_code=DEVICEBAY_STATUS,
@@ -924,12 +962,12 @@ class DeviceBayTable(DeviceComponentTable):
     class Meta(DeviceComponentTable.Meta):
         model = models.DeviceBay
         fields = (
-            'pk', 'id', 'name', 'device', 'label', 'status', 'description', 'installed_device', 'installed_role',
-            'installed_device_type', 'installed_description', 'installed_serial', 'installed_asset_tag', 'tags',
-            'created', 'last_updated',
+            'pk', 'id', 'name', 'device', 'label', 'enabled', 'status', 'description', 'installed_device',
+            'installed_role', 'installed_device_type', 'installed_description', 'installed_serial',
+            'installed_asset_tag', 'tags', 'created', 'last_updated',
         )
 
-        default_columns = ('pk', 'name', 'device', 'label', 'status', 'installed_device', 'description')
+        default_columns = ('pk', 'name', 'device', 'label', 'enabled', 'status', 'installed_device', 'description')
 
 
 class DeviceDeviceBayTable(DeviceBayTable):
@@ -939,6 +977,9 @@ class DeviceDeviceBayTable(DeviceBayTable):
                       '"></i> <a href="{{ record.get_absolute_url }}">{{ value }}</a>',
         attrs={'td': {'class': 'text-nowrap'}}
     )
+    enabled = columns.BooleanColumn(
+        verbose_name=_('Enabled'),
+    )
     actions = columns.ActionsColumn(
         extra_buttons=DEVICEBAY_BUTTONS
     )
@@ -946,9 +987,9 @@ class DeviceDeviceBayTable(DeviceBayTable):
     class Meta(DeviceComponentTable.Meta):
         model = models.DeviceBay
         fields = (
-            'pk', 'id', 'name', 'label', 'status', 'installed_device', 'description', 'tags', 'actions',
+            'pk', 'id', 'name', 'label', 'enabled', 'status', 'installed_device', 'description', 'tags', 'actions',
         )
-        default_columns = ('pk', 'name', 'label', 'status', 'installed_device', 'description')
+        default_columns = ('pk', 'name', 'label', 'enabled', 'status', 'installed_device', 'description')
 
 
 class ModuleBayTable(ModularDeviceComponentTable):
@@ -958,6 +999,9 @@ class ModuleBayTable(ModularDeviceComponentTable):
             'viewname': 'dcim:device_modulebays',
             'args': [Accessor('device_id')],
         }
+    )
+    enabled = columns.BooleanColumn(
+        verbose_name=_('Enabled'),
     )
     parent = tables.Column(
         linkify=True,
@@ -983,15 +1027,19 @@ class ModuleBayTable(ModularDeviceComponentTable):
         template_code=MODULEBAY_STATUS,
         verbose_name=_('Module Status')
     )
+    module_bay_types = columns.ManyToManyColumn(
+        verbose_name=_('Bay Types'),
+        linkify_item=True,
+    )
 
     class Meta(ModularDeviceComponentTable.Meta):
         model = models.ModuleBay
         fields = (
-            'pk', 'id', 'name', 'device', 'parent', 'label', 'position', 'installed_module', 'module_status',
-            'module_serial', 'module_asset_tag', 'description', 'tags',
+            'pk', 'id', 'name', 'device', 'enabled', 'parent', 'label', 'position', 'module_bay_types',
+            'installed_module', 'module_status', 'module_serial', 'module_asset_tag', 'description', 'tags',
         )
         default_columns = (
-            'pk', 'name', 'device', 'parent', 'label', 'installed_module', 'module_status', 'description',
+            'pk', 'name', 'device', 'enabled', 'parent', 'label', 'installed_module', 'module_status', 'description',
         )
 
     def render_parent_bay(self, value):
@@ -1006,6 +1054,9 @@ class DeviceModuleBayTable(ModuleBayTable):
         verbose_name=_('Name'),
         linkify=True,
     )
+    enabled = columns.BooleanColumn(
+        verbose_name=_('Enabled'),
+    )
     actions = columns.ActionsColumn(
         extra_buttons=MODULEBAY_BUTTONS
     )
@@ -1013,10 +1064,10 @@ class DeviceModuleBayTable(ModuleBayTable):
     class Meta(ModuleBayTable.Meta):
         model = models.ModuleBay
         fields = (
-            'pk', 'id', 'parent', 'name', 'label', 'position', 'installed_module', 'module_status', 'module_serial',
-            'module_asset_tag', 'description', 'tags', 'actions',
+            'pk', 'id', 'parent', 'name', 'label', 'enabled', 'position', 'installed_module', 'module_status',
+            'module_serial', 'module_asset_tag', 'description', 'tags', 'actions',
         )
-        default_columns = ('pk', 'name', 'label', 'installed_module', 'module_status', 'description')
+        default_columns = ('pk', 'name', 'label', 'enabled', 'installed_module', 'module_status', 'description')
 
 
 class InventoryItemTable(DeviceComponentTable):
@@ -1148,7 +1199,7 @@ class VirtualDeviceContextTable(TenancyColumnsMixin, PrimaryModelTable):
     )
     device = tables.Column(
         verbose_name=_('Device'),
-        order_by=('device___name',),
+        order_by=('device__name',),
         linkify=True
     )
     status = columns.ChoiceFieldColumn(
@@ -1187,6 +1238,61 @@ class VirtualDeviceContextTable(TenancyColumnsMixin, PrimaryModelTable):
         )
 
 
+class MACAddressActionsColumn(columns.ActionsColumn):
+    actions = {
+        **columns.ActionsColumn.actions,
+        'set_primary': columns.ActionsItem('Set as primary', 'star-outline', None, 'warning'),
+    }
+
+    def render(self, record, table, **kwargs):
+        # Always exclude set_primary from the parent's action loop (which renders GET links).
+        # We inject a CSRF-protected POST form for set_primary in the dropdown below.
+        show_set_primary = not record.is_primary and record.assigned_object_id
+        original_actions = self.actions
+        self.actions = {k: v for k, v in original_actions.items() if k != 'set_primary'}
+        try:
+            html = super().render(record, table, **kwargs)
+        finally:
+            self.actions = original_actions
+
+        if show_set_primary and html:
+            request = getattr(table, 'context', {}).get('request')
+            if request:
+                url = reverse('dcim:macaddress_set_primary', kwargs={'pk': record.pk})
+                # Return the user where they came from, the same way the parent's GET actions
+                # (edit/delete/changelog) do. In an embedded panel ObjectsTablePanel injects the parent
+                # object's URL as ?return_url=, so this lands on the interface; on the list view it falls
+                # back to the list path.
+                return_url = request.GET.get('return_url', request.get_full_path())
+                url = f'{url}?return_url={quote(return_url)}'
+                # Embedded tables need their own form; list tables reuse the surrounding bulk form.
+                if getattr(table, 'embedded', False):
+                    # No surrounding form: a self-contained POST form is valid and carries its own CSRF token.
+                    action_li = format_html(
+                        '<li><form method="post" action="{}">'
+                        '<input type="hidden" name="csrfmiddlewaretoken" value="{}">'
+                        '<button type="submit" class="dropdown-item">'
+                        '<i class="mdi mdi-star-outline"></i> {}'
+                        '</button></form></li>',
+                        url, get_token(request), _('Set as primary'),
+                    )
+                else:
+                    # Inside the bulk-edit <form>: a nested <form> is invalid HTML and gets dropped by the
+                    # parser, so ride the surrounding form via formaction/formmethod instead (matching the
+                    # DataSource sync button in core/tables/template_code.py).
+                    action_li = format_html(
+                        '<li><button type="submit" formaction="{}" formmethod="post" class="dropdown-item">'
+                        '<i class="mdi mdi-star-outline"></i> {}'
+                        '</button></li>',
+                        url, _('Set as primary'),
+                    )
+                html_str = str(html)
+                if '</ul>' in html_str:
+                    html = mark_safe(html_str.replace('</ul>', str(action_li) + '</ul>', 1))
+
+        return html
+
+
 class MACAddressTable(PrimaryModelTable):
     mac_address = tables.TemplateColumn(
         template_code=MACADDRESS_LINK,
@@ -1204,12 +1310,14 @@ class MACAddressTable(PrimaryModelTable):
         verbose_name=_('Parent')
     )
     is_primary = columns.BooleanColumn(
-        verbose_name=_('Primary')
+        verbose_name=_('Primary'),
+        orderable=False,
     )
     tags = columns.TagColumn(
         url_name='dcim:macaddress_list'
     )
-    actions = columns.ActionsColumn(
+    actions = MACAddressActionsColumn(
+        actions=('edit', 'delete', 'changelog', 'set_primary'),
         extra_buttons=MACADDRESS_COPY_BUTTON
     )
 

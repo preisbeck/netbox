@@ -1,6 +1,6 @@
 # Module Bays
 
-Module bays represent a space or slot within a device in which a field-replaceable [module](./module.md) may be installed. A common example is that of a chassis-based switch such as the Cisco Nexus 9000 or Juniper EX9200. Modules in turn hold additional components that become available to the parent device.
+Module bays represent a space or slot within a device in which a field-replaceable [module](./module.md) may be installed. A common example is that of a chassis-based switch such as the Cisco Nexus 9000 or Juniper EX9200. Modules, in turn, hold additional components that become available to the parent device.
 
 !!! note
     If you need to model child devices rather than modules, use a [device bay](./devicebay.md) instead.
@@ -29,3 +29,12 @@ An alternative physical label identifying the module bay.
 ### Position
 
 The numeric position in which this module bay is situated. For example, this would be the number assigned to a slot within a chassis-based switch.
+
+### Bay Types
+
+Zero or more [module bay types](./modulebaytype.md) assigned to this bay. When at least one bay type is set, only module types that share a common bay type may be installed. Leave empty to allow any module type.
+
+### Enabled
+
+Whether this module bay is enabled. Disabled module bays are not available for installation.
+

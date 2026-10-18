@@ -1,4 +1,5 @@
 from netbox.search import SearchIndex, register_search
+
 from . import models
 
 
@@ -21,8 +22,9 @@ class ASNIndex(SearchIndex):
         ('asn', 100),
         ('prefixed_name', 110),
         ('description', 500),
+        ('comments', 5000),
     )
-    display_attrs = ('rir', 'tenant', 'description')
+    display_attrs = ('rir', 'role', 'tenant', 'description')
 
 
 @register_search
@@ -170,6 +172,7 @@ class VLANTranslationPolicyIndex(SearchIndex):
     fields = (
         ('name', 100),
         ('description', 500),
+        ('comments', 5000),
     )
     display_attrs = ('description',)
 

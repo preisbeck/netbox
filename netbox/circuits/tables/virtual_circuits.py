@@ -66,12 +66,17 @@ class VirtualCircuitTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModel
     tags = columns.TagColumn(
         url_name='circuits:virtualcircuit_list'
     )
+    assignments = columns.ManyToManyColumn(
+        accessor='group_assignments',
+        verbose_name=_('Assignments'),
+        linkify_item=True
+    )
 
     class Meta(PrimaryModelTable.Meta):
         model = VirtualCircuit
         fields = (
             'pk', 'id', 'cid', 'provider', 'provider_account', 'provider_network', 'type', 'status', 'tenant',
-            'tenant_group', 'description', 'comments', 'tags', 'created', 'last_updated',
+            'tenant_group', 'description', 'comments', 'contacts', 'tags', 'created', 'last_updated', 'assignments',
         )
         default_columns = (
             'pk', 'cid', 'provider', 'provider_account', 'provider_network', 'type', 'status', 'tenant',
@@ -95,6 +100,7 @@ class VirtualCircuitTerminationTable(NetBoxTable):
         verbose_name=_('Provider network')
     )
     provider_account = tables.Column(
+        accessor=tables.A('virtual_circuit__provider_account'),
         linkify=True,
         verbose_name=_('Account')
     )
@@ -112,7 +118,7 @@ class VirtualCircuitTerminationTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = VirtualCircuitTermination
         fields = (
-            'pk', 'id', 'virtual_circuit', 'provider', 'provider_network', 'provider_account', 'role', 'interfaces',
+            'pk', 'id', 'virtual_circuit', 'provider', 'provider_network', 'provider_account', 'role', 'interface',
             'description', 'created', 'last_updated', 'actions',
         )
         default_columns = (

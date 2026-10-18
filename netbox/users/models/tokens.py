@@ -1,6 +1,6 @@
 import hashlib
 import hmac
-import random
+import secrets
 import zoneinfo
 
 from django.conf import settings
@@ -117,6 +117,9 @@ class Token(models.Model):
 
     class Meta:
         ordering = ('-created',)
+        indexes = (
+            models.Index(fields=('-created',)),  # Default ordering
+        )
         verbose_name = _('token')
         verbose_name_plural = _('tokens')
         constraints = [
@@ -209,6 +212,7 @@ class Token(models.Model):
             return 'Token '
         if self.v2:
             return f'Bearer {TOKEN_PREFIX}{self.key}.'
+        return None
 
     def clean(self):
         super().clean()
@@ -217,6 +221,13 @@ class Token(models.Model):
             raise ValidationError(_("Unable to save v2 tokens: API_TOKEN_PEPPERS is not defined."))
 
         if self._state.adding:
+            # Ensure a randomly-generated plaintext is always assigned to new tokens. A client-supplied value is
+            # never accepted via the REST API (the serializer's `token` field is read-only); generating it here
+            # guarantees the version-dependent key/digest fields are populated before constraint validation
+            # (full_clean) runs.
+            if self.token is None:
+                self.token = self.generate()
+
             if self.pepper_id is not None and self.pepper_id not in settings.API_TOKEN_PEPPERS:
                 raise ValidationError(_(
                     "Invalid pepper ID: {id}. Check configured API_TOKEN_PEPPERS."
@@ -256,7 +267,7 @@ class Token(models.Model):
         """
         Generate and return a random token value of the given length.
         """
-        return ''.join(random.choice(TOKEN_CHARSET) for _ in range(length))
+        return ''.join(secrets.choice(TOKEN_CHARSET) for _ in range(length))
 
     def update_digest(self):
         """
@@ -278,7 +289,7 @@ class Token(models.Model):
         digest.
         """
         if self.v1:
-            return token == self.token
+            return hmac.compare_digest(token, self.plaintext)
         if self.v2:
             token = token.removeprefix(TOKEN_PREFIX)
             try:
@@ -287,7 +298,8 @@ class Token(models.Model):
                 # Invalid pepper ID
                 return False
             digest = hmac.new(pepper.encode('utf-8'), token.encode('utf-8'), hashlib.sha256).hexdigest()
-            return digest == self.hmac_digest
+            return hmac.compare_digest(digest, self.hmac_digest)
+        return False
 
     def validate_client_ip(self, client_ip):
         """

@@ -1,10 +1,11 @@
 from django import forms
 from django.utils.translation import gettext_lazy as _
 
-from core.models import ObjectType, DataFile, DataSource
+from core.models import DataFile, DataSource, ObjectType
 from dcim.models import DeviceRole, DeviceType, Location, Platform, Region, Site, SiteGroup
 from extras.choices import *
 from extras.models import *
+from netbox.event_rules import get_event_rule_action_choices
 from netbox.events import get_event_type_choices
 from netbox.forms import NetBoxModelFilterSetForm, PrimaryModelFilterSetForm
 from netbox.forms.mixins import OwnerFilterMixin, SavedFiltersMixin
@@ -12,7 +13,10 @@ from tenancy.models import Tenant, TenantGroup
 from users.models import Group, User
 from utilities.forms import BOOLEAN_WITH_BLANK_CHOICES, FilterForm, add_blank_choice
 from utilities.forms.fields import (
-    ContentTypeChoiceField, ContentTypeMultipleChoiceField, DynamicModelMultipleChoiceField, TagFilterField,
+    ContentTypeChoiceField,
+    ContentTypeMultipleChoiceField,
+    DynamicModelMultipleChoiceField,
+    TagFilterField,
 )
 from utilities.forms.rendering import FieldSet
 from utilities.forms.widgets import DateTimePicker
@@ -42,9 +46,11 @@ class CustomFieldFilterForm(OwnerFilterMixin, SavedFiltersMixin, FilterForm):
     model = CustomField
     fieldsets = (
         FieldSet('q', 'filter_id'),
-        FieldSet('object_type_id', 'type', 'group_name', 'weight', 'required', 'unique', name=_('Attributes')),
+        FieldSet(
+            'object_type_id', 'type', 'group_name', 'weight', 'required', 'unique', 'status', name=_('Attributes')
+        ),
         FieldSet('choice_set_id', 'related_object_type_id', name=_('Type Options')),
-        FieldSet('ui_visible', 'ui_editable', 'is_cloneable', name=_('Behavior')),
+        FieldSet('ui_visible', 'ui_editable', 'is_cloneable', 'nulls_first', name=_('Behavior')),
         FieldSet('validation_minimum', 'validation_maximum', 'validation_regex', name=_('Validation')),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
@@ -62,6 +68,11 @@ class CustomFieldFilterForm(OwnerFilterMixin, SavedFiltersMixin, FilterForm):
         choices=CustomFieldTypeChoices,
         required=False,
         label=_('Field type')
+    )
+    status = forms.ChoiceField(
+        choices=add_blank_choice(CustomFieldStatusChoices),
+        required=False,
+        label=_('Status')
     )
     group_name = forms.CharField(
         label=_('Group name'),
@@ -107,6 +118,13 @@ class CustomFieldFilterForm(OwnerFilterMixin, SavedFiltersMixin, FilterForm):
             choices=BOOLEAN_WITH_BLANK_CHOICES
         )
     )
+    nulls_first = forms.NullBooleanField(
+        label=_('Nulls first'),
+        required=False,
+        widget=forms.Select(
+            choices=BOOLEAN_WITH_BLANK_CHOICES
+        )
+    )
     validation_minimum = forms.DecimalField(
         label=_('Minimum value'),
         required=False
@@ -125,7 +143,7 @@ class CustomFieldChoiceSetFilterForm(OwnerFilterMixin, SavedFiltersMixin, Filter
     model = CustomFieldChoiceSet
     fieldsets = (
         FieldSet('q', 'filter_id'),
-        FieldSet('base_choices', 'choice', name=_('Choices')),
+        FieldSet('base_choices', 'choice', 'choice_colors', name=_('Choices')),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
     base_choices = forms.MultipleChoiceField(
@@ -134,6 +152,11 @@ class CustomFieldChoiceSetFilterForm(OwnerFilterMixin, SavedFiltersMixin, Filter
     )
     choice = forms.CharField(
         required=False
+    )
+    choice_colors = forms.MultipleChoiceField(
+        choices=CustomFieldChoiceColorChoices,
+        required=False,
+        label=_('Choice colors'),
     )
 
 
@@ -300,7 +323,9 @@ class WebhookFilterForm(OwnerFilterMixin, NetBoxModelFilterSetForm):
     model = Webhook
     fieldsets = (
         FieldSet('q', 'filter_id', 'tag'),
-        FieldSet('payload_url', 'http_method', 'http_content_type', name=_('Attributes')),
+        FieldSet(
+            'payload_url', 'http_method', 'http_content_type', 'timeout__gte', 'timeout__lte', name=_('Attributes')
+        ),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
     http_content_type = forms.CharField(
@@ -316,6 +341,16 @@ class WebhookFilterForm(OwnerFilterMixin, NetBoxModelFilterSetForm):
         required=False,
         label=_('HTTP method')
     )
+    timeout__gte = forms.IntegerField(
+        required=False,
+        min_value=1,
+        label=_('Minimum timeout (seconds)')
+    )
+    timeout__lte = forms.IntegerField(
+        required=False,
+        min_value=1,
+        label=_('Maximum timeout (seconds)')
+    )
     tag = TagFilterField(model)
 
 
@@ -323,7 +358,9 @@ class EventRuleFilterForm(OwnerFilterMixin, NetBoxModelFilterSetForm):
     model = EventRule
     fieldsets = (
         FieldSet('q', 'filter_id', 'tag'),
-        FieldSet('object_type_id', 'event_type', 'action_type', 'enabled', name=_('Attributes')),
+        FieldSet(
+            'object_type_id', 'event_type', 'action_type', 'action_is_available', 'enabled', name=_('Attributes')
+        ),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
     object_type_id = ContentTypeMultipleChoiceField(
@@ -337,9 +374,18 @@ class EventRuleFilterForm(OwnerFilterMixin, NetBoxModelFilterSetForm):
         label=_('Event type')
     )
     action_type = forms.ChoiceField(
-        choices=add_blank_choice(EventRuleActionChoices),
+        # Wrapped in a callable so the registry is read on each access, rather than frozen at the
+        # time this module is first imported (see EventRule.action_type).
+        choices=lambda: add_blank_choice(get_event_rule_action_choices()),
         required=False,
         label=_('Action type')
+    )
+    action_is_available = forms.NullBooleanField(
+        label=_('Action available'),
+        required=False,
+        widget=forms.Select(
+            choices=BOOLEAN_WITH_BLANK_CHOICES
+        )
     )
     enabled = forms.NullBooleanField(
         label=_('Enabled'),
@@ -494,7 +540,7 @@ class ConfigTemplateFilterForm(OwnerFilterMixin, SavedFiltersMixin, FilterForm):
     fieldsets = (
         FieldSet('q', 'filter_id', 'tag'),
         FieldSet('data_source_id', 'data_file_id', 'auto_sync_enabled', name=_('Data')),
-        FieldSet('mime_type', 'file_name', 'file_extension', 'as_attachment', name=_('Rendering')),
+        FieldSet('mime_type', 'file_name', 'file_extension', 'as_attachment', 'debug', name=_('Rendering')),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
     data_source_id = DynamicModelMultipleChoiceField(
@@ -532,6 +578,13 @@ class ConfigTemplateFilterForm(OwnerFilterMixin, SavedFiltersMixin, FilterForm):
     )
     as_attachment = forms.NullBooleanField(
         label=_('As attachment'),
+        required=False,
+        widget=forms.Select(
+            choices=BOOLEAN_WITH_BLANK_CHOICES
+        )
+    )
+    debug = forms.NullBooleanField(
+        label=_('Debug'),
         required=False,
         widget=forms.Select(
             choices=BOOLEAN_WITH_BLANK_CHOICES

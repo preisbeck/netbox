@@ -168,6 +168,9 @@ Or by a set of attributes which uniquely identify the rack:
 
 Note that if the provided parameters do not return exactly one object, a validation error is raised.
 
+!!! note "Permissions"
+    When a related object is referenced by a set of attributes, the lookup is restricted to only those objects which the requesting user has permission to view. This prevents the enumeration of objects by their attributes. Referencing a related object directly by its numeric ID is always permitted, regardless of the user's view permissions for that object.
+
 ### Generic Relations
 
 Some objects within NetBox have attributes which can reference an object of multiple types, known as _generic relations_. For example, an IP address can be assigned to either a device interface _or_ a virtual machine interface. When making this assignment via the REST API, we must specify two attributes:
@@ -179,7 +182,7 @@ Together, these values identify a unique object in NetBox. The assigned object (
 
 ```no-highlight
 curl -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 -H "Accept: application/json; indent=4" \
 http://netbox/api/ipam/ip-addresses/ \
@@ -249,8 +252,6 @@ Similarly, you can opt to omit only specific fields by passing the `omit` parame
 ```
 GET /api/dcim/sites/?omit=circuit_count,device_count,virtualmachine_count
 ```
-
-!!! note "The `omit` parameter was introduced in NetBox v4.5.2."
 
 Strategic use of the `fields` and `omit` parameters can drastically improve REST API performance, as the exclusion of fields which reference related objects reduces the number and complexity of underlying database queries needed to generate the response.
 
@@ -335,13 +336,9 @@ GET /api/ipam/prefixes/13980/?brief=true
 
 The brief format is supported for both lists and individual objects.
 
-### Excluding Config Contexts
-
-When retrieving devices and virtual machines via the REST API, each will include its rendered [configuration context data](../features/context-data.md) by default. Users with large amounts of context data will likely observe suboptimal performance when returning multiple objects, particularly with very high page sizes. To combat this, context data may be excluded from the response data by attaching the query parameter `?exclude=config_context` to the request. This parameter works for both list and detail views.
-
 ## Pagination
 
-API responses which contain a list of many objects will be paginated for efficiency. The root JSON object returned by a list endpoint contains the following attributes:
+API responses which contain a list of many objects will be paginated for efficiency. NetBox employs offset-based pagination by default, which forms a page by skipping the number of objects indicated by the `offset` URL parameter. The root JSON object returned by a list endpoint contains the following attributes:
 
 * `count`: The total number of all objects matching the query
 * `next`: A hyperlink to the next page of results (if applicable)
@@ -397,6 +394,49 @@ The maximum number of objects that can be returned is limited by the [`MAX_PAGE_
 
 !!! warning
     Disabling the page size limit introduces a potential for very resource-intensive requests, since one API request can effectively retrieve an entire table from the database.
+
+### Cursor-Based Pagination
+
+For large datasets, offset-based pagination can become inefficient because the database must scan all rows up to the offset. As an alternative, cursor-based pagination uses the `start` query parameter to filter results by primary key (PK), enabling efficient keyset pagination.
+
+To use cursor-based pagination, pass `start` (the minimum PK value) and `limit` (the page size):
+
+```
+http://netbox/api/dcim/devices/?start=0&limit=100
+```
+
+This returns objects with an `id` greater than or equal to zero, ordered by PK, limited to 100 results. Below is an example showing an arbitrary `start` value.
+
+```json
+{
+    "count": null,
+    "next": "http://netbox/api/dcim/devices/?start=356&limit=100",
+    "previous": null,
+    "results": [
+        {
+            "id": 109,
+            "name": "dist-router07",
+            ...
+        },
+        ...
+        {
+            "id": 356,
+            "name": "acc-switch492",
+            ...
+        }
+    ]
+}
+```
+
+To iterate through all results, use the `id` of the last object in each response plus one as the `start` value for the next request. Continue until `next` is null.
+
+!!! info
+    Some important differences from offset-based pagination:
+
+    * `start` and `offset` are **mutually exclusive**; specifying both will result in a 400 error.
+    * Results are always ordered by primary key when using `start`. This is required to ensure deterministic behavior.
+    * `count` is always `null` in cursor mode, as counting all matching rows would partially negate its performance benefit.
+    * `previous` is always `null`: cursor-based pagination supports only forward navigation.
 
 ## Interacting with Objects
 
@@ -459,7 +499,7 @@ To create a new object, make a `POST` request to the model's _list_ endpoint wit
 
 ```no-highlight
 curl -s -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/ipam/prefixes/ \
 --data '{"prefix": "192.0.2.0/24", "scope_type": "dcim.site", "scope_id": 6}' | jq '.'
@@ -512,7 +552,7 @@ http://netbox/api/ipam/prefixes/ \
 To create multiple instances of a model using a single request, make a `POST` request to the model's _list_ endpoint with a list of JSON objects representing each instance to be created. If successful, the response will contain a list of the newly created instances. The example below illustrates the creation of three new sites.
 
 ```no-highlight
-curl -X POST -H "Authorization: Token $TOKEN" \
+curl -X POST -H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 -H "Accept: application/json; indent=4" \
 http://netbox/api/dcim/sites/ \
@@ -546,13 +586,16 @@ http://netbox/api/dcim/sites/ \
 ]
 ```
 
+!!! note
+    The bulk creation of objects is an all-or-none operation, meaning that if NetBox fails to successfully create any of the specified objects (e.g. due to a validation error), the entire operation will be aborted and none of the objects will be created.
+
 ### Updating an Object
 
 To modify an object which has already been created, make a `PATCH` request to the model's _detail_ endpoint specifying its unique numeric ID. Include any data which you wish to update on the object. As with object creation, the `Authorization` and `Content-Type` headers must also be specified.
 
 ```no-highlight
 curl -s -X PATCH \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/ipam/prefixes/18691/ \
 --data '{"status": "reserved"}' | jq '.'
@@ -609,7 +652,7 @@ Multiple objects can be updated simultaneously by issuing a `PUT` or `PATCH` req
 
 ```no-highlight
 curl -s -X PATCH \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/dcim/sites/ \
 --data '[{"id": 10, "status": "active"}, {"id": 11, "status": "active"}]'
@@ -620,13 +663,74 @@ Note that there is no requirement for the attributes to be identical among objec
 !!! note
     The bulk update of objects is an all-or-none operation, meaning that if NetBox fails to successfully update any of the specified objects (e.g. due a validation error), the entire operation will be aborted and none of the objects will be updated.
 
+### Errors in Bulk Operations
+
+!!! info "This feature was introduced in NetBox v4.7."
+
+When a bulk creation or update fails validation, the response identifies each offending object by its index within the submitted list, so that a client can correct and resubmit only the objects which actually failed. (The operation itself remains all-or-none: No objects are written unless every object validates.)
+
+```json
+{
+    "detail": "1 of 3 objects failed validation.",
+    "errors": [
+        {
+            "index": 1,
+            "errors": {
+                "slug": ["This field may not be blank."]
+            }
+        }
+    ]
+}
+```
+
+### Concurrent Update Protection
+
+To guard against the lost-update problem when multiple clients modify the same object, NetBox returns a weak `ETag` response header on detail-view responses (`GET`, `POST`, `PATCH`, `PUT`) for individual objects. Clients may supply this value back on a subsequent `PATCH` or `PUT` request via the `If-Match` request header. If the object's current ETag does not match any of the values supplied, the server rejects the request with a `412 Precondition Failed` response and includes the current ETag in the response so the client can retry.
+
+```no-highlight
+# Capture the ETag returned with the object
+$ curl -s -i -H "Authorization: Bearer $TOKEN" http://netbox/api/dcim/sites/1/ | grep -i ^etag
+ETag: W/"2026-05-01T17:42:11.123456+00:00"
+
+# Submit an update with If-Match referencing that ETag
+$ curl -s -X PATCH \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -H 'If-Match: W/"2026-05-01T17:42:11.123456+00:00"' \
+    http://netbox/api/dcim/sites/1/ \
+    --data '{"status": "decommissioning"}'
+```
+
+A literal `If-Match: *` value matches any current ETag and may be used to assert simply that the object exists. Submitting `If-Match` is optional; requests without the header retain prior (last-write-wins) behavior.
+
+### Adding and Removing Tags
+
+In addition to replacing an object's tag set wholesale via the `tags` field, taggable models accept two write-only fields, `add_tags` and `remove_tags`, which apply only the specified additions or removals without disturbing existing tags. This is convenient when concurrent clients each manage a distinct subset of an object's tags.
+
+```no-highlight
+curl -s -X PATCH \
+-H "Authorization: Bearer $TOKEN" \
+-H "Content-Type: application/json" \
+http://netbox/api/dcim/sites/1/ \
+--data '{
+    "add_tags": [{"name": "production"}],
+    "remove_tags": [{"name": "staging"}]
+}'
+```
+
+Constraints:
+
+* `tags` may not be combined with `add_tags` or `remove_tags` in the same request.
+* `remove_tags` is only valid on updates; it cannot be used when creating a new object.
+* The same tag may not appear in both `add_tags` and `remove_tags`.
+
 ### Deleting an Object
 
 To delete an object from NetBox, make a `DELETE` request to the model's _detail_ endpoint specifying its unique numeric ID. The `Authorization` header must be included to specify an authorization token, however this type of request does not support passing any data in the body.
 
 ```no-highlight
 curl -s -X DELETE \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 http://netbox/api/ipam/prefixes/18691/
 ```
 
@@ -641,7 +745,7 @@ NetBox supports the simultaneous deletion of multiple objects of the same type b
 
 ```no-highlight
 curl -s -X DELETE \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/dcim/sites/ \
 --data '[{"id": 10}, {"id": 11}, {"id": 12}]'
@@ -649,6 +753,60 @@ http://netbox/api/dcim/sites/ \
 
 !!! note
     The bulk deletion of objects is an all-or-none operation, meaning that if NetBox fails to delete any of the specified objects (e.g. due a dependency by a related object), the entire operation will be aborted and none of the objects will be deleted.
+
+## Background Processing
+
+!!! info "This feature was introduced in NetBox v4.7."
+
+Bulk write operations (creating, updating, or deleting multiple objects via a model's list endpoint) can optionally be processed as a [background job](../features/background-jobs.md) rather than synchronously. This is useful for large batches that would otherwise hold the connection open long enough to risk a proxy or gateway timeout.
+
+To request background processing, append the `background=true` query parameter to a bulk write request. NetBox enqueues a job and returns an `HTTP 202 Accepted` response containing the job's ID and URL. The actual write is performed later by a worker, running the same logic (and preserving the same all-or-none transaction semantics) as the synchronous path. Note that the request payload is **not** validated before the job is enqueued; validation is deferred to the worker (see below).
+
+```no-highlight
+curl -s -X PATCH \
+-H "Authorization: Token $TOKEN" \
+-H "Content-Type: application/json" \
+http://netbox/api/dcim/sites/?background=true \
+--data '[{"id": 10, "status": "active"}, {"id": 11, "status": "active"}]'
+```
+
+The response identifies the enqueued job:
+
+```json
+{
+    "job": {
+        "id": 42,
+        "url": "http://netbox/api/core/jobs/42/",
+        "status": "pending"
+    }
+}
+```
+
+Poll the job's URL to track its progress. When the job reaches a terminal status, its `data` field holds the result and its `error` field describes any failure. The `data` field mirrors the response the synchronous request would have returned, as an object with the HTTP `status_code` and the response `data`. For example, a completed bulk update records:
+
+```json
+{
+    "status_code": 200,
+    "data": [
+        {"id": 10, "url": "http://netbox/api/dcim/sites/10/", "status": {"value": "active"}, "...": "..."}
+    ]
+}
+```
+
+A failed job records the equivalent error response, for instance `{"status_code": 400, "data": {"slug": ["This field may not be blank."]}}`, with a short summary also placed in the job's `error` field.
+
+A `202` response indicates that the request was accepted and queued, not that it succeeded: validation (including malformed or invalid payloads) and the database write all occur when the job runs. A rejected payload is therefore reported as a failed job rather than a synchronous error response. Always inspect the job's final status to confirm the outcome. Because the result is stored on the job, any user permitted to view jobs (`core.view_job`, subject to object permissions) can read the serialized objects it contains.
+
+Background processing applies only to bulk operations (a JSON list) on a model's list endpoint. For a single-object write the `background` parameter is ignored and the request is processed synchronously. It cannot be combined with an [`If-Match`](#if-match) precondition (which cannot be evaluated reliably once execution is deferred); such a request is rejected with an `HTTP 400` response. If no background worker is running to service the queue, the request is rejected with an `HTTP 503` response rather than enqueuing a job that would never run.
+
+Some endpoints do not support background processing at all, because their response carries a value that exists only once and cannot be delivered by an `HTTP 202` response. The API tokens endpoint (`/api/users/tokens/`) is one such endpoint: a created token's plaintext is returned only by the request that creates it. A bulk write to such an endpoint with `background=true` is rejected with an `HTTP 400` response and no job is enqueued.
+
+!!! warning "API Tokens Created by Background Bulk Requests"
+    NetBox v4.7.0 and v4.7.1 accepted `background=true` on a bulk write to the tokens endpoint, and recorded each created token's plaintext in the job's result. Any user permitted to view those jobs could read it.
+
+    Restricting the endpoint prevents further exposure. It does not remove the plaintexts already recorded, and it does not revoke the affected tokens. Treat a token created that way as potentially exposed: after upgrading and restarting the workers, revoke and replace it, then delete the job records which captured it. Deleting those records does not invalidate the tokens.
+
+Two behaviors differ from a synchronous request and may change in a future release: field selection via [`fields`/`omit`](#specifying-fields) (and brief mode) is not applied to the stored result, and the authorization captured when the request is accepted is not re-checked if the token is later disabled or expires before the job runs.
 
 ## Changelog Messages
 
@@ -658,7 +816,7 @@ For example, the following API request will create a new site and record a messa
 
 ```no-highlight
 curl -s -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/dcim/sites/ \
 --data '{
@@ -678,7 +836,7 @@ For example, we can upload an image attachment using the `curl` command shown be
 
 ```no-highlight
 curl -X POST \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Accept: application/json; indent=4" \
 -F "object_type=dcim.site" \
 -F "object_id=2" \
@@ -693,7 +851,7 @@ The NetBox REST API primarily employs token-based authentication. For convenienc
 
 ### Tokens
 
-A token is a secret, unique identifier mapped to a NetBox user account. Each user may have one or more tokens which he or she can use for authentication when making REST API requests. To create a token, navigate to the API tokens page under your user profile. When creating a token, NetBox will automatically populate a randomly-generated token value.
+A token is a secret, unique identifier mapped to a NetBox user account. Each user may have one or more tokens which he or she can use for authentication when making REST API requests. To create a token, navigate to the API tokens page under your user profile. When creating a token, NetBox will automatically generate a random token value. This value is always generated by the server and cannot be specified by the client; any `token` value included in a creation request is ignored.
 
 !!! note "Tokens cannot be retrieved once created"
     Once a token has been created, its plaintext value cannot be retrieved. For this reason, you must take care to securely record the token locally immediately upon its creation. If a token plaintext is lost, it cannot be recovered: A new token must be created.
@@ -704,7 +862,10 @@ Additionally, a token can be set to expire at a specific time. This can be usefu
 
 #### v1 and v2 Tokens
 
-Beginning with NetBox v4.5, two versions of API token are supported, denoted as v1 and v2. Users are strongly encouraged to create only v2 tokens and to discontinue the use of v1 tokens. Support for v1 tokens will be removed in a future NetBox release.
+!!! warning "v1 Tokens Are Deprecated"
+    v1 API tokens are deprecated as of NetBox v4.6 and will be removed in NetBox v5.0. All users should migrate to v2 tokens.
+
+Beginning with NetBox v4.5, two versions of API token are supported, denoted as v1 and v2. Users are strongly encouraged to create only v2 tokens and to discontinue the use of v1 tokens.
 
 v2 API tokens offer much stronger security. The token plaintext given at creation time is hashed together with a configured [cryptographic pepper](../configuration/required-parameters.md#api_token_peppers) to generate a unique checksum. This checksum is irreversible; the token plaintext is never stored on the server and thus cannot be retrieved even with database-level access.
 
@@ -715,6 +876,8 @@ By default, a token can be used to perform all actions via the API that a user w
 #### Client IP Restriction
 
 Each API token can optionally be restricted by client IP address. If one or more allowed IP prefixes/addresses is defined for a token, authentication will fail for any client connecting from an IP address outside the defined range(s). This enables restricting the use a token to a specific client. (By default, any client IP address is permitted.)
+
+The client IP address is determined from the HTTP headers configured by [`HTTP_CLIENT_IP_HEADERS`](../configuration/system.md#http_client_ip_headers); see the security note there regarding header trust.
 
 #### Creating Tokens for Other Users
 
@@ -828,3 +991,11 @@ GET /api/dcim/sites/?created_by_request=e39c84bc-f169-4d5f-bc1c-94487a1b18b5
 
 !!! note
     This header is included with _all_ NetBox responses, although it is most practical when working with an API.
+
+### `ETag`
+
+A weak entity tag (e.g. `W/"2026-05-01T17:42:11.123456+00:00"`) returned on detail-view responses for individual objects. The value is derived from the object's `last_updated` timestamp (or `created`, if the object has no `last_updated`). Clients may supply this value on a subsequent write request via the `If-Match` header to perform a conditional update. See [Concurrent Update Protection](#concurrent-update-protection) for details.
+
+### `If-Match`
+
+A request header which may be supplied on `PATCH` or `PUT` requests targeting a single object. If the object's current ETag does not match any value supplied, the request is rejected with a `412 Precondition Failed` response. A literal value of `*` matches any existing object. See [Concurrent Update Protection](#concurrent-update-protection) for details.

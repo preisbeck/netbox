@@ -6,16 +6,16 @@ from netaddr.core import AddrFormatError
 
 from dcim.base_filtersets import ScopedFilterSet
 from dcim.filtersets import CommonInterfaceFilterSet
-from dcim.models import Device, DeviceRole, Platform, Region, Site, SiteGroup
-from dcim.models import MACAddress
+from dcim.models import Device, DeviceRole, MACAddress, Platform, Region, Site, SiteGroup
 from extras.filtersets import LocalConfigContextFilterSet
 from extras.models import ConfigTemplate
 from ipam.filtersets import PrimaryIPFilterSet
 from netbox.filtersets import NetBoxModelFilterSet, OrganizationalModelFilterSet, PrimaryModelFilterSet
-from tenancy.filtersets import TenancyFilterSet, ContactModelFilterSet
+from tenancy.filtersets import ContactModelFilterSet, TenancyFilterSet
 from users.filterset_mixins import OwnerFilterMixin
 from utilities.filters import MultiValueCharFilter, MultiValueMACAddressFilter, TreeNodeMultipleChoiceFilter
 from utilities.filtersets import register_filterset
+
 from .choices import *
 from .models import *
 
@@ -23,9 +23,10 @@ __all__ = (
     'ClusterFilterSet',
     'ClusterGroupFilterSet',
     'ClusterTypeFilterSet',
+    'VMInterfaceFilterSet',
     'VirtualDiskFilterSet',
     'VirtualMachineFilterSet',
-    'VMInterfaceFilterSet',
+    'VirtualMachineTypeFilterSet',
 )
 
 
@@ -92,6 +93,45 @@ class ClusterFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ScopedFilterSet,
 
 
 @register_filterset
+class VirtualMachineTypeFilterSet(PrimaryModelFilterSet):
+    default_platform_id = TreeNodeMultipleChoiceFilter(
+        queryset=Platform.objects.all(),
+        field_name='default_platform',
+        lookup_expr='in',
+        label=_('Default platform (ID)'),
+    )
+    default_platform = TreeNodeMultipleChoiceFilter(
+        queryset=Platform.objects.all(),
+        field_name='default_platform',
+        to_field_name='slug',
+        lookup_expr='in',
+        label=_('Default platform (slug)'),
+    )
+
+    class Meta:
+        model = VirtualMachineType
+        fields = (
+            'id',
+            'name',
+            'slug',
+            'default_vcpus',
+            'default_memory',
+            'description',
+            'virtual_machine_count',
+        )
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+
+        return queryset.filter(
+            Q(name__icontains=value) |
+            Q(description__icontains=value) |
+            Q(comments__icontains=value)
+        )
+
+
+@register_filterset
 class VirtualMachineFilterSet(
     PrimaryModelFilterSet,
     TenancyFilterSet,
@@ -99,6 +139,18 @@ class VirtualMachineFilterSet(
     LocalConfigContextFilterSet,
     PrimaryIPFilterSet,
 ):
+    virtual_machine_type_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=VirtualMachineType.objects.all(),
+        distinct=False,
+        label=_('Virtual machine type (ID)'),
+    )
+    virtual_machine_type = django_filters.ModelMultipleChoiceFilter(
+        field_name='virtual_machine_type__slug',
+        queryset=VirtualMachineType.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Virtual machine type (slug)'),
+    )
     status = django_filters.MultipleChoiceFilter(
         choices=VirtualMachineStatusChoices,
         distinct=False,

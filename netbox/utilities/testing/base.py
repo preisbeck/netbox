@@ -6,17 +6,20 @@ from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import ArrayField, RangeField
 from django.core.exceptions import FieldDoesNotExist
 from django.db import transaction
-from django.db.models import ManyToManyField, ManyToManyRel, JSONField
+from django.db.models import DateField, DateTimeField, JSONField, ManyToManyField, ManyToManyRel
 from django.forms.models import model_to_dict
-from django.test import Client, TestCase as _TestCase
+from django.test import Client
+from django.test import TestCase as _TestCase
 from netaddr import IPNetwork
 from taggit.managers import TaggableManager
 
+from core.choices import ObjectChangeActionChoices
 from core.models import ObjectType
 from users.models import ObjectPermission, User
 from utilities.data import ranges_to_string
 from utilities.object_types import object_type_identifier
 from utilities.permissions import resolve_permission_type
+
 from .utils import DUMMY_CF_DATA, extract_form_failures
 
 __all__ = (
@@ -44,7 +47,7 @@ class TestCase(_TestCase):
         Context manager that wraps subTest with automatic cleanup.
         All database changes within the context will be rolled back.
         """
-        sid = transaction.savepoint()
+        sid = transaction.savepoint_create()
 
         try:
             with self.subTest(**params):
@@ -81,6 +84,30 @@ class TestCase(_TestCase):
     # Custom assertions
     #
 
+    def assertObjectChange(self, objectchange, *, action, message=None):
+        """
+        Assert that an ObjectChange record has the expected attributes. If message is provided, it will be
+        compared against objectchange.message.
+        """
+        # Verify the change action (create, update, delete)
+        self.assertEqual(objectchange.action, action)
+
+        # Verify the changelog message if provided
+        if message is not None:
+            self.assertEqual(objectchange.message, message)
+
+        # Verify pre/postchange data presence and integrity based on action type
+        if action == ObjectChangeActionChoices.ACTION_CREATE:
+            self.assertIsNone(objectchange.prechange_data, "Expected prechange_data to be None for a create")
+            self.assertIsNotNone(objectchange.postchange_data, "Expected postchange_data to be populated for a create")
+        elif action == ObjectChangeActionChoices.ACTION_UPDATE:
+            self.assertIsNotNone(objectchange.prechange_data, "Expected prechange_data to be populated for an update")
+            self.assertIsNotNone(objectchange.postchange_data, "Expected postchange_data to be populated for an update")
+            self.assertNotEqual(objectchange.prechange_data, objectchange.postchange_data)
+        elif action == ObjectChangeActionChoices.ACTION_DELETE:
+            self.assertIsNotNone(objectchange.prechange_data, "Expected prechange_data to be populated for a delete")
+            self.assertIsNone(objectchange.postchange_data, "Expected postchange_data to be None for a delete")
+
     def assertHttpStatus(self, response, expected_status):
         """
         TestCase method. Provide more detail in the event of an unexpected HTTP response.
@@ -97,6 +124,20 @@ class TestCase(_TestCase):
                 err = form_errors or response.content or 'No data'
             err_message = f"Expected HTTP status {expected_status}; received {response.status_code}: {err}"
         self.assertEqual(response.status_code, expected_status, err_message)
+
+    def assertNotCacheable(self, response):
+        """
+        TestCase method. Assert that a response instructs the browser not to persist its content
+        to the local cache. Views which render potentially sensitive content (e.g. the contents of
+        a synced data file) must not be written to the browser's cache, where they would remain
+        readable after the session has ended.
+        """
+        cache_control = response.headers.get('Cache-Control', '')
+        self.assertIn(
+            'no-store',
+            cache_control,
+            f"Expected a no-store cache directive; received Cache-Control: '{cache_control}'"
+        )
 
 
 class ModelTestCase(TestCase):
@@ -138,7 +179,9 @@ class ModelTestCase(TestCase):
                 continue
 
             # Handle ManyToManyFields
-            if value and type(field) in (ManyToManyField, ManyToManyRel, TaggableManager):
+            if value and (
+                type(field) in (ManyToManyField, ManyToManyRel) or isinstance(field, TaggableManager)
+            ):
                 # Resolve reverse M2M relationships
                 if isinstance(field, ManyToManyRel):
                     value = getattr(instance, field.related_name).all()
@@ -162,6 +205,11 @@ class ModelTestCase(TestCase):
                 elif type(value) is IPNetwork:
                     model_dict[key] = str(value)
 
+                # Convert date values to ISO 8601 strings (as rendered by the REST API). DateTimeField
+                # subclasses DateField, so exclude it here to preserve existing datetime handling.
+                elif isinstance(field, DateField) and not isinstance(field, DateTimeField) and value is not None:
+                    model_dict[key] = value.isoformat()
+
                 # Normalize arrays of numeric ranges (e.g. VLAN IDs or port ranges).
                 # DB uses canonical half-open [lo, hi) via NumericRange; API uses inclusive [lo, hi].
                 # Convert to inclusive pairs for stable API comparisons.
@@ -169,8 +217,8 @@ class ModelTestCase(TestCase):
                     model_dict[key] = [[r.lower, r.upper - 1] for r in value]
 
             else:
-                # Convert ArrayFields to CSV strings
-                if type(field) is ArrayField:
+                # Convert ArrayFields (including subclasses) to CSV strings
+                if isinstance(field, ArrayField):
                     if getattr(field.base_field, 'choices', None):
                         # Values for fields with pre-defined choices can be returned as lists
                         model_dict[key] = value

@@ -6,30 +6,43 @@ from django.utils.translation import gettext as _
 
 from utilities.choices import unpack_grouped_choices
 from utilities.querysets import RestrictedQuerySet
+
 from .constants import *
 
 __all__ = (
     'add_blank_choice',
     'expand_alphanumeric_pattern',
-    'expand_ipaddress_pattern',
+    'expand_ipnetwork_pattern',
     'form_from_model',
+    'get_capacity_unit_label',
     'get_field_value',
     'get_selected_values',
     'parse_alphanumeric_range',
+    'parse_csv',
     'parse_numeric_range',
     'restrict_form_fields',
-    'parse_csv',
     'validate_csv',
 )
 
 
-def parse_numeric_range(string, base=10):
+def parse_numeric_range(string, base=10, min_value=None, max_value=None):
     """
     Expand a numeric range (continuous or not) into a decimal or
     hexadecimal list, as specified by the base parameter
       '0-3,5' => [0, 1, 2, 3, 5]
       '2,8-b,d,f' => [2, 8, 9, a, b, d, f]
+
+    Pass BOTH ``min_value`` and ``max_value`` to validate each range against those bounds *before* it is
+    expanded: a reversed or out-of-bounds range then raises rather than materializing a huge list or
+    silently expanding to nothing (which would be swallowed when combined with valid ranges, e.g.
+    "80,9000-53"). Bounds are all-or-nothing — supplying only one raises ``ValueError`` — so a caller
+    can't opt into a lower bound while leaving the expansion size uncapped. With no bounds (e.g.
+    IP/pattern expansion) a reversed range yields an empty list, as before.
     """
+    bounded = min_value is not None or max_value is not None
+    if bounded and (min_value is None or max_value is None):
+        raise ValueError("parse_numeric_range() requires both min_value and max_value, or neither.")
+
     values = list()
     for dash_range in string.split(','):
         try:
@@ -40,6 +53,16 @@ def parse_numeric_range(string, base=10):
             begin, end = int(begin.strip(), base=base), int(end.strip(), base=base) + 1
         except ValueError:
             raise forms.ValidationError(_('Range "{value}" is invalid.').format(value=dash_range))
+        if bounded:
+            # Reject reversed ranges and endpoints outside the permitted range before expanding.
+            if begin > end - 1:
+                raise forms.ValidationError(_('Range "{value}" is invalid.').format(value=dash_range))
+            if begin < min_value or end - 1 > max_value:
+                raise forms.ValidationError(
+                    _('Range "{value}" is not within the permitted range ({min}-{max}).').format(
+                        value=dash_range, min=min_value, max=max_value
+                    )
+                )
         values.extend(range(begin, end))
     return sorted(set(values))
 
@@ -105,9 +128,9 @@ def expand_alphanumeric_pattern(string):
             yield "{}{}{}".format(lead, i, remnant)
 
 
-def expand_ipaddress_pattern(string, family):
+def expand_ipnetwork_pattern(string, family):
     """
-    Expand an IP address pattern into a list of strings. Examples:
+    Expand an IP network pattern into a list of strings. Examples:
       '192.0.2.[1,2,100-250]/24' => ['192.0.2.1/24', '192.0.2.2/24', '192.0.2.100/24' ... '192.0.2.250/24']
       '2001:db8:0:[0,fd-ff]::/64' => ['2001:db8:0:0::/64', '2001:db8:0:fd::/64', ... '2001:db8:0:ff::/64']
     """
@@ -123,10 +146,17 @@ def expand_ipaddress_pattern(string, family):
     parsed_range = parse_numeric_range(pattern, base)
     for i in parsed_range:
         if re.search(regex, remnant):
-            for string in expand_ipaddress_pattern(remnant, family):
+            for string in expand_ipnetwork_pattern(remnant, family):
                 yield ''.join([lead, format(i, 'x' if family == 6 else 'd'), string])
         else:
             yield ''.join([lead, format(i, 'x' if family == 6 else 'd'), remnant])
+
+
+def get_capacity_unit_label(divisor=1000):
+    """
+    Return the appropriate base unit label: 'MiB' for binary (1024), 'MB' for decimal (1000).
+    """
+    return 'MiB' if divisor == 1024 else 'MB'
 
 
 def get_field_value(form, field_name):
@@ -138,7 +168,7 @@ def get_field_value(form, field_name):
 
     if form.is_bound and field_name in form.data:
         if (value := form.data[field_name]) is None:
-            return
+            return None
         if hasattr(field, 'valid_value') and field.valid_value(value):
             return value
 
@@ -186,9 +216,10 @@ def get_selected_values(form, field_name):
 
 def add_blank_choice(choices):
     """
-    Add a blank choice to the beginning of a choices list.
+    Add a blank choice to the beginning of a choices list. Any Choice objects are preserved (rather than reduced to
+    plain tuples) so that description-aware fields can still reference their descriptions.
     """
-    return ((None, '---------'),) + tuple(choices)
+    return ((None, '---------'), *choices)
 
 
 def form_from_model(model, fields):

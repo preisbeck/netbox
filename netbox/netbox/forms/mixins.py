@@ -4,14 +4,14 @@ from django.utils.translation import gettext as _
 from core.models import ObjectType
 from extras.choices import *
 from extras.models import *
-from users.models import OwnerGroup, Owner
+from users.models import Owner, OwnerGroup
 from utilities.forms.fields import DynamicModelChoiceField, DynamicModelMultipleChoiceField
 
 __all__ = (
     'ChangelogMessageMixin',
     'CustomFieldsMixin',
-    'OwnerMixin',
     'OwnerFilterMixin',
+    'OwnerMixin',
     'SavedFiltersMixin',
     'TagsMixin',
 )
@@ -108,6 +108,10 @@ class SavedFiltersMixin(forms.Form):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # Ensure the underlying <select> has an accessible name even when Tom Select
+        # hides the original element (the visible UI is a JS-built combobox).
+        self.fields['filter_id'].widget.attrs['aria-label'] = _('Saved filter')
 
         # Limit saved filters to those applicable to the form's model
         if hasattr(self, 'model'):

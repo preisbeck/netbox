@@ -1,29 +1,50 @@
 import django_filters
+from django import forms
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from django.db import models
-from django.test import TestCase
-from mptt.fields import TreeForeignKey
+from django.http import QueryDict
+from django.test import RequestFactory, TestCase
 from taggit.managers import TaggableManager
 
+from core.models import ObjectType
 from dcim.choices import *
 from dcim.fields import MACAddressField
-from dcim.filtersets import DeviceFilterSet, SiteFilterSet, InterfaceFilterSet
+from dcim.filtersets import DeviceFilterSet, InterfaceFilterSet, SiteFilterSet
 from dcim.models import (
-    Device, DeviceRole, DeviceType, Interface, MACAddress, Manufacturer, Platform, Rack, Region, Site
+    Device,
+    DeviceRole,
+    DeviceType,
+    Interface,
+    MACAddress,
+    Manufacturer,
+    Platform,
+    Rack,
+    Region,
+    Site,
 )
 from extras.filters import TagFilter
-from extras.models import TaggedItem
+from extras.models import SavedFilter, Tag, TaggedItem
 from ipam.filtersets import ASNFilterSet
-from ipam.models import RIR, ASN
+from ipam.models import ASN, RIR
 from netbox.filtersets import BaseFilterSet
-from wireless.choices import WirelessRoleChoices
 from utilities.filters import (
-    MultiValueCharFilter, MultiValueDateFilter, MultiValueDateTimeFilter, MultiValueMACAddressFilter,
-    MultiValueNumberFilter, MultiValueTimeFilter, TreeNodeMultipleChoiceFilter,
+    MultiValueArrayFilter,
+    MultiValueCharFilter,
+    MultiValueDateFilter,
+    MultiValueDateTimeFilter,
+    MultiValueDecimalFilter,
+    MultiValueMACAddressFilter,
+    MultiValueNumberFilter,
+    MultiValueTimeFilter,
+    TreeNodeMultipleChoiceFilter,
 )
+from wireless.choices import WirelessRoleChoices
+
+User = get_user_model()
 
 
-class TreeNodeMultipleChoiceFilterTest(TestCase):
+class TreeNodeMultipleChoiceFilterTestCase(TestCase):
 
     class SiteFilterSet(django_filters.FilterSet):
         region = TreeNodeMultipleChoiceFilter(
@@ -80,6 +101,69 @@ class TreeNodeMultipleChoiceFilterTest(TestCase):
         self.assertEqual(qs[1], self.site3)
 
 
+class TagFilterTestCase(TestCase):
+    """
+    Verify the AND (default), OR (`any`), and NOR (`n`) semantics of TagFilter/TagIDFilter.
+    """
+    queryset = Site.objects.all()
+    filterset = SiteFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        tags = (
+            Tag(name='Tag 1', slug='tag-1'),
+            Tag(name='Tag 2', slug='tag-2'),
+            Tag(name='Tag 3', slug='tag-3'),
+        )
+        Tag.objects.bulk_create(tags)
+
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+        )
+        Site.objects.bulk_create(sites)
+        sites[0].tags.set([tags[0], tags[1]])  # tag-1, tag-2
+        sites[1].tags.set([tags[1]])  # tag-2 only
+        sites[2].tags.set([tags[2]])  # tag-3 only
+
+    def test_tag_and(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-2'))
+        params = {'tag': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-1')
+
+        params = {'tag_id': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-1')
+
+    def test_tag_any(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-3'))
+        params = {'tag__any': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual({site.slug for site in qs}, {'site-1', 'site-3'})
+
+        params = {'tag_id__any': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual({site.slug for site in qs}, {'site-1', 'site-3'})
+
+    def test_tag_negation(self):
+        tags = Tag.objects.filter(slug__in=('tag-1', 'tag-3'))
+        params = {'tag__n': [tags[0].slug, tags[1].slug]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-2')
+
+        params = {'tag_id__n': [tags[0].pk, tags[1].pk]}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs[0].slug, 'site-2')
+
+
 class DummyModel(models.Model):
     """
     Dummy model used by BaseFilterSetTest for filter validation. Should never appear in a schema migration.
@@ -99,21 +183,41 @@ class DummyModel(models.Model):
     integerfield = models.IntegerField()
     macaddressfield = MACAddressField()
     timefield = models.TimeField()
-    treeforeignkeyfield = TreeForeignKey(
+    treeforeignkeyfield = models.ForeignKey(
         to='self',
-        on_delete=models.CASCADE
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
     )
 
     tags = TaggableManager(through=TaggedItem)
 
 
-class BaseFilterSetTest(TestCase):
+class BaseFilterSetTestCase(TestCase):
     """
     Ensure that a BaseFilterSet automatically creates the expected set of filters for each filter type.
     """
     class DummyFilterSet(BaseFilterSet):
         charfield = django_filters.CharFilter()
         numberfield = django_filters.NumberFilter()
+        # Declared numeric/date filters with extra kwargs which don't apply to a BooleanFilter
+        declareddatefield = MultiValueDateFilter(
+            field_name='datefield',
+            input_formats=['%d/%m/%Y']
+        )
+        declareddatetimefield = MultiValueDateTimeFilter(
+            field_name='datetimefield',
+            input_formats=['%d/%m/%Y %H:%M']
+        )
+        declareddecimalfield = MultiValueDecimalFilter(
+            field_name='integerfield',  # We're pretending this is a decimal field
+            max_digits=10,
+            decimal_places=2
+        )
+        declaredtimefield = MultiValueTimeFilter(
+            field_name='timefield',
+            input_formats=['%H.%M']
+        )
         macaddressfield = MultiValueMACAddressFilter()
         modelchoicefield = django_filters.ModelChoiceFilter(
             field_name='integerfield',  # We're pretending this is a ForeignKey field
@@ -125,6 +229,9 @@ class BaseFilterSetTest(TestCase):
         )
         multiplechoicefield = django_filters.MultipleChoiceFilter(
             field_name='choicefield'
+        )
+        multivaluearrayfield = MultiValueArrayFilter(
+            field_name='charfield'  # We're pretending this is an array field
         )
         multivaluecharfield = MultiValueCharFilter(
             field_name='charfield'
@@ -199,8 +306,37 @@ class BaseFilterSetTest(TestCase):
         self.assertEqual(self.filters['numberfield__gt'].exclude, False)
         self.assertEqual(self.filters['numberfield__gte'].lookup_expr, 'gte')
         self.assertEqual(self.filters['numberfield__gte'].exclude, False)
+        self.assertIsInstance(self.filters['numberfield__empty'], django_filters.BooleanFilter)
         self.assertEqual(self.filters['numberfield__empty'].lookup_expr, 'isnull')
         self.assertEqual(self.filters['numberfield__empty'].exclude, False)
+
+    def test_declared_filter_empty_lookup(self):
+        """
+        The __empty variant of a declared numeric or date/time filter must be a BooleanFilter, and must not inherit
+        the declared filter's extra kwargs (which would raise a TypeError when the form field is built).
+        """
+        declared_filters = {
+            'declareddatefield': (MultiValueDateFilter, {'input_formats': ['%d/%m/%Y']}),
+            'declareddatetimefield': (MultiValueDateTimeFilter, {'input_formats': ['%d/%m/%Y %H:%M']}),
+            'declareddecimalfield': (MultiValueDecimalFilter, {'max_digits': 10, 'decimal_places': 2}),
+            'declaredtimefield': (MultiValueTimeFilter, {'input_formats': ['%H.%M']}),
+        }
+        for filter_name, (filter_cls, extra) in declared_filters.items():
+            with self.subTest(filter_name=filter_name):
+                empty_filter = self.filters[f'{filter_name}__empty']
+                self.assertIsInstance(empty_filter, django_filters.BooleanFilter)
+                self.assertEqual(empty_filter.lookup_expr, 'isnull')
+                self.assertIsInstance(empty_filter.field, forms.NullBooleanField)
+                for key in extra:
+                    self.assertNotIn(key, empty_filter.extra)
+
+                # Non-boolean lookups retain the declared filter's type and extra kwargs
+                gt_filter = self.filters[f'{filter_name}__gt']
+                self.assertIsInstance(gt_filter, filter_cls)
+                self.assertEqual(gt_filter.lookup_expr, 'gt')
+                for key, value in extra.items():
+                    self.assertEqual(gt_filter.extra[key], value)
+                self.assertIsNotNone(gt_filter.field)
 
     def test_mac_address_filter(self):
         self.assertIsInstance(self.filters['macaddressfield'], MultiValueMACAddressFilter)
@@ -242,6 +378,13 @@ class BaseFilterSetTest(TestCase):
         self.assertEqual(self.filters['modelmultiplechoicefield'].exclude, False)
         self.assertEqual(self.filters['modelmultiplechoicefield__n'].lookup_expr, 'exact')
         self.assertEqual(self.filters['modelmultiplechoicefield__n'].exclude, True)
+
+    def test_multi_value_array_filter(self):
+        self.assertIsInstance(self.filters['multivaluearrayfield'], MultiValueArrayFilter)
+        self.assertEqual(self.filters['multivaluearrayfield'].lookup_expr, 'contains')
+        self.assertEqual(self.filters['multivaluearrayfield'].exclude, False)
+        self.assertEqual(self.filters['multivaluearrayfield__n'].lookup_expr, 'contains')
+        self.assertEqual(self.filters['multivaluearrayfield__n'].exclude, True)
 
     def test_multi_value_char_filter(self):
         self.assertIsInstance(self.filters['multivaluecharfield'], MultiValueCharFilter)
@@ -361,8 +504,13 @@ class BaseFilterSetTest(TestCase):
         self.assertIsInstance(self.filters['tagfield'], TagFilter)
         self.assertEqual(self.filters['tagfield'].lookup_expr, 'exact')
         self.assertEqual(self.filters['tagfield'].exclude, False)
+        self.assertEqual(self.filters['tagfield'].conjoined, True)
         self.assertEqual(self.filters['tagfield__n'].lookup_expr, 'exact')
         self.assertEqual(self.filters['tagfield__n'].exclude, True)
+        self.assertEqual(self.filters['tagfield__n'].conjoined, True)
+        self.assertEqual(self.filters['tagfield__any'].lookup_expr, 'exact')
+        self.assertEqual(self.filters['tagfield__any'].exclude, False)
+        self.assertEqual(self.filters['tagfield__any'].conjoined, False)
 
     def test_tree_node_multiple_choice_filter(self):
         self.assertIsInstance(self.filters['treeforeignkeyfield'], TreeNodeMultipleChoiceFilter)
@@ -373,7 +521,7 @@ class BaseFilterSetTest(TestCase):
         self.assertEqual(self.filters['treeforeignkeyfield__n'].exclude, True)
 
 
-class DynamicFilterLookupExpressionTest(TestCase):
+class DynamicFilterLookupExpressionTestCase(TestCase):
     """
     Validate function of automatically generated filters using the Device model as an example.
     """
@@ -499,9 +647,9 @@ class DynamicFilterLookupExpressionTest(TestCase):
         MACAddress.objects.bulk_create(mac_addresses)
 
         interfaces = (
-            Interface(device=devices[0], name='Interface 1'),
-            Interface(device=devices[0], name='Interface 2'),
-            Interface(device=devices[1], name='Interface 3'),
+            Interface(device=devices[0], name='Interface 1', speed=1000000),
+            Interface(device=devices[0], name='Interface 2', speed=1000000),
+            Interface(device=devices[1], name='Interface 3', speed=10000000),
             Interface(device=devices[1], name='Interface 4'),
             Interface(device=devices[2], name='Interface 5'),
             Interface(device=devices[2], name='Interface 6', rf_role=WirelessRoleChoices.ROLE_AP),
@@ -656,3 +804,127 @@ class DynamicFilterLookupExpressionTest(TestCase):
         self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 5)
         params = {'rf_role__empty': 'false'}
         self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 1)
+
+    def test_interface_speed_empty(self):
+        params = {'speed__empty': 'true'}
+        self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 3)
+        params = {'speed__empty': 'false'}
+        self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 3)
+
+    def test_site_created_empty(self):
+        params = {'created__empty': 'true'}
+        self.assertEqual(SiteFilterSet(params, Site.objects.all()).qs.count(), 0)
+        params = {'created__empty': 'false'}
+        self.assertEqual(SiteFilterSet(params, Site.objects.all()).qs.count(), 3)
+
+    def test_empty_lookup_ignores_non_boolean_values(self):
+        """
+        A numeric or date value passed to an __empty filter on a declared numeric/date filter must be ignored
+        rather than passed through to the isnull lookup (which would raise a ValueError).
+        """
+        for value in ('1', '100'):
+            with self.subTest(value=value):
+                params = {'speed__empty': value}
+                self.assertEqual(InterfaceFilterSet(params, Interface.objects.all()).qs.count(), 6)
+        for value in ('2024-01-01', '2024-01-01T00:00:00'):
+            with self.subTest(value=value):
+                params = {'created__empty': value}
+                self.assertEqual(SiteFilterSet(params, Site.objects.all()).qs.count(), 3)
+
+
+class SavedFilterApplicationTestCase(TestCase):
+    """
+    Validate the application of referenced SavedFilters to a FilterSet's data.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        sites = (
+            Site(name='Site 1', slug='site-1', status=SiteStatusChoices.STATUS_ACTIVE),
+            Site(name='Site 2', slug='site-2', status=SiteStatusChoices.STATUS_PLANNED),
+        )
+        Site.objects.bulk_create(sites)
+
+        cls.saved_filter = SavedFilter.objects.create(
+            name='Active Sites',
+            slug='active-sites',
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        cls.saved_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+    def setUp(self):
+        self.request = RequestFactory().get('/')
+        self.request.user = User.objects.create_user('testuser')
+
+    def test_filter_id_valid(self):
+        # A referenced SavedFilter's parameters are applied to the queryset
+        data = QueryDict(f'filter_id={self.saved_filter.pk}')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 1)
+
+    def test_filter_id_nonexistent(self):
+        # A non-existent (but valid integer) filter_id is ignored
+        data = QueryDict('filter_id=999999')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 2)
+
+    def test_filter_id_non_integer(self):
+        # A non-integer filter_id is ignored rather than raising a ValueError (#22568)
+        data = QueryDict('filter_id=abc')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 2)
+
+    def test_filter_slug(self):
+        # A referenced SavedFilter may also be applied by slug
+        data = QueryDict('filter=active-sites')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=self.request).qs.count(), 1)
+
+    def test_private_filter_not_applied_for_other_user(self):
+        # A private SavedFilter owned by another user must not be applied (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        request = RequestFactory().get('/')
+        request.user = User.objects.create_user('other')
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=request).qs.count(), 2)
+
+    def test_private_filter_applied_for_owner(self):
+        # The owner of a private SavedFilter can still apply it (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        request = RequestFactory().get('/')
+        request.user = owner
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all(), request=request).qs.count(), 1)
+
+    def test_shared_filter_applied_without_request(self):
+        # Without a request, a shared SavedFilter is still applied (anonymous visibility)
+        data = QueryDict('filter=active-sites')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all()).qs.count(), 1)
+
+    def test_private_filter_not_applied_without_request(self):
+        # Without a request, a private SavedFilter is not applied (#22790)
+        owner = User.objects.create_user('owner')
+        private_filter = SavedFilter.objects.create(
+            name='Private',
+            slug='private',
+            user=owner,
+            shared=False,
+            parameters={'status': [SiteStatusChoices.STATUS_ACTIVE]},
+        )
+        private_filter.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        data = QueryDict('filter=private')
+        self.assertEqual(SiteFilterSet(data, Site.objects.all()).qs.count(), 2)

@@ -1,10 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime
-from typing import TypeVar, TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, TypeVar
 
 import strawberry
 import strawberry_django
-from strawberry_django import BaseFilterLookup, FilterLookup, DatetimeFilterLookup
+from strawberry_django import BaseFilterLookup, DatetimeFilterLookup, FilterLookup, StrFilterLookup
 
 __all__ = (
     'DistanceFilterMixin',
@@ -17,9 +16,10 @@ T = TypeVar('T')
 
 
 if TYPE_CHECKING:
-    from .enums import *
     from core.graphql.filters import *
     from extras.graphql.filters import *
+
+    from .enums import *
 
 
 @dataclass
@@ -47,9 +47,9 @@ class SyncedDataFilterMixin:
         strawberry_django.filter_field()
     )
     data_file_id: FilterLookup[int] | None = strawberry_django.filter_field()
-    data_path: FilterLookup[str] | None = strawberry_django.filter_field()
+    data_path: StrFilterLookup | None = strawberry_django.filter_field()
     auto_sync_enabled: FilterLookup[bool] | None = strawberry_django.filter_field()
-    data_synced: DatetimeFilterLookup[datetime] | None = strawberry_django.filter_field()
+    data_synced: DatetimeFilterLookup | None = strawberry_django.filter_field()
 
 
 @dataclass

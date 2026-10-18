@@ -1,19 +1,21 @@
 from unittest import skip
 
-from circuits.models import CircuitTermination
-from dcim.choices import CableProfileChoices
+from circuits.models import Circuit, CircuitTermination, ProviderNetwork
+from dcim.choices import CableLengthUnitChoices, CableProfileChoices
 from dcim.models import *
 from dcim.svg import CableTraceSVG
-from dcim.tests.utils import CablePathTestCase
+from dcim.tests.utils import BaseCablePathTestCase
+from netbox.choices import DistanceUnitChoices
 
 
-class CablePathTests(CablePathTestCase):
+class CablePathTestCase(BaseCablePathTestCase):
     """
     Test the creation of CablePaths for Cables with different profiles applied.
 
     Tests are numbered as follows:
         1XX: Test direct connections using each profile
         2XX: Topology tests replicated from the legacy test case and adapted to use profiles
+        3XX: Dynamic port mapping, profile and termination changes
     """
 
     def test_101_cable_profile_single_1c1p(self):
@@ -797,6 +799,524 @@ class CablePathTests(CablePathTestCase):
         # Test SVG generation
         CableTraceSVG(interfaces[0]).render()
 
+    def test_107_duplex_interface_profiled_patch_through_trunk_with_splices(self):
+        """
+        Tests that a duplex interface (cable_positions=[1,2]) traces both positions through
+        profiled cables and splice pass-throughs, producing a single CablePath with both
+        strands visible.
+
+        [IF1] -C1(1C2P)- [FP1(p=2)][RP1(p=2)] -C2(1C2P)- [RP2(p=2)]
+        [FP2] -C3- [FP4][RP3(p=2)] -C4(1C2P)- [RP4(p=2)][FP6(p=2)]
+        -C5(1C2P)- [IF2]  /  [FP3] -C6- [FP5]
+
+        Cable profiles: C1=1C2P, C2=1C2P, C3/C6=unprofiled splices, C4=1C2P, C5=1C2P
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name='Rear Port 1', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 2', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 3', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 4', positions=2),
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name='Front Port 1', positions=2),  # Panel A duplex
+            FrontPort.objects.create(device=self.device, name='Front Port 2'),               # Splice A strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 3'),               # Splice A strand 2
+            FrontPort.objects.create(device=self.device, name='Front Port 4'),               # Splice B strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 5'),               # Splice B strand 2
+            FrontPort.objects.create(device=self.device, name='Front Port 6', positions=2),  # Panel B duplex
+        ]
+        PortMapping.objects.bulk_create([
+            # Panel A: duplex FP1(pos=2) -> RP1(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=1,
+                rear_port=rear_ports[0], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=2,
+                rear_port=rear_ports[0], rear_port_position=2,
+            ),
+            # Splice A: FP2, FP3 -> RP2(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=1,
+                rear_port=rear_ports[1], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[2], front_port_position=1,
+                rear_port=rear_ports[1], rear_port_position=2,
+            ),
+            # Splice B: FP4, FP5 -> RP3(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[3], front_port_position=1,
+                rear_port=rear_ports[2], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[4], front_port_position=1,
+                rear_port=rear_ports[2], rear_port_position=2,
+            ),
+            # Panel B: duplex FP6(pos=2) -> RP4(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[5], front_port_position=1,
+                rear_port=rear_ports[3], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[5], front_port_position=2,
+                rear_port=rear_ports[3], rear_port_position=2,
+            ),
+        ])
+
+        # Create cables
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[interfaces[0]],
+            b_terminations=[front_ports[0]],
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[rear_ports[0]],
+            b_terminations=[rear_ports[1]],
+        )
+        cable2.clean()
+        cable2.save()
+        cable3 = Cable(
+            a_terminations=[front_ports[1]],
+            b_terminations=[front_ports[3]],
+        )
+        cable3.clean()
+        cable3.save()
+        cable4 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[rear_ports[2]],
+            b_terminations=[rear_ports[3]],
+        )
+        cable4.clean()
+        cable4.save()
+        cable5 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[front_ports[5]],
+            b_terminations=[interfaces[1]],
+        )
+        cable5.clean()
+        cable5.save()
+        cable6 = Cable(
+            a_terminations=[front_ports[2]],
+            b_terminations=[front_ports[4]],
+        )
+        cable6.clean()
+        cable6.save()
+
+        # Verify forward path: IF1 -> IF2 (both strands through splice)
+        self.assertPathExists(
+            (
+                interfaces[0], cable1, front_ports[0],
+                rear_ports[0], cable2, rear_ports[1],
+                [front_ports[1], front_ports[2]], [cable3, cable6], [front_ports[3], front_ports[4]],
+                rear_ports[2], cable4, rear_ports[3],
+                front_ports[5], cable5, interfaces[1],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        # Verify reverse path: IF2 -> IF1
+        self.assertPathExists(
+            (
+                interfaces[1], cable5, front_ports[5],
+                rear_ports[3], cable4, rear_ports[2],
+                [front_ports[3], front_ports[4]], [cable3, cable6], [front_ports[1], front_ports[2]],
+                rear_ports[1], cable2, rear_ports[0],
+                front_ports[0], cable1, interfaces[0],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        # Verify cable positions on interfaces
+        for iface in interfaces:
+            iface.refresh_from_db()
+        self.assertEqual(interfaces[0].cable_connector, 1)
+        self.assertEqual(interfaces[0].cable_positions, [1, 2])
+        self.assertEqual(interfaces[1].cable_connector, 1)
+        self.assertEqual(interfaces[1].cable_positions, [1, 2])
+
+        # Test SVG generation
+        CableTraceSVG(interfaces[0]).render()
+
+    def test_108_single_interface_two_frontports_unprofiled_through_trunk_with_splices(self):
+        """
+        Tests that positions seeded by PortMapping (not cable_positions) are preserved
+        when crossing profiled cables.
+
+        [IF1] -C1- [FP1,FP2][RP1(p=2)] -C2(1C2P)- [RP2(p=2)]
+        [FP3] -C3- [FP5][RP3(p=2)] -C4(1C2P)- [RP4(p=2)]
+        [FP7,FP8] -C5- [IF2]  /  [FP4] -C6- [FP6]
+
+        PortMappings: FP1->RP1p1, FP2->RP1p2, FP3->RP2p1, FP4->RP2p2,
+                      FP5->RP3p1, FP6->RP3p2, FP7->RP4p1, FP8->RP4p2
+
+        C1 is unprofiled (1 IF -> 2 FPs), C2/C4 are 1C2P trunks,
+        C3/C6 are unprofiled splices, C5 is unprofiled (2 FPs -> 1 IF).
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name='Rear Port 1', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 2', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 3', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 4', positions=2),
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name='Front Port 1'),  # Panel A strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 2'),  # Panel A strand 2
+            FrontPort.objects.create(device=self.device, name='Front Port 3'),  # Splice A strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 4'),  # Splice A strand 2
+            FrontPort.objects.create(device=self.device, name='Front Port 5'),  # Splice B strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 6'),  # Splice B strand 2
+            FrontPort.objects.create(device=self.device, name='Front Port 7'),  # Panel B strand 1
+            FrontPort.objects.create(device=self.device, name='Front Port 8'),  # Panel B strand 2
+        ]
+        PortMapping.objects.bulk_create([
+            # Panel A: FP1, FP2 -> RP1(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=1,
+                rear_port=rear_ports[0], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=1,
+                rear_port=rear_ports[0], rear_port_position=2,
+            ),
+            # Splice A: FP3, FP4 -> RP2(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[2], front_port_position=1,
+                rear_port=rear_ports[1], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[3], front_port_position=1,
+                rear_port=rear_ports[1], rear_port_position=2,
+            ),
+            # Splice B: FP5, FP6 -> RP3(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[4], front_port_position=1,
+                rear_port=rear_ports[2], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[5], front_port_position=1,
+                rear_port=rear_ports[2], rear_port_position=2,
+            ),
+            # Panel B: FP7, FP8 -> RP4(pos=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[6], front_port_position=1,
+                rear_port=rear_ports[3], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[7], front_port_position=1,
+                rear_port=rear_ports[3], rear_port_position=2,
+            ),
+        ])
+
+        # Create cables
+        cable1 = Cable(
+            a_terminations=[interfaces[0]],
+            b_terminations=[front_ports[0], front_ports[1]],
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[rear_ports[0]],
+            b_terminations=[rear_ports[1]],
+        )
+        cable2.clean()
+        cable2.save()
+        cable3 = Cable(
+            a_terminations=[front_ports[2]],
+            b_terminations=[front_ports[4]],
+        )
+        cable3.clean()
+        cable3.save()
+        cable4 = Cable(
+            profile=CableProfileChoices.SINGLE_1C2P,
+            a_terminations=[rear_ports[2]],
+            b_terminations=[rear_ports[3]],
+        )
+        cable4.clean()
+        cable4.save()
+        cable5 = Cable(
+            a_terminations=[front_ports[6], front_ports[7]],
+            b_terminations=[interfaces[1]],
+        )
+        cable5.clean()
+        cable5.save()
+        cable6 = Cable(
+            a_terminations=[front_ports[3]],
+            b_terminations=[front_ports[5]],
+        )
+        cable6.clean()
+        cable6.save()
+
+        # Verify forward path: IF1 -> IF2 (both strands through splice)
+        self.assertPathExists(
+            (
+                interfaces[0], cable1, [front_ports[0], front_ports[1]],
+                rear_ports[0], cable2, rear_ports[1],
+                [front_ports[2], front_ports[3]], [cable3, cable6], [front_ports[4], front_ports[5]],
+                rear_ports[2], cable4, rear_ports[3],
+                [front_ports[6], front_ports[7]], cable5, interfaces[1],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        # Verify reverse path: IF2 -> IF1
+        self.assertPathExists(
+            (
+                interfaces[1], cable5, [front_ports[6], front_ports[7]],
+                rear_ports[3], cable4, rear_ports[2],
+                [front_ports[4], front_ports[5]], [cable3, cable6], [front_ports[2], front_ports[3]],
+                rear_ports[1], cable2, rear_ports[0],
+                [front_ports[0], front_ports[1]], cable1, interfaces[0],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        # Verify cable positions are not set (unprofiled patch cables)
+        for iface in interfaces:
+            iface.refresh_from_db()
+        self.assertIsNone(interfaces[0].cable_connector)
+        self.assertIsNone(interfaces[0].cable_positions)
+        self.assertIsNone(interfaces[1].cable_connector)
+        self.assertIsNone(interfaces[1].cable_positions)
+
+    def test_109_multiconnector_trunk_through_patch_panel(self):
+        """
+        Tests that a 4-position interface traces correctly through a patch panel
+        that fans out to both connectors of a Trunk2C2P cable.
+
+        [IF1] --C1(1C4P)-- [FP1(p=4)][RP1(p=2)] --C3(Trunk2C2P)-- [RP3(p=2)][FP5(p=4)] --C5(1C4P)-- [IF2]
+                                      [RP2(p=2)]                    [RP4(p=2)]
+
+        PortMappings (Panel A): FP1p1->RP1p1, FP1p2->RP1p2, FP1p3->RP2p1, FP1p4->RP2p2
+        PortMappings (Panel B): FP5p1->RP3p1, FP5p2->RP3p2, FP5p3->RP4p1, FP5p4->RP4p2
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name='Rear Port 1', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 2', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 3', positions=2),
+            RearPort.objects.create(device=self.device, name='Rear Port 4', positions=2),
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name='Front Port 1', positions=4),
+            FrontPort.objects.create(device=self.device, name='Front Port 5', positions=4),
+        ]
+        PortMapping.objects.bulk_create([
+            # Panel A: FP1(p=4) -> RP1(p=2) and RP2(p=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=1,
+                rear_port=rear_ports[0], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=2,
+                rear_port=rear_ports[0], rear_port_position=2,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=3,
+                rear_port=rear_ports[1], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[0], front_port_position=4,
+                rear_port=rear_ports[1], rear_port_position=2,
+            ),
+            # Panel B: FP5(p=4) -> RP3(p=2) and RP4(p=2)
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=1,
+                rear_port=rear_ports[2], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=2,
+                rear_port=rear_ports[2], rear_port_position=2,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=3,
+                rear_port=rear_ports[3], rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device, front_port=front_ports[1], front_port_position=4,
+                rear_port=rear_ports[3], rear_port_position=2,
+            ),
+        ])
+
+        # Create cables
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C4P,
+            a_terminations=[interfaces[0]],
+            b_terminations=[front_ports[0]],
+        )
+        cable1.clean()
+        cable1.save()
+        cable3 = Cable(
+            profile=CableProfileChoices.TRUNK_2C2P,
+            a_terminations=[rear_ports[0], rear_ports[1]],
+            b_terminations=[rear_ports[2], rear_ports[3]],
+        )
+        cable3.clean()
+        cable3.save()
+        cable5 = Cable(
+            profile=CableProfileChoices.SINGLE_1C4P,
+            a_terminations=[front_ports[1]],
+            b_terminations=[interfaces[1]],
+        )
+        cable5.clean()
+        cable5.save()
+
+        # Verify forward path: IF1 -> IF2 (all 4 positions through trunk)
+        self.assertPathExists(
+            (
+                interfaces[0], cable1, front_ports[0],
+                [rear_ports[0], rear_ports[1]], cable3, [rear_ports[2], rear_ports[3]],
+                front_ports[1], cable5, interfaces[1],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        # Verify reverse path: IF2 -> IF1
+        self.assertPathExists(
+            (
+                interfaces[1], cable5, front_ports[1],
+                [rear_ports[2], rear_ports[3]], cable3, [rear_ports[0], rear_ports[1]],
+                front_ports[0], cable1, interfaces[0],
+            ),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        # Verify cable positions
+        for iface in interfaces:
+            iface.refresh_from_db()
+        self.assertEqual(interfaces[0].cable_connector, 1)
+        self.assertEqual(interfaces[0].cable_positions, [1, 2, 3, 4])
+        self.assertEqual(interfaces[1].cable_connector, 1)
+        self.assertEqual(interfaces[1].cable_positions, [1, 2, 3, 4])
+
+        # Verify rear port connector assignments
+        for rp in rear_ports:
+            rp.refresh_from_db()
+        self.assertEqual(rear_ports[0].cable_connector, 1)
+        self.assertEqual(rear_ports[0].cable_positions, [1, 2])
+        self.assertEqual(rear_ports[1].cable_connector, 2)
+        self.assertEqual(rear_ports[1].cable_positions, [1, 2])
+        self.assertEqual(rear_ports[2].cable_connector, 1)
+        self.assertEqual(rear_ports[2].cable_positions, [1, 2])
+        self.assertEqual(rear_ports[3].cable_connector, 2)
+        self.assertEqual(rear_ports[3].cable_positions, [1, 2])
+
+        # Test SVG generation
+        CableTraceSVG(interfaces[0]).render()
+
+    def test_110_partial_termination_profiled_trunk(self):
+        """
+        Tests that tracing through a partially terminated profiled cable
+        produces a complete path for the connected pair and an incomplete
+        path for the unconnected pair, without errors. Also verifies that
+        attaching the missing termination completes the previously incomplete path.
+
+        [IF1] --C1-- [IF3]
+        [IF2]        (empty)
+
+        Cable profile: Trunk 2C1P with only one B-side termination.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+            Interface.objects.create(device=self.device, name='Interface 3'),
+        ]
+
+        # Create a 2-connector trunk cable with both A-side connectors
+        # populated but only one B-side connector terminated.
+        cable1 = Cable(
+            profile=CableProfileChoices.TRUNK_2C1P,
+            a_terminations=[interfaces[0], interfaces[1]],
+            b_terminations=[interfaces[2]],
+        )
+        cable1.clean()
+        cable1.save()
+
+        # IF1 (connector 1) → IF3 (connector 1): complete path
+        path1 = self.assertPathExists(
+            (interfaces[0], cable1, interfaces[2]),
+            is_complete=True,
+            is_active=True,
+        )
+
+        # IF3 (connector 1) → IF1 (connector 1): complete path (reverse)
+        path2 = self.assertPathExists(
+            (interfaces[2], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True,
+        )
+
+        # IF2 (connector 2) has no B-side peer.
+        # Tracing should stop at this segment, and the resulting path
+        # should remain incomplete.
+        # Verify via the origin's _path reference rather than matching
+        # the exact path shape directly.
+        interfaces[1].refresh_from_db()
+        self.assertIsNotNone(interfaces[1]._path_id)
+        path3 = CablePath.objects.get(pk=interfaces[1]._path_id)
+        self.assertFalse(path3.is_complete)
+        self.assertTrue(path3.is_active)
+
+        for iface in interfaces:
+            iface.refresh_from_db()
+        self.assertPathIsSet(interfaces[0], path1)
+        self.assertPathIsSet(interfaces[2], path2)
+        self.assertPathIsSet(interfaces[1], path3)
+
+        # Verify connector/position assignments
+        self.assertEqual(interfaces[0].cable_connector, 1)
+        self.assertEqual(interfaces[0].cable_positions, [1])
+        self.assertEqual(interfaces[1].cable_connector, 2)
+        self.assertEqual(interfaces[1].cable_positions, [1])
+        self.assertEqual(interfaces[2].cable_connector, 1)
+        self.assertEqual(interfaces[2].cable_positions, [1])
+
+        # Now attach the missing B-side termination and verify the
+        # previously incomplete path becomes complete.
+        interface4 = Interface.objects.create(device=self.device, name='Interface 4')
+        cable1.b_terminations = [interfaces[2], interface4]
+        cable1.clean()
+        cable1.save()
+
+        path4 = self.assertPathExists(
+            (interfaces[1], cable1, interface4),
+            is_complete=True,
+            is_active=True,
+        )
+        path5 = self.assertPathExists(
+            (interface4, cable1, interfaces[1]),
+            is_complete=True,
+            is_active=True,
+        )
+
+        interfaces[1].refresh_from_db()
+        interface4.refresh_from_db()
+        self.assertPathIsSet(interfaces[1], path4)
+        self.assertPathIsSet(interface4, path5)
+        self.assertEqual(interface4.cable_connector, 2)
+        self.assertEqual(interface4.cable_positions, [1])
+
     def test_202_single_path_via_pass_through_with_breakouts(self):
         """
         [IF1] --C1-- [FP1] [RP1] --C2-- [IF3]
@@ -1338,6 +1858,459 @@ class CablePathTests(CablePathTestCase):
         )
         self.assertEqual(CablePath.objects.count(), 4)
 
+    def test_225_breakout_1c2p_2c1p_to_single_position_passthroughs(self):
+        """
+        Regression test for #22187: a 1C2P:2C1P breakout cable terminating on two
+        single-position FrontPorts (each mapping 1:1 to a single-position RearPort)
+        which are then connected to PathEndpoints via unprofiled cables.
+
+        [IF1] --C1 (1C2P:2C1P)-- [FP1] [RP1] --C2 (unprofiled)-- [IF2]
+                                 [FP2] [RP2] --C3 (unprofiled)-- [IF3]
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+            Interface.objects.create(device=self.device, name='Interface 3'),
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name='Rear Port 1'),
+            RearPort.objects.create(device=self.device, name='Rear Port 2'),
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name='Front Port 1'),
+            FrontPort.objects.create(device=self.device, name='Front Port 2'),
+        ]
+        PortMapping.objects.bulk_create([
+            PortMapping(
+                device=self.device,
+                front_port=front_ports[0],
+                front_port_position=1,
+                rear_port=rear_ports[0],
+                rear_port_position=1,
+            ),
+            PortMapping(
+                device=self.device,
+                front_port=front_ports[1],
+                front_port_position=1,
+                rear_port=rear_ports[1],
+                rear_port_position=1,
+            ),
+        ])
+
+        # Create cables
+        cable1 = Cable(
+            profile=CableProfileChoices.BREAKOUT_1C2P_2C1P,
+            a_terminations=[interfaces[0]],
+            b_terminations=[front_ports[0], front_ports[1]],
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            a_terminations=[rear_ports[0]],
+            b_terminations=[interfaces[1]],
+        )
+        cable2.clean()
+        cable2.save()
+        cable3 = Cable(
+            a_terminations=[rear_ports[1]],
+            b_terminations=[interfaces[2]],
+        )
+        cable3.clean()
+        cable3.save()
+
+        # The breakout splits IF1's two positions into separate downstream cables,
+        # so the forward path has FP1/FP2, RP1/RP2, and the two unprofiled cables
+        # at the corresponding hops.
+        path1 = self.assertPathExists(
+            (
+                interfaces[0],
+                cable1,
+                [front_ports[0], front_ports[1]],
+                [rear_ports[0], rear_ports[1]],
+                [cable2, cable3],
+                [interfaces[1], interfaces[2]],
+            ),
+            is_complete=True,
+            is_active=True,
+        )
+        path2 = self.assertPathExists(
+            (interfaces[1], cable2, rear_ports[0], front_ports[0], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True,
+        )
+        path3 = self.assertPathExists(
+            (interfaces[2], cable3, rear_ports[1], front_ports[1], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True,
+        )
+        self.assertEqual(CablePath.objects.count(), 3)
+        for interface in interfaces:
+            interface.refresh_from_db()
+        self.assertPathIsSet(interfaces[0], path1)
+        self.assertPathIsSet(interfaces[1], path2)
+        self.assertPathIsSet(interfaces[2], path3)
+
+        # Test SVG generation from both directions
+        CableTraceSVG(interfaces[0]).render()
+        CableTraceSVG(interfaces[1]).render()
+        CableTraceSVG(interfaces[2]).render()
+
+    def test_226_total_length_via_circuit(self):
+        """
+        [IF1] --C1-- [CT1] [CT2] --C2-- [IF2]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        interface2 = Interface.objects.create(device=self.device, name='Interface 2')
+        circuittermination1 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination2 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='Z'
+        )
+
+        # Create cables
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1]
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[circuittermination2],
+            b_terminations=[interface2]
+        )
+        cable2.clean()
+        cable2.save()
+
+        # Check for complete paths in both directions
+        paths = [
+            self.assertPathExists(
+                (interface1, cable1, circuittermination1, circuittermination2, cable2, interface2),
+                is_complete=True,
+                is_active=True
+            ),
+            self.assertPathExists(
+                (interface2, cable2, circuittermination2, circuittermination1, cable1, interface1),
+                is_complete=True,
+                is_active=True
+            ),
+        ]
+
+        # The crossed circuit's distance counts toward the total path length
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (10400, True))
+
+        # An unset circuit distance makes the total length non-definitive
+        self.circuit.distance = None
+        self.circuit.save()
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (400, False))
+
+        # A circuit distance of zero is a known value and remains definitive
+        self.circuit.distance = 0
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (400, True))
+
+    def test_227_total_length_via_circuit_without_peer_termination(self):
+        """
+        [IF1] --C1-- [CT1]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        circuittermination1 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1]
+        )
+        cable1.clean()
+        cable1.save()
+
+        # The distance of a circuit which the path does not cross is excluded
+        path = self.assertPathExists(
+            (interface1, cable1, circuittermination1),
+            is_complete=False
+        )
+        self.assertEqual(path.get_total_length(), (200, True))
+
+    def test_228_total_length_via_multiple_circuits(self):
+        """
+        [IF1] --C1-- [CT1] [CT2] --C2-- [CT3] [CT4] --C3-- [IF2]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+        circuit2 = Circuit.objects.create(
+            provider=self.circuit.provider,
+            type=self.circuit.type,
+            cid='Circuit 2',
+            distance=5,
+            distance_unit=DistanceUnitChoices.UNIT_KILOMETER
+        )
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        interface2 = Interface.objects.create(device=self.device, name='Interface 2')
+        circuittermination1 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination2 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='Z'
+        )
+        circuittermination3 = CircuitTermination.objects.create(
+            circuit=circuit2,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination4 = CircuitTermination.objects.create(
+            circuit=circuit2,
+            termination=self.site,
+            term_side='Z'
+        )
+
+        # Create cables
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1]
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=100,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[circuittermination2],
+            b_terminations=[circuittermination3]
+        )
+        cable2.clean()
+        cable2.save()
+        cable3 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[circuittermination4],
+            b_terminations=[interface2]
+        )
+        cable3.clean()
+        cable3.save()
+
+        # Check for complete paths in both directions
+        paths = [
+            self.assertPathExists(
+                (
+                    interface1, cable1, circuittermination1, circuittermination2, cable2, circuittermination3,
+                    circuittermination4, cable3, interface2,
+                ),
+                is_complete=True,
+                is_active=True
+            ),
+            self.assertPathExists(
+                (
+                    interface2, cable3, circuittermination4, circuittermination3, cable2, circuittermination2,
+                    circuittermination1, cable1, interface1,
+                ),
+                is_complete=True,
+                is_active=True
+            ),
+        ]
+
+        # Each crossed circuit adds its distance to the total path length
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (15500, True))
+
+    def test_229_total_length_via_circuit_to_site(self):
+        """
+        [IF1] --C1-- [CT1] [CT2] --> [Site2]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        site2 = Site.objects.create(name='Site 2', slug='site-2')
+        circuittermination1 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination2 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=site2,
+            term_side='Z'
+        )
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1]
+        )
+        cable1.clean()
+        cable1.save()
+
+        # The distance of a circuit crossed to reach its far-side site counts toward the total length
+        path = self.assertPathExists(
+            (interface1, cable1, circuittermination1, circuittermination2, site2),
+            is_active=True
+        )
+        self.assertEqual(path.get_total_length(), (10200, True))
+
+    def test_230_total_length_via_circuit_to_providernetwork(self):
+        """
+        [IF1] --C1-- [CT1] [CT2] --> [PN1]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        providernetwork = ProviderNetwork.objects.create(name='Provider Network 1', provider=self.circuit.provider)
+        circuittermination1 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination2 = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=providernetwork,
+            term_side='Z'
+        )
+        cable1 = Cable(
+            profile=CableProfileChoices.SINGLE_1C1P,
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1]
+        )
+        cable1.clean()
+        cable1.save()
+
+        # The distance of a circuit crossed to reach a provider network counts toward the total length
+        path = self.assertPathExists(
+            (interface1, cable1, circuittermination1, circuittermination2, providernetwork),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(path.get_total_length(), (10200, True))
+
+    def test_231_total_length_via_parallel_circuits(self):
+        """
+        [IF1] --C1-- [CT1_A] [CT1_Z] --C2-- [IF2]
+                     [CT2_A] [CT2_Z]
+        """
+        self.circuit.distance = 10
+        self.circuit.distance_unit = DistanceUnitChoices.UNIT_KILOMETER
+        self.circuit.save()
+        circuit2 = Circuit.objects.create(
+            provider=self.circuit.provider,
+            type=self.circuit.type,
+            cid='Circuit 2',
+            distance=5,
+            distance_unit=DistanceUnitChoices.UNIT_KILOMETER
+        )
+
+        interface1 = Interface.objects.create(device=self.device, name='Interface 1')
+        interface2 = Interface.objects.create(device=self.device, name='Interface 2')
+        circuittermination1_A = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination1_Z = CircuitTermination.objects.create(
+            circuit=self.circuit,
+            termination=self.site,
+            term_side='Z'
+        )
+        circuittermination2_A = CircuitTermination.objects.create(
+            circuit=circuit2,
+            termination=self.site,
+            term_side='A'
+        )
+        circuittermination2_Z = CircuitTermination.objects.create(
+            circuit=circuit2,
+            termination=self.site,
+            term_side='Z'
+        )
+
+        # Create cables
+        cable1 = Cable(
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[interface1],
+            b_terminations=[circuittermination1_A, circuittermination2_A]
+        )
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(
+            length=200,
+            length_unit=CableLengthUnitChoices.UNIT_METER,
+            a_terminations=[circuittermination1_Z, circuittermination2_Z],
+            b_terminations=[interface2]
+        )
+        cable2.clean()
+        cable2.save()
+
+        # Check for complete paths in both directions
+        paths = [
+            self.assertPathExists(
+                (
+                    interface1, cable1, (circuittermination1_A, circuittermination2_A),
+                    (circuittermination1_Z, circuittermination2_Z), cable2, interface2,
+                ),
+                is_complete=True,
+                is_active=True
+            ),
+            self.assertPathExists(
+                (
+                    interface2, cable2, (circuittermination1_Z, circuittermination2_Z),
+                    (circuittermination1_A, circuittermination2_A), cable1, interface1,
+                ),
+                is_complete=True,
+                is_active=True
+            ),
+        ]
+
+        # Parallel circuits crossed in the same hop count only the longest distance
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (10400, True))
+
+        # An unset distance on one parallel circuit keeps the longest known distance but is non-definitive
+        circuit2.distance = None
+        circuit2.save()
+        for path in paths:
+            self.assertEqual(path.get_total_length(), (10400, False))
+
     def test_304_add_port_mapping_between_connected_ports(self):
         """
         [IF1] --C1-- [FP1] [RP1] --C2-- [IF2]
@@ -1539,3 +2512,374 @@ class CablePathTests(CablePathTestCase):
             is_complete=True,
             is_active=True
         )
+
+    def test_307_change_cable_profile_rebuilds_paths(self):
+        """
+        [IF1] --C1-- [IF2]
+
+        Applying a profile to an existing cable rebuilds its paths.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+
+        # Create cable 1 without a profile
+        cable1 = Cable(
+            a_terminations=[interfaces[0]],
+            b_terminations=[interfaces[1]],
+        )
+        cable1.clean()
+        cable1.save()
+
+        self.assertPathExists(
+            (interfaces[0], cable1, interfaces[1]),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertPathExists(
+            (interfaces[1], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True
+        )
+
+        # Reload so _terminations_modified starts False, as it does in a bulk edit
+        cable1 = Cable.objects.get(pk=cable1.pk)
+        cable1.profile = CableProfileChoices.SINGLE_1C1P
+        cable1.full_clean()
+        cable1.save()
+
+        path1 = self.assertPathExists(
+            (interfaces[0], cable1, interfaces[1]),
+            is_complete=True,
+            is_active=True
+        )
+        path2 = self.assertPathExists(
+            (interfaces[1], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+        interfaces[0].refresh_from_db()
+        interfaces[1].refresh_from_db()
+        self.assertPathIsSet(interfaces[0], path1)
+        self.assertPathIsSet(interfaces[1], path2)
+
+    def test_308_change_cable_profile_regroups_trunk_paths(self):
+        """
+        [IF1] --C1-- [IF3]
+        [IF2]        [IF4]
+
+        Applying a trunk profile to an existing cable regroups its paths by connector, and
+        clearing it again collapses them.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+            Interface.objects.create(device=self.device, name='Interface 3'),
+            Interface.objects.create(device=self.device, name='Interface 4'),
+        ]
+
+        # Create cable 1 without a profile
+        cable1 = Cable(
+            a_terminations=[interfaces[0], interfaces[1]],
+            b_terminations=[interfaces[2], interfaces[3]],
+        )
+        cable1.clean()
+        cable1.save()
+
+        # Without a profile both terminations on each end share a single path
+        self.assertPathExists(
+            ((interfaces[0], interfaces[1]), cable1, (interfaces[2], interfaces[3])),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertPathExists(
+            ((interfaces[2], interfaces[3]), cable1, (interfaces[0], interfaces[1])),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        # Reload so _terminations_modified starts False, as it does in a bulk edit
+        cable1 = Cable.objects.get(pk=cable1.pk)
+        cable1.profile = CableProfileChoices.TRUNK_2C1P
+        cable1.full_clean()
+        cable1.save()
+
+        path1 = self.assertPathExists(
+            (interfaces[0], cable1, interfaces[2]),
+            is_complete=True,
+            is_active=True
+        )
+        path2 = self.assertPathExists(
+            (interfaces[1], cable1, interfaces[3]),
+            is_complete=True,
+            is_active=True
+        )
+        path3 = self.assertPathExists(
+            (interfaces[2], cable1, interfaces[0]),
+            is_complete=True,
+            is_active=True
+        )
+        path4 = self.assertPathExists(
+            (interfaces[3], cable1, interfaces[1]),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 4)
+
+        for interface in interfaces:
+            interface.refresh_from_db()
+        self.assertPathIsSet(interfaces[0], path1)
+        self.assertPathIsSet(interfaces[1], path2)
+        self.assertPathIsSet(interfaces[2], path3)
+        self.assertPathIsSet(interfaces[3], path4)
+        self.assertEqual(interfaces[0].cable_connector, 1)
+        self.assertEqual(interfaces[1].cable_connector, 2)
+        self.assertEqual(interfaces[2].cable_connector, 1)
+        self.assertEqual(interfaces[3].cable_connector, 2)
+        for interface in interfaces:
+            self.assertEqual(interface.cable_positions, [1])
+
+        # Clearing the profile is a bulk-edit action in its own right
+        cable1 = Cable.objects.get(pk=cable1.pk)
+        cable1.profile = ''
+        cable1.full_clean()
+        cable1.save()
+
+        path5 = self.assertPathExists(
+            ((interfaces[0], interfaces[1]), cable1, (interfaces[2], interfaces[3])),
+            is_complete=True,
+            is_active=True
+        )
+        path6 = self.assertPathExists(
+            ((interfaces[2], interfaces[3]), cable1, (interfaces[0], interfaces[1])),
+            is_complete=True,
+            is_active=True
+        )
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        for interface in interfaces:
+            interface.refresh_from_db()
+            self.assertIsNone(interface.cable_connector)
+        self.assertPathIsSet(interfaces[0], path5)
+        self.assertPathIsSet(interfaces[1], path5)
+        self.assertPathIsSet(interfaces[2], path6)
+        self.assertPathIsSet(interfaces[3], path6)
+
+    def test_309_change_midspan_cable_profile_rebuilds_paths(self):
+        """
+        [IF1] --C1-- [FP1][RP1] --C3-- [RP2][FP2] --C2-- [IF2]
+
+        Applying a profile to a cable which terminates on pass-through ports rebuilds the
+        paths traversing it. The rear ports are not path origins, so a missing rebuild
+        truncates those paths rather than deleting them.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name='Rear Port 1'),
+            RearPort.objects.create(device=self.device, name='Rear Port 2'),
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name='Front Port 1'),
+            FrontPort.objects.create(device=self.device, name='Front Port 2'),
+        ]
+        for front_port, rear_port in zip(front_ports, rear_ports):
+            PortMapping.objects.create(
+                device=self.device,
+                front_port=front_port,
+                front_port_position=1,
+                rear_port=rear_port,
+                rear_port_position=1
+            )
+
+        cable1 = Cable(a_terminations=[interfaces[0]], b_terminations=[front_ports[0]])
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(a_terminations=[front_ports[1]], b_terminations=[interfaces[1]])
+        cable2.clean()
+        cable2.save()
+
+        # Create the mid-span cable without a profile
+        cable3 = Cable(a_terminations=[rear_ports[0]], b_terminations=[rear_ports[1]])
+        cable3.clean()
+        cable3.save()
+
+        nodes_a_to_b = (
+            interfaces[0], cable1, front_ports[0], rear_ports[0], cable3, rear_ports[1], front_ports[1], cable2,
+            interfaces[1],
+        )
+        nodes_b_to_a = (
+            interfaces[1], cable2, front_ports[1], rear_ports[1], cable3, rear_ports[0], front_ports[0], cable1,
+            interfaces[0],
+        )
+        self.assertPathExists(nodes_a_to_b, is_complete=True, is_active=True)
+        self.assertPathExists(nodes_b_to_a, is_complete=True, is_active=True)
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        # Reload so _terminations_modified starts False, as it does in a bulk edit
+        cable3 = Cable.objects.get(pk=cable3.pk)
+        cable3.profile = CableProfileChoices.SINGLE_1C1P
+        cable3.full_clean()
+        cable3.save()
+
+        path1 = self.assertPathExists(nodes_a_to_b, is_complete=True, is_active=True)
+        path2 = self.assertPathExists(nodes_b_to_a, is_complete=True, is_active=True)
+        self.assertEqual(CablePath.objects.count(), 2)
+
+        for interface in interfaces:
+            interface.refresh_from_db()
+        self.assertPathIsSet(interfaces[0], path1)
+        self.assertPathIsSet(interfaces[1], path2)
+
+    def test_310_repeat_save_does_not_recreate_paths(self):
+        """
+        [IF1] --C1-- [IF2]
+
+        Saving an unchanged cable again leaves its terminations and paths untouched.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+
+        cable1 = Cable(
+            a_terminations=[interfaces[0]],
+            b_terminations=[interfaces[1]],
+        )
+        cable1.clean()
+        cable1.save()
+
+        path_pks = set(CablePath.objects.values_list('pk', flat=True))
+        termination_pks = set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True))
+        self.assertEqual(len(path_pks), 2)
+        self.assertEqual(len(termination_pks), 2)
+
+        # Saving the same instance again must not duplicate its paths
+        cable1.save()
+        self.assertEqual(set(CablePath.objects.values_list('pk', flat=True)), path_pks)
+        self.assertEqual(
+            set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True)),
+            termination_pks
+        )
+
+        # Reload so _terminations_modified starts False, as it does in a bulk edit
+        cable1 = Cable.objects.get(pk=cable1.pk)
+        cable1.profile = CableProfileChoices.SINGLE_1C1P
+        cable1.full_clean()
+        cable1.save()
+
+        path_pks = set(CablePath.objects.values_list('pk', flat=True))
+        termination_pks = set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True))
+        self.assertEqual(len(path_pks), 2)
+        self.assertEqual(len(termination_pks), 2)
+
+        # The profile change is applied once, so a second save must not recreate anything
+        cable1.save()
+        self.assertEqual(set(CablePath.objects.values_list('pk', flat=True)), path_pks)
+        self.assertEqual(
+            set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True)),
+            termination_pks
+        )
+
+    def test_311_moving_a_midspan_termination_preserves_far_end_paths(self):
+        """
+        [IF1] --C1-- [FP1][RP1] --C3-- [RP2][FP2] --C2-- [IF2]
+        becomes
+        [IF1] --C1-- [FP1][RP1] --C3-- [RP3][FP3] --C4-- [IF3]
+
+        Rear ports originate no path, so moving a mid-span cable's end must retrace the rows which traverse it
+        rather than delete them: their origins cannot be recovered from the cable's own terminations.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name=f'Interface {i}') for i in range(1, 4)
+        ]
+        rear_ports = [
+            RearPort.objects.create(device=self.device, name=f'Rear Port {i}') for i in range(1, 4)
+        ]
+        front_ports = [
+            FrontPort.objects.create(device=self.device, name=f'Front Port {i}') for i in range(1, 4)
+        ]
+        for front_port, rear_port in zip(front_ports, rear_ports):
+            PortMapping.objects.create(
+                device=self.device,
+                front_port=front_port,
+                front_port_position=1,
+                rear_port=rear_port,
+                rear_port_position=1
+            )
+
+        cable1 = Cable(a_terminations=[interfaces[0]], b_terminations=[front_ports[0]])
+        cable1.clean()
+        cable1.save()
+        cable2 = Cable(a_terminations=[front_ports[1]], b_terminations=[interfaces[1]])
+        cable2.clean()
+        cable2.save()
+        cable3 = Cable(a_terminations=[rear_ports[0]], b_terminations=[rear_ports[1]])
+        cable3.clean()
+        cable3.save()
+        cable4 = Cable(a_terminations=[front_ports[2]], b_terminations=[interfaces[2]])
+        cable4.clean()
+        cable4.save()
+
+        before = (
+            interfaces[0], cable1, front_ports[0], rear_ports[0], cable3, rear_ports[1], front_ports[1], cable2,
+            interfaces[1],
+        )
+        self.assertCurrentPathExists(before, is_complete=True, is_active=True)
+        self.assertCurrentPathExists(tuple(reversed(before)), is_complete=True, is_active=True)
+        # Two for the completed link, one for the third interface stopping at its own rear port
+        self.assertEqual(CablePath.objects.count(), 3)
+
+        cable3 = Cable.objects.get(pk=cable3.pk)
+        cable3.b_terminations = [rear_ports[2]]
+        cable3.full_clean()
+        cable3.save()
+
+        after = (
+            interfaces[0], cable1, front_ports[0], rear_ports[0], cable3, rear_ports[2], front_ports[2], cable4,
+            interfaces[2],
+        )
+        self.assertCurrentPathExists(after, is_complete=True, is_active=True)
+        self.assertCurrentPathExists(tuple(reversed(after)), is_complete=True, is_active=True)
+        self.assertCurrentPathExists(
+            (interfaces[1], cable2, front_ports[1], rear_ports[1]), is_complete=False
+        )
+        self.assertEqual(CablePath.objects.count(), 3)
+
+    def test_312_change_cable_profile_on_a_warm_instance_rebuilds_paths(self):
+        """
+        [IF1] --C1-- [IF2]
+
+        Applying a profile to an instance whose termination caches are warm must recreate the rows and the paths.
+        """
+        interfaces = [
+            Interface.objects.create(device=self.device, name='Interface 1'),
+            Interface.objects.create(device=self.device, name='Interface 2'),
+        ]
+
+        # Creating the cable warms both caches and saving it resets the flag
+        cable1 = Cable(
+            a_terminations=[interfaces[0]],
+            b_terminations=[interfaces[1]],
+        )
+        cable1.clean()
+        cable1.save()
+        termination_pks = set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True))
+        self.assertEqual(CablePath.objects.count(), 2)
+        self.assertTrue(hasattr(cable1, '_a_terminations') and hasattr(cable1, '_b_terminations'))
+        self.assertFalse(cable1._terminations_modified)
+
+        cable1.profile = CableProfileChoices.SINGLE_1C1P
+        cable1.full_clean()
+        cable1.save()
+
+        self.assertCurrentPathExists((interfaces[0], cable1, interfaces[1]), is_complete=True, is_active=True)
+        self.assertCurrentPathExists((interfaces[1], cable1, interfaces[0]), is_complete=True, is_active=True)
+        self.assertEqual(CablePath.objects.count(), 2)
+        new_termination_pks = set(CableTermination.objects.filter(cable=cable1).values_list('pk', flat=True))
+        self.assertTrue(termination_pks.isdisjoint(new_termination_pks))

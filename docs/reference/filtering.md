@@ -14,7 +14,7 @@ Some models have fields which are limited to specific choices, such as the `stat
 
 ```no-highlight
 $ curl -s -X OPTIONS \
--H "Authorization: Token $TOKEN" \
+-H "Authorization: Bearer $TOKEN" \
 -H "Content-Type: application/json" \
 http://netbox/api/ipam/prefixes/ | jq ".actions.POST.status.choices"
 [
@@ -101,6 +101,16 @@ Here is an example of a lookup expression on a string field that will return all
 GET /api/dcim/devices/?name__ic=switch
 ```
 
+!!! note "Case-insensitive matching depends on the field's collation"
+    Most `name` fields use a database collation which sorts them in natural order, so that
+    `device-2` precedes `device-10`. Case-insensitive matching on those fields follows the
+    same collation, which treats a character as equivalent to the sequence it expands to in
+    upper case. The German `ß` is the common example: a search for `Strasse` matches a
+    device named `Straße`, and vice versa. Ligatures such as `ﬁ` behave the same way. One
+    consequence is that a case-insensitive exact match on such a field may return more than
+    one object. Fields which do not use this collation, such as `serial` and `description`,
+    match these characters literally.
+
 ### Foreign Keys & Other Fields
 
 Certain other fields, namely foreign key relationships support just the negation
@@ -109,6 +119,23 @@ expression: `n`. Here is an example of a lookup expression on a foreign key, it 
 ```no-highlight
 GET /api/ipam/vlans/?group_id__n=3203
 ```
+
+### Tags
+
+The `tag` and `tag_id` filters support negation (`n`) as well as an `any` lookup expression:
+
+| Filter | Description                                       |
+|--------|----------------------------------------------------|
+| `n`    | Does not have any of these tags                    |
+| `any`  | Has any of these tags (logical OR)                  |
+
+Passing multiple values for `tag`/`tag_id` without a lookup expression uses a logical AND: `GET /api/dcim/sites/?tag=foo&tag=bar` returns only sites tagged with both `foo` _and_ `bar`. To instead match sites tagged with `foo` _or_ `bar`, use the `any` lookup expression:
+
+```no-highlight
+GET /api/dcim/sites/?tag__any=foo&tag__any=bar
+```
+
+Note that `n` is not the logical complement of the default (AND) behavior: passing multiple values applies NOR logic, matching only objects which have _none_ of the specified tags, rather than objects which are simply missing at least one of them.
 
 ## Ordering Objects
 

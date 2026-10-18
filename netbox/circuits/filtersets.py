@@ -9,9 +9,13 @@ from ipam.models import ASN
 from netbox.filtersets import NetBoxModelFilterSet, OrganizationalModelFilterSet, PrimaryModelFilterSet
 from tenancy.filtersets import ContactModelFilterSet, TenancyFilterSet
 from utilities.filters import (
-    MultiValueCharFilter, MultiValueContentTypeFilter, MultiValueNumberFilter, TreeNodeMultipleChoiceFilter,
+    MultiValueCharFilter,
+    MultiValueContentTypeFilter,
+    MultiValueNumberFilter,
+    TreeNodeMultipleChoiceFilter,
 )
 from utilities.filtersets import register_filterset
+
 from .choices import *
 from .models import *
 
@@ -21,9 +25,9 @@ __all__ = (
     'CircuitGroupFilterSet',
     'CircuitTerminationFilterSet',
     'CircuitTypeFilterSet',
-    'ProviderNetworkFilterSet',
     'ProviderAccountFilterSet',
     'ProviderFilterSet',
+    'ProviderNetworkFilterSet',
     'VirtualCircuitFilterSet',
     'VirtualCircuitTerminationFilterSet',
     'VirtualCircuitTypeFilterSet',
@@ -185,7 +189,7 @@ class CircuitFilterSet(PrimaryModelFilterSet, TenancyFilterSet, ContactModelFilt
     )
     provider_account = django_filters.ModelMultipleChoiceFilter(
         field_name='provider_account__account',
-        queryset=Provider.objects.all(),
+        queryset=ProviderAccount.objects.all(),
         distinct=False,
         to_field_name='account',
         label=_('Provider account (account)'),
@@ -401,6 +405,11 @@ class CircuitGroupAssignmentFilterSet(NetBoxModelFilterSet):
         label=_('Search'),
     )
     member_type = MultiValueContentTypeFilter()
+    member_type_id = django_filters.ModelMultipleChoiceFilter(
+        field_name='member_type',
+        queryset=ContentType.objects.all(),
+        distinct=False,
+    )
     circuit = MultiValueCharFilter(
         method='filter_circuit',
         field_name='cid',
@@ -446,13 +455,14 @@ class CircuitGroupAssignmentFilterSet(NetBoxModelFilterSet):
 
     class Meta:
         model = CircuitGroupAssignment
-        fields = ('id', 'member_id', 'priority')
+        fields = ('id', 'member_type_id', 'member_id', 'priority')
 
     def search(self, queryset, name, value):
         if not value.strip():
             return queryset
         return queryset.filter(
-            Q(member__cid__icontains=value) |
+            Q(circuit__cid__icontains=value) |
+            Q(virtual_circuit__cid__icontains=value) |
             Q(group__name__icontains=value)
         )
 
@@ -527,7 +537,7 @@ class VirtualCircuitFilterSet(PrimaryModelFilterSet, TenancyFilterSet):
     )
     provider_account = django_filters.ModelMultipleChoiceFilter(
         field_name='provider_account__account',
-        queryset=Provider.objects.all(),
+        queryset=ProviderAccount.objects.all(),
         distinct=False,
         to_field_name='account',
         label=_('Provider account (account)'),

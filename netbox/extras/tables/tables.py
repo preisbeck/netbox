@@ -5,13 +5,14 @@ from django.template.defaultfilters import filesizeformat
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 
-from extras.models import *
-from core.tables import JobTable
 from core.models import Job
+from core.tables import JobTable
+from extras.models import *
 from netbox.constants import EMPTY_TABLE_TEXT
 from netbox.events import get_event_text
 from netbox.tables import BaseTable, NetBoxTable, PrimaryModelTable, columns
-from .columns import NotificationActionsColumn
+
+from .columns import CustomFieldStatusColumn, NotificationActionsColumn
 
 __all__ = (
     'BookmarkTable',
@@ -27,14 +28,14 @@ __all__ = (
     'JournalEntryTable',
     'NotificationGroupTable',
     'NotificationTable',
-    'SavedFilterTable',
     'ReportResultsTable',
-    'ScriptResultsTable',
+    'SavedFilterTable',
     'ScriptJobTable',
+    'ScriptResultsTable',
     'SubscriptionTable',
     'TableConfigTable',
-    'TaggedItemTable',
     'TagTable',
+    'TaggedItemTable',
     'WebhookTable',
 )
 
@@ -86,6 +87,9 @@ class CustomFieldTable(NetBoxTable):
         verbose_name=_('Validate Uniqueness'),
         false_mark=None
     )
+    status = CustomFieldStatusColumn(
+        verbose_name=_('Status')
+    )
     ui_visible = columns.ChoiceFieldColumn(
         verbose_name=_('Visible')
     )
@@ -111,6 +115,10 @@ class CustomFieldTable(NetBoxTable):
         verbose_name=_('Is Cloneable'),
         false_mark=None
     )
+    nulls_first = columns.BooleanColumn(
+        verbose_name=_('Nulls First'),
+        false_mark=None
+    )
     validation_minimum = tables.Column(
         verbose_name=_('Minimum Value'),
     )
@@ -119,6 +127,10 @@ class CustomFieldTable(NetBoxTable):
     )
     validation_regex = tables.Column(
         verbose_name=_('Validation Regex'),
+    )
+    validation_schema = columns.BooleanColumn(
+        verbose_name=_('Validation Schema'),
+        false_mark=None,
     )
     owner = tables.Column(
         linkify=True,
@@ -130,11 +142,13 @@ class CustomFieldTable(NetBoxTable):
         fields = (
             'pk', 'id', 'name', 'object_types', 'label', 'type', 'related_object_type', 'group_name', 'required',
             'unique', 'default', 'description', 'search_weight', 'filter_logic', 'ui_visible', 'ui_editable',
-            'is_cloneable', 'weight', 'choice_set', 'choices', 'validation_minimum', 'validation_maximum',
-            'validation_regex', 'comments', 'created', 'last_updated',
+            'is_cloneable', 'nulls_first', 'weight', 'choice_set', 'choices', 'validation_minimum',
+            'validation_maximum', 'validation_regex', 'validation_schema', 'status', 'comments', 'created',
+            'last_updated',
         )
         default_columns = (
-            'pk', 'name', 'object_types', 'label', 'group_name', 'type', 'required', 'unique', 'description',
+            'pk', 'name', 'status', 'object_types', 'label', 'group_name', 'type', 'required', 'unique',
+            'description',
         )
 
 
@@ -416,9 +430,10 @@ class NotificationTable(NetBoxTable):
     icon = columns.TemplateColumn(
         template_code=NOTIFICATION_ICON,
         accessor=tables.A('event'),
+        orderable=False,
         attrs={
             'td': {'class': 'w-1'},
-            'th': {'class': 'w-1'},
+            'th': {'class': 'w-1', 'aria-label': _('Type')},
         },
         verbose_name=''
     )
@@ -478,8 +493,11 @@ class WebhookTable(NetBoxTable):
         verbose_name=_('Name'),
         linkify=True
     )
-    ssl_validation = columns.BooleanColumn(
-        verbose_name=_('SSL Validation')
+    ssl_verification = columns.BooleanColumn(
+        verbose_name=_('SSL Verification'),
+    )
+    timeout = tables.Column(
+        verbose_name=_('Timeout (sec)'),
     )
     owner = tables.Column(
         linkify=True,
@@ -493,7 +511,7 @@ class WebhookTable(NetBoxTable):
         model = Webhook
         fields = (
             'pk', 'id', 'name', 'http_method', 'payload_url', 'http_content_type', 'secret', 'ssl_verification',
-            'ca_file_path', 'description', 'tags', 'created', 'last_updated',
+            'ca_file_path', 'timeout', 'description', 'tags', 'created', 'last_updated',
         )
         default_columns = (
             'pk', 'name', 'http_method', 'payload_url', 'description',
@@ -509,8 +527,9 @@ class EventRuleTable(NetBoxTable):
         verbose_name=_('Type'),
     )
     action_object = tables.Column(
-        linkify=True,
         verbose_name=_('Object'),
+        orderable=False,
+        linkify=True,
     )
     object_types = columns.ContentTypesColumn(
         verbose_name=_('Object Types'),
@@ -540,6 +559,19 @@ class EventRuleTable(NetBoxTable):
         default_columns = (
             'pk', 'name', 'enabled', 'action_type', 'action_object', 'object_types', 'event_types',
         )
+
+    def render_action_type(self, record):
+        # Render explicitly (rather than relying on django-tables2's built-in choices-driven
+        # get_FOO_display() auto-rendering) so an unavailable action type gets a red badge.
+        label = record.get_action_type_display()
+        if not record.action_is_available:
+            return format_html('<span class="badge text-bg-red">{}</span>', label)
+        return label
+
+    def value_action_type(self, record):
+        # Raw value for non-HTML output (e.g. CSV/table-config export), so the badge's HTML
+        # markup from render_action_type() above isn't leaked into it.
+        return record.get_action_type_display()
 
 
 class TagTable(NetBoxTable):
@@ -696,6 +728,10 @@ class ConfigTemplateTable(NetBoxTable):
         verbose_name=_('As Attachment'),
         false_mark=None
     )
+    debug = columns.BooleanColumn(
+        verbose_name=_('Debug'),
+        false_mark=None
+    )
     owner = tables.Column(
         linkify=True,
         verbose_name=_('Owner')
@@ -727,7 +763,7 @@ class ConfigTemplateTable(NetBoxTable):
     class Meta(NetBoxTable.Meta):
         model = ConfigTemplate
         fields = (
-            'pk', 'id', 'name', 'description', 'data_source', 'data_file', 'data_synced', 'as_attachment',
+            'pk', 'id', 'name', 'description', 'data_source', 'data_file', 'data_synced', 'as_attachment', 'debug',
             'mime_type', 'file_name', 'file_extension', 'role_count', 'platform_count', 'device_count',
             'vm_count', 'created', 'last_updated', 'tags',
         )

@@ -9,7 +9,10 @@ from netbox.utils import get_data_backend_choices
 from users.models import User
 from utilities.forms import BOOLEAN_WITH_BLANK_CHOICES, FilterForm, add_blank_choice
 from utilities.forms.fields import (
-    ContentTypeChoiceField, ContentTypeMultipleChoiceField, DynamicModelMultipleChoiceField, TagFilterField,
+    ContentTypeChoiceField,
+    ContentTypeMultipleChoiceField,
+    DynamicModelMultipleChoiceField,
+    TagFilterField,
 )
 from utilities.forms.rendering import FieldSet
 from utilities.forms.widgets import DateTimePicker
@@ -72,11 +75,12 @@ class JobFilterForm(SavedFiltersMixin, FilterForm):
     model = Job
     fieldsets = (
         FieldSet('q', 'filter_id'),
-        FieldSet('object_type_id', 'status', 'queue_name', name=_('Attributes')),
+        FieldSet('object_type_id', 'status', 'queue_name', 'user_id', name=_('Attributes')),
         FieldSet(
             'created__before', 'created__after', 'scheduled__before', 'scheduled__after', 'started__before',
-            'started__after', 'completed__before', 'completed__after', 'user', name=_('Creation')
+            'started__after', 'completed__before', 'completed__after', name=_('Scheduling')
         ),
+        FieldSet('execution_time__gte', 'execution_time__lte', name=_('Execution')),
     )
     object_type_id = ContentTypeChoiceField(
         label=_('Object Type'),
@@ -132,10 +136,20 @@ class JobFilterForm(SavedFiltersMixin, FilterForm):
         required=False,
         widget=DateTimePicker()
     )
-    user = DynamicModelMultipleChoiceField(
+    user_id = DynamicModelMultipleChoiceField(
         queryset=User.objects.all(),
         required=False,
         label=_('User')
+    )
+    execution_time__gte = forms.DurationField(
+        label=_('Execution time (minimum)'),
+        required=False,
+        help_text=_('Seconds, or HH:MM:SS')
+    )
+    execution_time__lte = forms.DurationField(
+        label=_('Execution time (maximum)'),
+        required=False,
+        help_text=_('Seconds, or HH:MM:SS')
     )
 
 

@@ -1,10 +1,13 @@
 import django_tables2 as tables
+from django.utils.html import conditional_escape
+from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 
-from netbox.tables import BaseTable, NetBoxTable, columns
 from core.constants import JOB_LOG_ENTRY_LEVELS
 from core.models import Job
 from core.tables.columns import BadgeColumn
+from netbox.tables import BaseTable, NetBoxTable, columns
+from utilities.string import humanize_duration
 
 
 class JobTable(NetBoxTable):
@@ -42,6 +45,9 @@ class JobTable(NetBoxTable):
     completed = columns.DateTimeColumn(
         verbose_name=_('Completed'),
     )
+    execution_time = tables.Column(
+        verbose_name=_('Execution Time'),
+    )
     queue_name = tables.Column(
         verbose_name=_('Queue'),
     )
@@ -56,14 +62,23 @@ class JobTable(NetBoxTable):
         model = Job
         fields = (
             'pk', 'id', 'object_type', 'object', 'name', 'status', 'created', 'scheduled', 'interval', 'started',
-            'completed', 'user', 'queue_name', 'log_entries', 'error', 'job_id',
+            'completed', 'execution_time', 'user', 'queue_name', 'log_entries', 'error', 'job_id',
         )
         default_columns = (
-            'pk', 'id', 'object_type', 'object', 'name', 'status', 'created', 'started', 'completed', 'user',
+            'pk', 'id', 'object_type', 'object', 'name', 'status', 'created', 'started', 'completed', 'execution_time',
+            'user',
         )
 
     def render_log_entries(self, value):
         return len(value)
+
+    def render_execution_time(self, value):
+        return humanize_duration(value)
+
+    def value_execution_time(self, value):
+        # Export the recorded execution time as a raw number of seconds, rather than the humanized
+        # string, as an export is intended for analysis
+        return round(value.total_seconds(), 3)
 
 
 class JobLogEntryTable(BaseTable):
@@ -82,3 +97,9 @@ class JobLogEntryTable(BaseTable):
     class Meta(BaseTable.Meta):
         empty_text = _('No log entries')
         fields = ('timestamp', 'level', 'message')
+
+    def render_message(self, record, value):
+        if record.get('level') == 'error' and '\n' in value:
+            value = conditional_escape(value)
+            return mark_safe(f'<pre class="p-0">{value}</pre>')
+        return value

@@ -4,9 +4,15 @@ from django.utils.translation import gettext_lazy as _
 from dcim.models import *
 from netbox.forms import NetBoxModelForm
 from netbox.forms.mixins import OwnerMixin
-from utilities.forms.fields import DynamicModelChoiceField, DynamicModelMultipleChoiceField, ExpandableNameField
+from utilities.forms.fields import (
+    DynamicModelChoiceField,
+    DynamicModelMultipleChoiceField,
+    ExpandableNameField,
+    ExpandableNumericField,
+)
 from utilities.forms.rendering import FieldSet, TabbedGroups
 from utilities.forms.widgets import APISelect
+
 from . import model_forms
 
 __all__ = (
@@ -15,6 +21,10 @@ __all__ = (
     'ConsolePortTemplateCreateForm',
     'ConsoleServerPortCreateForm',
     'ConsoleServerPortTemplateCreateForm',
+    'CoolingIntakeCreateForm',
+    'CoolingIntakeTemplateCreateForm',
+    'CoolingOutflowCreateForm',
+    'CoolingOutflowTemplateCreateForm',
     'DeviceBayCreateForm',
     'DeviceBayTemplateCreateForm',
     'FrontPortCreateForm',
@@ -61,18 +71,20 @@ class ComponentCreateForm(forms.Form):
             return
         pattern_count = len(patterns)
         for field_name in self.replication_fields:
-            value_count = len(self.cleaned_data[field_name])
-            if self.cleaned_data[field_name]:
-                if value_count == 1:
-                    # If the field resolves to a single value (because no pattern was used), multiply it by the number
-                    # of expected values. This allows us to reuse the same label when creating multiple components.
-                    self.cleaned_data[field_name] = self.cleaned_data[field_name] * pattern_count
-                elif value_count != pattern_count:
-                    raise forms.ValidationError({
-                        field_name: _(
-                            "The provided pattern specifies {value_count} values, but {pattern_count} are expected."
-                        ).format(value_count=value_count, pattern_count=pattern_count)
-                    }, code='label_pattern_mismatch')
+            # A field is absent from cleaned_data if it failed its own validation, e.g. an inverted numeric range
+            if not (values := self.cleaned_data.get(field_name)):
+                continue
+            value_count = len(values)
+            if value_count == 1:
+                # If the field resolves to a single value (because no pattern was used), multiply it by the number
+                # of expected values. This allows us to reuse the same label when creating multiple components.
+                self.cleaned_data[field_name] = values * pattern_count
+            elif value_count != pattern_count:
+                raise forms.ValidationError({
+                    field_name: _(
+                        "The provided pattern specifies {value_count} values, but {pattern_count} are expected."
+                    ).format(value_count=value_count, pattern_count=pattern_count)
+                }, code='label_pattern_mismatch')
 
 
 #
@@ -103,10 +115,27 @@ class PowerOutletTemplateCreateForm(ComponentCreateForm, model_forms.PowerOutlet
         exclude = ('name', 'label')
 
 
+class CoolingIntakeTemplateCreateForm(ComponentCreateForm, model_forms.CoolingIntakeTemplateForm):
+
+    class Meta(model_forms.CoolingIntakeTemplateForm.Meta):
+        exclude = ('name', 'label')
+
+
+class CoolingOutflowTemplateCreateForm(ComponentCreateForm, model_forms.CoolingOutflowTemplateForm):
+
+    class Meta(model_forms.CoolingOutflowTemplateForm.Meta):
+        exclude = ('name', 'label')
+
+
 class InterfaceTemplateCreateForm(ComponentCreateForm, model_forms.InterfaceTemplateForm):
+    channel_id = ExpandableNumericField(
+        label=_('Channel ID'),
+        required=False
+    )
+    replication_fields = ('name', 'label', 'channel_id')
 
     class Meta(model_forms.InterfaceTemplateForm.Meta):
-        exclude = ('name', 'label')
+        exclude = ('name', 'label', 'channel_id')
 
 
 class FrontPortTemplateCreateForm(ComponentCreateForm, model_forms.FrontPortTemplateForm):
@@ -195,10 +224,27 @@ class PowerOutletCreateForm(ComponentCreateForm, model_forms.PowerOutletForm):
         exclude = ('name', 'label')
 
 
+class CoolingIntakeCreateForm(ComponentCreateForm, model_forms.CoolingIntakeForm):
+
+    class Meta(model_forms.CoolingIntakeForm.Meta):
+        exclude = ('name', 'label')
+
+
+class CoolingOutflowCreateForm(ComponentCreateForm, model_forms.CoolingOutflowForm):
+
+    class Meta(model_forms.CoolingOutflowForm.Meta):
+        exclude = ('name', 'label')
+
+
 class InterfaceCreateForm(ComponentCreateForm, model_forms.InterfaceForm):
+    channel_id = ExpandableNumericField(
+        label=_('Channel ID'),
+        required=False
+    )
+    replication_fields = ('name', 'label', 'channel_id')
 
     class Meta(model_forms.InterfaceForm.Meta):
-        exclude = ('name', 'label')
+        exclude = ('name', 'label', 'channel_id')
 
 
 class FrontPortCreateForm(ComponentCreateForm, model_forms.FrontPortForm):

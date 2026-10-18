@@ -1,3 +1,5 @@
+from itertools import batched
+
 from django.apps import apps
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.core.exceptions import ValidationError
@@ -8,10 +10,18 @@ from django.utils.translation import gettext_lazy as _
 from circuits.choices import *
 from dcim.models import CabledObjectModel
 from netbox.models import ChangeLoggedModel, OrganizationalModel, PrimaryModel
-from netbox.models.mixins import DistanceMixin
 from netbox.models.features import (
-    ContactsMixin, CustomFieldsMixin, CustomLinksMixin, ExportTemplatesMixin, ImageAttachmentsMixin, TagsMixin,
+    ContactsMixin,
+    CustomFieldsMixin,
+    CustomLinksMixin,
+    ExportTemplatesMixin,
+    ImageAttachmentsMixin,
+    TagsMixin,
 )
+from netbox.models.mixins import DistanceMixin
+from utilities.data import normalize_update_fields
+from utilities.string import title
+
 from .base import BaseCircuitType
 
 __all__ = (
@@ -138,6 +148,9 @@ class Circuit(ContactsMixin, ImageAttachmentsMixin, DistanceMixin, PrimaryModel)
                 name='%(app_label)s_%(class)s_unique_provideraccount_cid'
             ),
         )
+        indexes = (
+            models.Index(fields=('provider', 'provider_account', 'cid')),  # Default ordering
+        )
         verbose_name = _('circuit')
         verbose_name_plural = _('circuits')
 
@@ -215,6 +228,9 @@ class CircuitGroupAssignment(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin,
                 name='%(app_label)s_%(class)s_unique_member_group'
             ),
         )
+        indexes = (
+            models.Index(fields=('group', 'member_type', 'member_id', 'priority', 'id')),  # Default ordering
+        )
         verbose_name = _('Circuit group assignment')
         verbose_name_plural = _('Circuit group assignments')
 
@@ -225,6 +241,23 @@ class CircuitGroupAssignment(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin,
 
     def get_absolute_url(self):
         return reverse('circuits:circuitgroupassignment', args=[self.pk])
+
+
+def _set_circuit_terminations(circuit, fields, using):
+    """
+    Set or clear a Circuit's cached `termination_a`/`termination_z` fields, recording the change.
+    """
+    from extras.models import CustomField
+
+    circuit.snapshot()
+    for field_name, value in fields.items():
+        setattr(circuit, field_name, value)
+
+    # Write custom_field_data only if save() will populate a default, which the change log serializes
+    update_fields = [*fields, 'last_updated']
+    if CustomField.objects.get_defaults_for_model(circuit).keys() - circuit.custom_field_data.keys():
+        update_fields.append('custom_field_data')
+    circuit.save(using=using, update_fields=update_fields)
 
 
 class CircuitTermination(
@@ -341,6 +374,13 @@ class CircuitTermination(
         verbose_name = _('circuit termination')
         verbose_name_plural = _('circuit terminations')
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Cache original values to detect changes
+        self._orig_circuit_id = self.__dict__.get('circuit_id')
+        self._orig_term_side = self.__dict__.get('term_side')
+
     def __str__(self):
         return f'{self.circuit}: Termination {self.term_side}'
 
@@ -348,16 +388,77 @@ class CircuitTermination(
         return reverse('circuits:circuittermination', args=[self.pk])
 
     def clean(self):
+        if self.termination_type and not (self.termination or self.termination_id):
+            termination_type = self.termination_type.model_class()
+            raise ValidationError(
+                _("Please select a {termination_type}.").format(
+                    termination_type=_(title(termination_type._meta.verbose_name))
+                )
+            )
         super().clean()
 
         if self.termination is None:
             raise ValidationError(_("A circuit termination must attach to a terminating object."))
 
     def save(self, *args, **kwargs):
+        is_new = self._state.adding
+        update_fields = normalize_update_fields(kwargs)
+
+        # Only consider circuit/term_side changes if those fields
+        # are actually being persisted
+        if update_fields is not None:
+            tracking_relevant = 'circuit' in update_fields or 'term_side' in update_fields
+        else:
+            tracking_relevant = True
+
+        circuit_changed = tracking_relevant and self._orig_circuit_id and self._orig_circuit_id != self.circuit_id
+        term_side_changed = tracking_relevant and self._orig_term_side and self._orig_term_side != self.term_side
+
         # Cache objects associated with the terminating object (for filtering)
         self.cache_related_objects()
 
         super().save(*args, **kwargs)
+
+        # Clear the old termination reference if circuit or term_side changed
+        if circuit_changed or term_side_changed:
+            old_termination_name = f'termination_{self._orig_term_side.lower()}'
+            circuit = Circuit.objects.using(self._state.db).filter(
+                pk=self._orig_circuit_id, **{old_termination_name: self.pk}
+            ).prefetch_related('tags').first()
+            if circuit is not None:
+                _set_circuit_terminations(circuit, {old_termination_name: None}, using=self._state.db)
+
+        # Update the cache if this is a new termination or circuit/term_side changed
+        if is_new or circuit_changed or term_side_changed:
+            # Update the new circuit's termination reference
+            termination_name = f'termination_{self.term_side.lower()}'
+            circuit = Circuit.objects.using(self._state.db).prefetch_related('tags').get(pk=self.circuit_id)
+            _set_circuit_terminations(circuit, {termination_name: self}, using=self._state.db)
+
+            # Update cached values for subsequent saves
+            self._orig_circuit_id = self.circuit_id
+            self._orig_term_side = self.term_side
+
+    @classmethod
+    def clear_cached_references(cls, instances, collector):
+        # Called by CustomCollector ahead of the DELETE, for explicit and cascaded deletions alike
+        doomed_circuits = {circuit.pk for circuit in collector.data.get(Circuit, ())}
+
+        # A circuit only points at its own terminations, so any deleted along with it need no clear
+        pks = {instance.pk for instance in instances if instance.circuit_id not in doomed_circuits}
+        circuit_ids = {instance.circuit_id for instance in instances if instance.pk in pks}
+
+        for batch in batched(circuit_ids, 1000):
+            # Read and write on the deletion's alias, inside its transaction
+            circuits = Circuit.objects.using(collector.using).filter(pk__in=batch).prefetch_related('tags')
+            for circuit in circuits:
+                fields = {
+                    name: None
+                    for name in ('termination_a', 'termination_z')
+                    if getattr(circuit, f'{name}_id') in pks
+                }
+                if fields:
+                    _set_circuit_terminations(circuit, fields, using=collector.using)
 
     def cache_related_objects(self):
         self._provider_network = self._region = self._site_group = self._site = self._location = None

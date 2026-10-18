@@ -1,12 +1,26 @@
 from django.contrib.contenttypes.models import ContentType
 from django.utils.translation import gettext as _
+from netaddr import EUI, AddrFormatError
 from rest_framework import serializers
 
 from dcim.choices import *
 from dcim.constants import *
 from dcim.models import (
-    ConsolePort, ConsoleServerPort, DeviceBay, FrontPort, Interface, InventoryItem, ModuleBay, PortMapping,
-    PowerOutlet, PowerPort, RearPort, VirtualDeviceContext,
+    ConsolePort,
+    ConsoleServerPort,
+    CoolingIntake,
+    CoolingOutflow,
+    DeviceBay,
+    FrontPort,
+    Interface,
+    InventoryItem,
+    ModuleBay,
+    ModuleBayType,
+    PortMapping,
+    PowerOutlet,
+    PowerPort,
+    RearPort,
+    VirtualDeviceContext,
 )
 from ipam.api.serializers_.vlans import VLANSerializer, VLANTranslationPolicySerializer
 from ipam.api.serializers_.vrfs import VRFSerializer
@@ -14,22 +28,28 @@ from ipam.models import VLAN
 from netbox.api.fields import ChoiceField, ContentTypeField, SerializedPKRelatedField
 from netbox.api.gfk_fields import GFKSerializerField
 from netbox.api.serializers import NetBoxModelSerializer
+from netbox.choices import DiameterUnitChoices, FlowRateUnitChoices
 from users.api.serializers_.mixins import OwnerMixin
 from vpn.api.serializers_.l2vpn import L2VPNTerminationSerializer
 from wireless.api.serializers_.nested import NestedWirelessLinkSerializer
 from wireless.api.serializers_.wirelesslans import WirelessLANSerializer
 from wireless.choices import *
 from wireless.models import WirelessLAN
+
 from .base import ConnectedEndpointsSerializer, PortSerializer
 from .cables import CabledObjectSerializer
 from .devices import DeviceSerializer, MACAddressSerializer, ModuleSerializer, VirtualDeviceContextSerializer
+from .devicetypes import ModuleBayTypeSerializer
 from .manufacturers import ManufacturerSerializer
-from .nested import NestedInterfaceSerializer
+from .mixins import _UNSET, MACAddressShortcutMixin
+from .nested import NestedCoolingOutflowSerializer, NestedInterfaceSerializer
 from .roles import InventoryItemRoleSerializer
 
 __all__ = (
     'ConsolePortSerializer',
     'ConsoleServerPortSerializer',
+    'CoolingIntakeSerializer',
+    'CoolingOutflowSerializer',
     'DeviceBaySerializer',
     'FrontPortSerializer',
     'InterfaceSerializer',
@@ -185,7 +205,85 @@ class PowerOutletSerializer(
         brief_fields = ('id', 'url', 'display', 'device', 'name', 'description', 'cable', '_occupied')
 
 
+class CoolingIntakeSerializer(OwnerMixin, NetBoxModelSerializer):
+    device = DeviceSerializer(nested=True)
+    module = ModuleSerializer(
+        nested=True,
+        fields=('id', 'url', 'display', 'device', 'module_bay'),
+        required=False,
+        allow_null=True
+    )
+    type = ChoiceField(
+        choices=CoolingConnectorTypeChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    diameter_unit = ChoiceField(
+        choices=DiameterUnitChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    max_flow_unit = ChoiceField(
+        choices=FlowRateUnitChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    cooling_outflow = NestedCoolingOutflowSerializer(
+        required=False,
+        allow_null=True
+    )
+
+    class Meta:
+        model = CoolingIntake
+        fields = [
+            'id', 'url', 'display_url', 'display', 'device', 'module', 'name', 'label', 'type',
+            'diameter', 'diameter_unit', 'max_flow', 'max_flow_unit', 'cooling_outflow',
+            'description', 'owner', 'tags', 'custom_fields', 'created', 'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'device', 'name', 'description')
+
+
+class CoolingOutflowSerializer(OwnerMixin, NetBoxModelSerializer):
+    device = DeviceSerializer(nested=True)
+    module = ModuleSerializer(
+        nested=True,
+        fields=('id', 'url', 'display', 'device', 'module_bay'),
+        required=False,
+        allow_null=True
+    )
+    type = ChoiceField(
+        choices=CoolingConnectorTypeChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    diameter_unit = ChoiceField(
+        choices=DiameterUnitChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    cooling_intake = CoolingIntakeSerializer(
+        nested=True,
+        required=False,
+        allow_null=True
+    )
+
+    class Meta:
+        model = CoolingOutflow
+        fields = [
+            'id', 'url', 'display_url', 'display', 'device', 'module', 'name', 'label', 'type',
+            'diameter', 'diameter_unit', 'cooling_intake', 'description', 'owner', 'tags', 'custom_fields',
+            'created', 'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'device', 'name', 'description')
+
+
 class InterfaceSerializer(
+    MACAddressShortcutMixin,
     OwnerMixin,
     NetBoxModelSerializer,
     CabledObjectSerializer,
@@ -238,8 +336,9 @@ class InterfaceSerializer(
     )
     count_ipaddresses = serializers.IntegerField(read_only=True)
     count_fhrp_groups = serializers.IntegerField(read_only=True)
-    # Maintains backward compatibility with NetBox <v4.2
-    mac_address = serializers.CharField(allow_null=True, read_only=True)
+    # Maintains backward compatibility with NetBox <v4.2; also accepts a MAC string on write to
+    # create/update the primary MAC address in a single request.
+    mac_address = serializers.CharField(allow_null=True, required=False)
     primary_mac_address = MACAddressSerializer(nested=True, required=False, allow_null=True)
     mac_addresses = MACAddressSerializer(many=True, nested=True, read_only=True, allow_null=True)
     wwn = serializers.CharField(required=False, default=None, allow_blank=True, allow_null=True)
@@ -247,7 +346,8 @@ class InterfaceSerializer(
     class Meta:
         model = Interface
         fields = [
-            'id', 'url', 'display_url', 'display', 'device', 'vdcs', 'module', 'name', 'label', 'type', 'enabled',
+            'id', 'url', 'display_url', 'display', 'device', 'vdcs', 'module', 'name', 'label', 'type', 'channels',
+            'channel_id', 'enabled',
             'parent', 'bridge', 'bridge_interfaces', 'lag', 'mtu', 'mac_address', 'primary_mac_address',
             'mac_addresses', 'speed', 'duplex', 'wwn', 'mgmt_only', 'description', 'mode', 'rf_role', 'rf_channel',
             'poe_mode', 'poe_type', 'rf_channel_frequency', 'rf_channel_width', 'tx_power', 'untagged_vlan',
@@ -259,8 +359,22 @@ class InterfaceSerializer(
         brief_fields = ('id', 'url', 'display', 'device', 'name', 'description', 'cable', '_occupied')
 
     def validate(self, data):
+        # Pop mac_address before model validation — it's a cached_property, not a model field,
+        # and passing it to Interface(**attrs) in ValidatedModelSerializer.validate() would raise TypeError.
+        # data may be an Interface instance (not a dict) in some custom field code paths (#18887).
+        mac_address = _UNSET
+        if isinstance(data, dict):
+            mac_address = data.pop('mac_address', _UNSET)
+        self._validate_no_mac_conflict(data, mac_address)
 
-        if not self.nested:
+        if not self.nested and isinstance(data, dict):
+            if mac_address not in (_UNSET, None):
+                try:
+                    EUI(mac_address, version=48)
+                except (AddrFormatError, ValueError, TypeError):
+                    raise serializers.ValidationError({
+                        'mac_address': _('Enter a valid MAC address (e.g. 00:11:22:33:44:55).')
+                    })
 
             # Validate 802.1q mode and vlan(s)
             mode = None
@@ -318,7 +432,12 @@ class InterfaceSerializer(
                                         f"or it must be global."
                     })
 
-        return super().validate(data)
+        data = super().validate(data)
+
+        if mac_address is not _UNSET:
+            data['mac_address'] = mac_address
+
+        return data
 
 
 class RearPortMappingSerializer(serializers.ModelSerializer):
@@ -409,30 +528,41 @@ class ModuleBaySerializer(OwnerMixin, NetBoxModelSerializer):
     installed_module = ModuleSerializer(
         nested=True,
         fields=('id', 'url', 'display', 'serial', 'description'),
-        required=False,
+        read_only=True,
         allow_null=True
     )
+    module_bay_types = SerializedPKRelatedField(
+        queryset=ModuleBayType.objects.all(),
+        serializer=ModuleBayTypeSerializer,
+        nested=True,
+        required=False,
+        many=True
+    )
+    _occupied = serializers.BooleanField(required=False, read_only=True)
+    is_module_compatible = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = ModuleBay
         fields = [
-            'id', 'url', 'display_url', 'display', 'device', 'module', 'name', 'installed_module', 'label', 'position',
-            'description', 'owner', 'tags', 'custom_fields', 'created', 'last_updated',
+            'id', 'url', 'display_url', 'display', 'device', 'module', 'name', 'label', 'position', 'enabled',
+            'description', 'module_bay_types', 'installed_module', 'owner', 'tags', 'custom_fields', 'created',
+            'last_updated', '_occupied', 'is_module_compatible',
         ]
-        brief_fields = ('id', 'url', 'display', 'installed_module', 'name', 'description')
+        brief_fields = ('id', 'url', 'display', 'installed_module', 'name', 'enabled', 'description', '_occupied')
 
 
 class DeviceBaySerializer(OwnerMixin, NetBoxModelSerializer):
     device = DeviceSerializer(nested=True)
     installed_device = DeviceSerializer(nested=True, required=False, allow_null=True)
+    _occupied = serializers.BooleanField(required=False, read_only=True)
 
     class Meta:
         model = DeviceBay
         fields = [
-            'id', 'url', 'display_url', 'display', 'device', 'name', 'label', 'description', 'installed_device',
-            'owner', 'tags', 'custom_fields', 'created', 'last_updated',
+            'id', 'url', 'display_url', 'display', 'device', 'name', 'label', 'enabled', 'description',
+            'installed_device', 'owner', 'tags', 'custom_fields', 'created', 'last_updated', '_occupied',
         ]
-        brief_fields = ('id', 'url', 'display', 'device', 'name', 'description')
+        brief_fields = ('id', 'url', 'display', 'device', 'name', 'enabled', 'description', '_occupied',)
 
 
 class InventoryItemSerializer(OwnerMixin, NetBoxModelSerializer):

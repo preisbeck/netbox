@@ -16,7 +16,7 @@ from django.utils import timezone
 from django.utils.translation import gettext as _
 from rq.exceptions import InvalidJobOperation
 
-from core.choices import JobStatusChoices
+from core.choices import JobNotificationChoices, JobStatusChoices
 from core.dataclasses import JobLogEntry
 from core.events import JOB_COMPLETED, JOB_ERRORED, JOB_FAILED
 from core.models import ObjectType
@@ -84,6 +84,12 @@ class Job(models.Model):
         null=True,
         blank=True
     )
+    execution_time = models.DurationField(
+        verbose_name=_('execution time'),
+        null=True,
+        blank=True,
+        editable=False
+    )
     user = models.ForeignKey(
         to=settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -118,6 +124,12 @@ class Job(models.Model):
         blank=True,
         help_text=_('Name of the queue in which this job was enqueued')
     )
+    notifications = models.CharField(
+        verbose_name=_('notifications'),
+        max_length=30,
+        choices=JobNotificationChoices,
+        default=JobNotificationChoices.NOTIFICATION_ALWAYS
+    )
     log_entries = ArrayField(
         verbose_name=_('log entries'),
         base_field=models.JSONField(
@@ -133,6 +145,7 @@ class Job(models.Model):
     class Meta:
         ordering = ['-created']
         indexes = (
+            models.Index(fields=('-created',)),  # Default ordering
             models.Index(fields=('object_type', 'object_id')),
         )
         verbose_name = _('job')
@@ -146,7 +159,7 @@ class Job(models.Model):
         if self.object_type:
             if self.object_type.model == 'reportmodule':
                 return reverse('extras:report_result', kwargs={'job_pk': self.pk})
-            elif self.object_type.model == 'scriptmodule':
+            if self.object_type.model == 'scriptmodule':
                 return reverse('extras:script_result', kwargs={'job_pk': self.pk})
         return reverse('core:job', args=[self.pk])
 
@@ -234,15 +247,21 @@ class Job(models.Model):
         if error:
             self.error = error
         self.completed = timezone.now()
+        if self.started:
+            self.execution_time = self.completed - self.started
         self.save()
 
         # Notify the user (if any) of completion
-        if self.user:
-            Notification(
-                user=self.user,
-                object=self,
-                event_type=self.get_event_type(),
-            ).save()
+        if self.user and self.notifications != JobNotificationChoices.NOTIFICATION_NEVER:
+            if (
+                self.notifications == JobNotificationChoices.NOTIFICATION_ALWAYS or
+                status != JobStatusChoices.STATUS_COMPLETED
+            ):
+                Notification(
+                    user=self.user,
+                    object=self,
+                    event_type=self.get_event_type(),
+                ).save()
 
         # Send signal
         job_end.send(self)
@@ -266,6 +285,7 @@ class Job(models.Model):
             interval=None,
             immediate=False,
             queue_name=None,
+            notifications=None,
             **kwargs
     ):
         """
@@ -280,6 +300,7 @@ class Job(models.Model):
             interval: Recurrence interval (in minutes)
             immediate: Run the job immediately without scheduling it in the background. Should be used for interactive
                 management commands only.
+            notifications: Notification behavior on job completion (always, on_failure, or never)
         """
         if schedule_at and immediate:
             raise ValueError(_("enqueue() cannot be called with values for both schedule_at and immediate."))
@@ -301,7 +322,8 @@ class Job(models.Model):
             interval=interval,
             user=user,
             job_id=uuid.uuid4(),
-            queue_name=rq_queue_name
+            queue_name=rq_queue_name,
+            notifications=notifications if notifications is not None else JobNotificationChoices.NOTIFICATION_ALWAYS
         )
         job.full_clean()
         job.save()

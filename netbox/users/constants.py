@@ -2,7 +2,6 @@ import string
 
 from django.db.models import Q
 
-
 OBJECTPERMISSION_OBJECT_TYPES = (
     (Q(public=True) & ~Q(app_label='core', model='objecttype'))
     | Q(app_label='core', model__in=['managedfile'])
@@ -10,6 +9,11 @@ OBJECTPERMISSION_OBJECT_TYPES = (
 )
 
 CONSTRAINT_TOKEN_USER = '$user'
+
+# Django's four default model permissions. These receive special handling
+# (dedicated checkboxes, model properties) and should not be registered
+# as custom model actions.
+RESERVED_ACTIONS = ('view', 'add', 'change', 'delete')
 
 # API tokens
 TOKEN_PREFIX = 'nbt_'  # Used for v2 tokens only

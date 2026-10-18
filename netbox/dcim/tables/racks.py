@@ -2,17 +2,42 @@ import django_tables2 as tables
 from django.utils.translation import gettext_lazy as _
 from django_tables2.utils import Accessor
 
-from dcim.models import Rack, RackReservation, RackRole, RackType
+from dcim.models import Rack, RackGroup, RackReservation, RackRole, RackType
 from netbox.tables import OrganizationalModelTable, PrimaryModelTable, columns
 from tenancy.tables import ContactsColumnMixin, TenancyColumnsMixin
+
 from .template_code import OUTER_UNIT, WEIGHT
 
 __all__ = (
-    'RackTable',
+    'RackGroupTable',
     'RackReservationTable',
     'RackRoleTable',
+    'RackTable',
     'RackTypeTable',
 )
+
+
+class RackGroupTable(OrganizationalModelTable):
+    name = tables.Column(
+        verbose_name=_('Name'),
+        linkify=True,
+    )
+    rack_count = columns.LinkedCountColumn(
+        viewname='dcim:rack_list',
+        url_params={'group_id': 'pk'},
+        verbose_name=_('Racks'),
+    )
+    tags = columns.TagColumn(
+        url_name='dcim:rackgroup_list',
+    )
+
+    class Meta(OrganizationalModelTable.Meta):
+        model = RackGroup
+        fields = (
+            'pk', 'id', 'name', 'rack_count', 'description', 'slug', 'comments', 'tags', 'actions', 'created',
+            'last_updated',
+        )
+        default_columns = ('pk', 'name', 'rack_count', 'description')
 
 
 class RackRoleTable(OrganizationalModelTable):
@@ -81,6 +106,12 @@ class RackTypeTable(PrimaryModelTable):
         url_params={'rack_type_id': 'pk'},
         verbose_name=_('Rack Count'),
     )
+    cooling_capability = columns.ChoiceFieldColumn(
+        verbose_name=_('Cooling Capability'),
+    )
+    cooling_capacity = tables.Column(
+        verbose_name=_('Cooling Capacity (kW)')
+    )
     tags = columns.TagColumn(
         url_name='dcim:rack_list'
     )
@@ -89,8 +120,8 @@ class RackTypeTable(PrimaryModelTable):
         model = RackType
         fields = (
             'pk', 'id', 'model', 'manufacturer', 'form_factor', 'u_height', 'starting_unit', 'width', 'outer_width',
-            'outer_height', 'outer_depth', 'mounting_depth', 'weight', 'max_weight', 'description', 'comments',
-            'rack_count', 'tags', 'created', 'last_updated',
+            'outer_height', 'outer_depth', 'mounting_depth', 'weight', 'max_weight', 'cooling_capability',
+            'cooling_capacity', 'description', 'comments', 'rack_count', 'tags', 'created', 'last_updated',
         )
         default_columns = (
             'pk', 'model', 'manufacturer', 'type', 'u_height', 'description', 'rack_count',
@@ -109,6 +140,10 @@ class RackTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
     site = tables.Column(
         verbose_name=_('Site'),
         linkify=True
+    )
+    group = tables.Column(
+        verbose_name=_('Group'),
+        linkify=True,
     )
     status = columns.ChoiceFieldColumn(
         verbose_name=_('Status'),
@@ -167,19 +202,26 @@ class RackTable(TenancyColumnsMixin, ContactsColumnMixin, PrimaryModelTable):
         template_code=WEIGHT,
         order_by=('_abs_max_weight', 'weight_unit')
     )
+    cooling_capability = columns.ChoiceFieldColumn(
+        verbose_name=_('Cooling Capability'),
+    )
+    cooling_capacity = tables.Column(
+        verbose_name=_('Cooling Capacity (kW)')
+    )
 
     class Meta(PrimaryModelTable.Meta):
         model = Rack
         fields = (
-            'pk', 'id', 'name', 'site', 'location', 'status', 'facility_id', 'tenant', 'tenant_group', 'role',
+            'pk', 'id', 'name', 'site', 'location', 'group', 'status', 'facility_id', 'tenant', 'tenant_group', 'role',
             'rack_type', 'serial', 'asset_tag', 'form_factor', 'u_height', 'starting_unit', 'width', 'outer_width',
-            'outer_height', 'outer_depth', 'mounting_depth', 'airflow', 'weight', 'max_weight', 'comments',
+            'outer_height', 'outer_depth', 'mounting_depth', 'airflow', 'cooling_capability',
+            'cooling_capacity', 'weight', 'max_weight', 'comments',
             'device_count', 'get_utilization', 'get_power_utilization', 'description', 'contacts',
             'tags', 'created', 'last_updated',
         )
         default_columns = (
-            'pk', 'name', 'site', 'location', 'status', 'facility_id', 'tenant', 'role', 'rack_type', 'u_height',
-            'device_count', 'get_utilization',
+            'pk', 'name', 'site', 'location', 'group', 'status', 'facility_id', 'tenant', 'role', 'rack_type',
+            'u_height', 'device_count', 'get_utilization',
         )
 
 
@@ -199,6 +241,11 @@ class RackReservationTable(TenancyColumnsMixin, PrimaryModelTable):
         accessor=Accessor('rack__location'),
         linkify=True
     )
+    group = tables.Column(
+        verbose_name=_('Group'),
+        accessor=Accessor('rack__group'),
+        linkify=True
+    )
     rack = tables.Column(
         verbose_name=_('Rack'),
         linkify=True
@@ -206,6 +253,9 @@ class RackReservationTable(TenancyColumnsMixin, PrimaryModelTable):
     unit_list = tables.Column(
         orderable=False,
         verbose_name=_('Units')
+    )
+    unit_count = tables.Column(
+        verbose_name=_("Total U's")
     )
     status = columns.ChoiceFieldColumn(
         verbose_name=_('Status'),
@@ -217,7 +267,9 @@ class RackReservationTable(TenancyColumnsMixin, PrimaryModelTable):
     class Meta(PrimaryModelTable.Meta):
         model = RackReservation
         fields = (
-            'pk', 'id', 'reservation', 'site', 'location', 'rack', 'unit_list', 'status', 'user', 'created', 'tenant',
-            'tenant_group', 'description', 'comments', 'tags', 'actions', 'created', 'last_updated',
+            'pk', 'id', 'reservation', 'site', 'location', 'group', 'rack', 'unit_list', 'unit_count', 'status',
+            'user', 'tenant', 'tenant_group', 'description', 'comments', 'tags', 'actions', 'created', 'last_updated',
         )
-        default_columns = ('pk', 'reservation', 'site', 'rack', 'unit_list', 'status', 'user', 'description')
+        default_columns = (
+            'pk', 'reservation', 'site', 'rack', 'unit_list', 'unit_count', 'status', 'user', 'description',
+        )

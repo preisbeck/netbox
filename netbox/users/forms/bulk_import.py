@@ -1,17 +1,17 @@
 from django import forms
 from django.utils.translation import gettext as _
-from users.models import *
+
 from users.choices import TokenVersionChoices
+from users.models import *
 from utilities.forms import CSVModelForm
 from utilities.forms.fields import CSVModelChoiceField, CSVModelMultipleChoiceField
-
 
 __all__ = (
     'GroupImportForm',
     'OwnerGroupImportForm',
     'OwnerImportForm',
-    'UserImportForm',
     'TokenImportForm',
+    'UserImportForm',
 )
 
 
@@ -44,15 +44,18 @@ class TokenImportForm(CSVModelForm):
         required=False,
         help_text=_("Specify version 1 or 2 (v2 will be used by default)")
     )
-    token = forms.CharField(
-        label=_('Token'),
-        required=False,
-        help_text=_("If no token is provided, one will be generated automatically.")
-    )
 
     class Meta:
         model = Token
-        fields = ('user', 'version', 'token', 'enabled', 'write_enabled', 'expires', 'description',)
+        fields = ('user', 'version', 'enabled', 'write_enabled', 'expires', 'description',)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Disable the user field when updating an existing Token, so a Token's owner cannot be reassigned via
+        # bulk import (consistent with the REST API & UI edit form).
+        if self.instance.pk:
+            self.fields['user'].disabled = True
 
 
 class OwnerGroupImportForm(CSVModelForm):

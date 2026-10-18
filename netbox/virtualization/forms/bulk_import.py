@@ -7,20 +7,21 @@ from dcim.models import Device, DeviceRole, Platform, Site
 from extras.models import ConfigTemplate
 from ipam.choices import VLANQinQRoleChoices
 from ipam.models import VLAN, VRF, VLANGroup
-from netbox.forms import NetBoxModelImportForm
-from netbox.forms import OrganizationalModelImportForm, OwnerCSVMixin, PrimaryModelImportForm
+from netbox.forms import NetBoxModelImportForm, OrganizationalModelImportForm, OwnerCSVMixin, PrimaryModelImportForm
 from tenancy.models import Tenant
 from utilities.forms.fields import CSVChoiceField, CSVModelChoiceField, CSVModelMultipleChoiceField
-from virtualization.choices import *
-from virtualization.models import *
+
+from ..choices import *
+from ..models import *
 
 __all__ = (
-    'ClusterImportForm',
     'ClusterGroupImportForm',
+    'ClusterImportForm',
     'ClusterTypeImportForm',
+    'VMInterfaceImportForm',
     'VirtualDiskImportForm',
     'VirtualMachineImportForm',
-    'VMInterfaceImportForm',
+    'VirtualMachineTypeImportForm',
 )
 
 
@@ -75,15 +76,39 @@ class ClusterImportForm(ScopedImportForm, PrimaryModelImportForm):
     class Meta:
         model = Cluster
         fields = (
-            'name', 'type', 'group', 'status', 'scope_type', 'scope_id', 'tenant', 'description', 'owner', 'comments',
-            'tags',
+            'name', 'type', 'group', 'status', 'scope_type', 'scope_name', 'scope_id', 'tenant', 'description', 'owner',
+            'comments', 'tags',
         )
         labels = {
             'scope_id': _('Scope ID'),
         }
 
 
+class VirtualMachineTypeImportForm(PrimaryModelImportForm):
+    default_platform = CSVModelChoiceField(
+        label=_('Default platform'),
+        queryset=Platform.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Assigned default platform'),
+    )
+
+    class Meta:
+        model = VirtualMachineType
+        fields = (
+            'name', 'slug', 'default_platform', 'default_vcpus', 'default_memory', 'description',
+            'owner', 'comments', 'tags',
+        )
+
+
 class VirtualMachineImportForm(PrimaryModelImportForm):
+    virtual_machine_type = CSVModelChoiceField(
+        label=_('Virtual machine type'),
+        queryset=VirtualMachineType.objects.all(),
+        to_field_name='name',
+        required=False,
+        help_text=_('Optional virtual machine type'),
+    )
     status = CSVChoiceField(
         label=_('Status'),
         choices=VirtualMachineStatusChoices,
@@ -100,21 +125,21 @@ class VirtualMachineImportForm(PrimaryModelImportForm):
         queryset=Site.objects.all(),
         to_field_name='name',
         required=False,
-        help_text=_('Assigned site')
+        help_text=_('Assigned site (inferred from cluster or device if omitted)')
     )
     cluster = CSVModelChoiceField(
         label=_('Cluster'),
         queryset=Cluster.objects.all(),
         to_field_name='name',
         required=False,
-        help_text=_('Assigned cluster')
+        help_text=_('Assigned cluster (required when the device belongs to a cluster)')
     )
     device = CSVModelChoiceField(
         label=_('Device'),
         queryset=Device.objects.all(),
         to_field_name='name',
         required=False,
-        help_text=_('Assigned device within cluster')
+        help_text=_('Host device (standalone or within a cluster)')
     )
     role = CSVModelChoiceField(
         label=_('Role'),
@@ -150,8 +175,9 @@ class VirtualMachineImportForm(PrimaryModelImportForm):
     class Meta:
         model = VirtualMachine
         fields = (
-            'name', 'status', 'start_on_boot', 'role', 'site', 'cluster', 'device', 'tenant', 'platform', 'vcpus',
-            'memory', 'disk', 'description', 'serial', 'config_template', 'comments', 'owner', 'tags',
+            'name', 'virtual_machine_type', 'role', 'status', 'start_on_boot', 'site', 'cluster', 'device',
+            'platform', 'vcpus', 'memory', 'disk', 'description', 'serial',
+            'tenant', 'owner', 'comments', 'tags', 'config_template',
         )
 
 
@@ -253,8 +279,7 @@ class VMInterfaceImportForm(OwnerCSVMixin, NetBoxModelImportForm):
         # Make sure enabled is True when it's not included in the uploaded data
         if 'enabled' not in self.data:
             return True
-        else:
-            return self.cleaned_data['enabled']
+        return self.cleaned_data['enabled']
 
 
 class VirtualDiskImportForm(OwnerCSVMixin, NetBoxModelImportForm):

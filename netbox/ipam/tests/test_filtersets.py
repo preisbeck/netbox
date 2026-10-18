@@ -4,19 +4,31 @@ from django.test import TestCase
 from netaddr import IPNetwork
 
 from circuits.models import Provider
-from dcim.choices import InterfaceTypeChoices
-from dcim.models import Device, DeviceRole, DeviceType, Interface, Location, Manufacturer, Rack, Region, Site, SiteGroup
+from dcim.choices import InterfaceModeChoices, InterfaceTypeChoices
+from dcim.models import (
+    Device,
+    DeviceRole,
+    DeviceType,
+    Interface,
+    Location,
+    Manufacturer,
+    Rack,
+    RackGroup,
+    Region,
+    Site,
+    SiteGroup,
+)
 from ipam.choices import *
 from ipam.filtersets import *
 from ipam.models import *
 from tenancy.models import Tenant, TenantGroup
-from utilities.testing import ChangeLoggedFilterSetTests, create_test_device, create_test_virtualmachine
+from utilities.testing import ChangeLoggedFilterSetTestMixin, create_test_device, create_test_virtualmachine
 from virtualization.models import Cluster, ClusterGroup, ClusterType, VirtualMachine, VMInterface
 from vpn.choices import L2VPNTypeChoices
 from vpn.models import L2VPN
 
 
-class ASNRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ASNRangeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ASNRange.objects.all()
     filterset = ASNRangeFilterSet
 
@@ -101,7 +113,7 @@ class ASNRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ASNTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ASN.objects.all()
     filterset = ASNFilterSet
 
@@ -114,6 +126,13 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         ]
         RIR.objects.bulk_create(rirs)
 
+        roles = [
+            Role(name='Role 1', slug='role-1'),
+            Role(name='Role 2', slug='role-2'),
+            Role(name='Role 3', slug='role-3'),
+        ]
+        Role.objects.bulk_create(roles)
+
         tenants = [
             Tenant(name='Tenant 1', slug='tenant-1'),
             Tenant(name='Tenant 2', slug='tenant-2'),
@@ -124,12 +143,12 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         Tenant.objects.bulk_create(tenants)
 
         asns = (
-            ASN(asn=65001, rir=rirs[0], tenant=tenants[0], description='foobar1'),
-            ASN(asn=65002, rir=rirs[1], tenant=tenants[1], description='foobar2'),
-            ASN(asn=65003, rir=rirs[2], tenant=tenants[2], description='foobar3'),
-            ASN(asn=4200000000, rir=rirs[0], tenant=tenants[0]),
-            ASN(asn=4200000001, rir=rirs[1], tenant=tenants[1]),
-            ASN(asn=4200000002, rir=rirs[2], tenant=tenants[2]),
+            ASN(asn=65001, rir=rirs[0], role=roles[0], tenant=tenants[0], description='foobar1'),
+            ASN(asn=65002, rir=rirs[1], role=roles[1], tenant=tenants[1], description='foobar2'),
+            ASN(asn=65003, rir=rirs[2], role=roles[2], tenant=tenants[2], description='foobar3'),
+            ASN(asn=4200000000, rir=rirs[0], role=roles[0], tenant=tenants[0]),
+            ASN(asn=4200000001, rir=rirs[1], role=roles[1], tenant=tenants[1]),
+            ASN(asn=4200000002, rir=rirs[2], role=roles[2], tenant=tenants[2]),
         )
         ASN.objects.bulk_create(asns)
 
@@ -186,6 +205,13 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'rir': [rirs[0].slug, rirs[1].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
+    def test_role(self):
+        roles = Role.objects.all()[:2]
+        params = {'role_id': [roles[0].pk, roles[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+        params = {'role': [roles[0].slug, roles[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+
     def test_site_group(self):
         site_groups = SiteGroup.objects.all()[:2]
         params = {'site_group_id': [site_groups[0].pk, site_groups[1].pk]}
@@ -210,7 +236,7 @@ class ASNTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VRFTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VRFTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VRF.objects.all()
     filterset = VRFFilterSet
 
@@ -220,7 +246,7 @@ class VRFTestCase(TestCase, ChangeLoggedFilterSetTests):
             return 'import_target'
         if field.name == 'export_targets':
             return 'export_target'
-        return ChangeLoggedFilterSetTests.get_m2m_filter_name(field)
+        return ChangeLoggedFilterSetTestMixin.get_m2m_filter_name(field)
 
     @classmethod
     def setUpTestData(cls):
@@ -314,7 +340,7 @@ class VRFTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class RouteTargetTestCase(TestCase, ChangeLoggedFilterSetTests):
+class RouteTargetTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = RouteTarget.objects.all()
     filterset = RouteTargetFilterSet
 
@@ -328,7 +354,7 @@ class RouteTargetTestCase(TestCase, ChangeLoggedFilterSetTests):
             return 'importing_l2vpn'
         if field.name == 'exporting_l2vpns':
             return 'exporting_l2vpn'
-        return ChangeLoggedFilterSetTests.get_m2m_filter_name(field)
+        return ChangeLoggedFilterSetTestMixin.get_m2m_filter_name(field)
 
     @classmethod
     def setUpTestData(cls):
@@ -441,7 +467,7 @@ class RouteTargetTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class RIRTestCase(TestCase, ChangeLoggedFilterSetTests):
+class RIRTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = RIR.objects.all()
     filterset = RIRFilterSet
 
@@ -481,7 +507,7 @@ class RIRTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
 
-class AggregateTestCase(TestCase, ChangeLoggedFilterSetTests):
+class AggregateTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Aggregate.objects.all()
     filterset = AggregateFilterSet
 
@@ -567,7 +593,7 @@ class AggregateTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
 
-class RoleTestCase(TestCase, ChangeLoggedFilterSetTests):
+class RoleTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Role.objects.all()
     filterset = RoleFilterSet
 
@@ -598,7 +624,7 @@ class RoleTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class PrefixTestCase(TestCase, ChangeLoggedFilterSetTests):
+class PrefixTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Prefix.objects.all()
     filterset = PrefixFilterSet
 
@@ -902,7 +928,7 @@ class PrefixTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class IPRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
+class IPRangeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = IPRange.objects.all()
     filterset = IPRangeFilterSet
 
@@ -1032,9 +1058,25 @@ class IPRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'start_address': ['10.0.1.100', '10.0.2.100']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+        # Invalid addresses are discarded
+        params = {'start_address': ['no-such-value']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        params = {'start_address': ['10.0.1.100', 'no-such-value']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+        # Surrounding whitespace is ignored
+        params = {'start_address': [' 10.0.1.100 ']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
     def test_end_address(self):
         params = {'end_address': ['10.0.1.199', '10.0.2.199']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # Invalid addresses are discarded
+        params = {'end_address': ['no-such-value']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        params = {'end_address': ['10.0.1.199', 'no-such-value']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
     def test_contains(self):
         params = {'contains': '10.0.1.150/24'}
@@ -1096,8 +1138,27 @@ class IPRangeTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'mark_populated': 'false'}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
 
+    def test_single_address_range(self):
+        # A range with start_address == end_address must be discoverable by the
+        # start, end, and contains filters.
+        iprange = IPRange(
+            start_address=IPNetwork('10.0.5.1/24'),
+            end_address=IPNetwork('10.0.5.1/24'),
+        )
+        iprange.clean()
+        iprange.save()
 
-class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
+        params = {'start_address': ['10.0.5.1']}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
+        params = {'end_address': ['10.0.5.1']}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
+        params = {'contains': '10.0.5.1/24'}
+        self.assertIn(iprange, self.filterset(params, self.queryset).qs)
+
+
+class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = IPAddress.objects.all()
     filterset = IPAddressFilterSet
     ignore_fields = ('fhrpgroup',)
@@ -1274,25 +1335,14 @@ class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
         )
         IPAddress.objects.bulk_create(ipaddresses)
 
+        IPAddress.objects.filter(pk__in=[ipaddresses[1].pk, ipaddresses[2].pk]).update(
+            nat_inside=ipaddresses[0]
+        )
+
         services = (
-            Service(
-                parent=devices[0],
-                name='Service 1',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1],
-            ),
-            Service(
-                parent=devices[1],
-                name='Service 2',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1],
-            ),
-            Service(
-                parent=devices[2],
-                name='Service 3',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1],
-            ),
+            Service(parent=devices[0], name='Service 1', port_mappings=['tcp/80']),
+            Service(parent=devices[1], name='Service 2', port_mappings=['tcp/80']),
+            Service(parent=devices[2], name='Service 3', port_mappings=['tcp/80']),
         )
         Service.objects.bulk_create(services)
         services[0].ipaddresses.add(ipaddresses[0])
@@ -1355,6 +1405,24 @@ class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
         # Check for partially invalid input.
         params = {'address': ['10.0.0.1', '/24', '10.0.0.10/24']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # Surrounding whitespace is ignored
+        params = {'address': [' 10.0.0.1/24 ']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+        # The parse_inet_addresses() method is retained for backward compatibility
+        self.assertEqual(
+            self.filterset().parse_inet_addresses(['10.0.0.1', '/24', '10.0.0.1/255.255.255.0']),
+            ['10.0.0.1', '10.0.0.1/24']
+        )
+
+        # An override of parse_inet_addresses() is honored when filtering
+        class CustomIPAddressFilterSet(IPAddressFilterSet):
+            def parse_inet_addresses(self, value):
+                return ['10.0.0.1/24']
+
+        params = {'address': ['no-such-value']}
+        self.assertEqual(CustomIPAddressFilterSet(params, self.queryset).qs.count(), 1)
 
     def test_mask_length(self):
         params = {'mask_length': [24]}
@@ -1443,8 +1511,13 @@ class IPAddressTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'service_id': [services[0].pk, services[1].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_nat_inside(self):
+        inside = IPAddress.objects.filter(nat_outside__isnull=False).distinct().first()
+        params = {'nat_inside_id': [inside.pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
-class FHRPGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
+
+class FHRPGroupTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = FHRPGroup.objects.all()
     filterset = FHRPGroupFilterSet
 
@@ -1526,7 +1599,7 @@ class FHRPGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class FHRPGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
+class FHRPGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = FHRPGroupAssignment.objects.all()
     filterset = FHRPGroupAssignmentFilterSet
 
@@ -1599,7 +1672,7 @@ class FHRPGroupAssignmentTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
 
-class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VLANGroup.objects.all()
     filterset = VLANGroupFilterSet
     ignore_fields = ('vid_ranges',)
@@ -1700,7 +1773,9 @@ class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
                 slug='vlan-group-8'
             ),
         )
-        VLANGroup.objects.bulk_create(vlan_groups)
+        # Ensure the total_vlan_ids field is populated
+        for vlan_group in vlan_groups:
+            vlan_group.save()
 
     def test_q(self):
         params = {'q': 'foobar1'}
@@ -1728,33 +1803,111 @@ class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'contains_vid': 4095}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
 
-    def test_region(self):
-        params = {'region': Region.objects.first().pk}
+    def test_total_vlan_ids(self):
+        params = {'total_vlan_ids': [110]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)
+        params = {'total_vlan_ids': [4094]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_region(self):
+        regions = (
+            Region.objects.get(slug='region-1'),
+            Region.objects.create(name='Region 2', slug='region-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=regions[1])
+
+        params = {'region': [regions[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'region': [regions[0].pk, regions[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_site_group(self):
-        params = {'site_group': SiteGroup.objects.first().pk}
+        site_groups = (
+            SiteGroup.objects.get(slug='site-group-1'),
+            SiteGroup.objects.create(name='Site Group 2', slug='site-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=site_groups[1])
+
+        params = {'site_group': [site_groups[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'site_group': [site_groups[0].pk, site_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_site(self):
-        params = {'site': Site.objects.first().pk}
+        sites = (
+            Site.objects.get(slug='site-1'),
+            Site.objects.create(name='Site 2', slug='site-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=sites[1])
+
+        params = {'site': [sites[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'site': [sites[0].pk, sites[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_location(self):
-        params = {'location': Location.objects.first().pk}
+        site = Site.objects.get(slug='site-1')
+        locations = (
+            Location.objects.get(slug='location-1'),
+            Location.objects.create(name='Location 2', slug='location-2', site=site),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=locations[1])
+
+        params = {'location': [locations[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'location': [locations[0].pk, locations[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_rack_group(self):
+        rack_groups = (
+            RackGroup.objects.create(name='Rack Group 1', slug='rack-group-1'),
+            RackGroup.objects.create(name='Rack Group 2', slug='rack-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=rack_groups[0])
+        VLANGroup.objects.create(name='VLAN Group 10', slug='vlan-group-10', scope=rack_groups[1])
+
+        params = {'rack_group': [rack_groups[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'rack_group': [rack_groups[0].pk, rack_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_rack(self):
-        params = {'rack': Rack.objects.first().pk}
+        site = Site.objects.get(slug='site-1')
+        racks = (
+            Rack.objects.get(name='Rack 1'),
+            Rack.objects.create(name='Rack 2', site=site),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=racks[1])
+
+        params = {'rack': [racks[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'rack': [racks[0].pk, racks[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_cluster_group(self):
-        params = {'cluster_group': ClusterGroup.objects.first().pk}
+        cluster_groups = (
+            ClusterGroup.objects.get(slug='cluster-group-1'),
+            ClusterGroup.objects.create(name='Cluster Group 2', slug='cluster-group-2'),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=cluster_groups[1])
+
+        params = {'cluster_group': [cluster_groups[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'cluster_group': [cluster_groups[0].pk, cluster_groups[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_cluster(self):
-        params = {'cluster': Cluster.objects.first().pk}
+        cluster_type = ClusterType.objects.get(slug='cluster-type-1')
+        clusters = (
+            Cluster.objects.get(name='Cluster 1'),
+            Cluster.objects.create(name='Cluster 2', type=cluster_type),
+        )
+        VLANGroup.objects.create(name='VLAN Group 9', slug='vlan-group-9', scope=clusters[1])
+
+        params = {'cluster': [clusters[0].pk]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'cluster': [clusters[0].pk, clusters[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_tenant(self):
         tenants = Tenant.objects.all()[:2]
@@ -1771,7 +1924,7 @@ class VLANGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
 
-class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VLANTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VLAN.objects.all()
     filterset = VLANFilterSet
     ignore_fields = ('interfaces_as_tagged', 'vminterfaces_as_tagged')
@@ -2097,6 +2250,143 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'site': [sites[3].slug, sites[4].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
+    def test_related_to_site(self):
+        """Site-related VLANs cover direct assignment plus site and site group scopes."""
+        # site-1: one site-scoped VLAN and one scoped to its site group
+        site = Site.objects.get(slug='site-1')
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(
+            list(self.filterset(params, self.queryset).qs.order_by('vid').values_list('vid', flat=True)),
+            [4, 7]
+        )
+        # site-4: two directly assigned VLANs plus the same site-group-scoped VLAN
+        site = Site.objects.get(slug='site-4')
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(
+            list(self.filterset(params, self.queryset).qs.order_by('vid').values_list('vid', flat=True)),
+            [4, 101, 102]
+        )
+        # site-7 has no site group
+        site = Site.objects.get(slug='site-7')
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(
+            list(self.filterset(params, self.queryset).qs.order_by('vid').values_list('vid', flat=True)),
+            [2001, 2002, 2003, 3001, 3002, 3003]
+        )
+
+    def test_related_to_site_matches_any_of_several_sites(self):
+        """Several sites spanning two site groups are ORed together, and a shared VLAN comes back once."""
+        sites = (
+            Site.objects.get(slug='site-1'),
+            Site.objects.get(slug='site-2'),
+            Site.objects.get(slug='site-4'),
+        )
+        params = {'related_to_site': [site.pk for site in sites]}
+        # VLAN 4 is scoped to the site group both site-1 and site-4 belong to, VLAN 5 to site-2's
+        self.assertEqual(
+            list(self.filterset(params, self.queryset).qs.order_by('vid').values_list('vid', flat=True)),
+            [4, 5, 7, 8, 101, 102]
+        )
+
+    def test_related_to_site_returns_dual_assignment_once(self):
+        """A VLAN matching both the direct site and a group scope is returned once."""
+        site = Site.objects.get(slug='site-1')
+        VLAN.objects.create(
+            vid=51,
+            name='Dual assignment',
+            site=site,
+            group=VLANGroup.objects.get(slug='site-group-1')
+        )
+
+        # 4 and 7 as before, plus the dual-assigned VLAN
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_related_to_site_includes_ancestor_site_group_scope(self):
+        """A group scoped to an ancestor site group relates to sites in descendant groups."""
+        parent = SiteGroup.objects.create(name='Parent Group', slug='parent-group')
+        child = SiteGroup.objects.create(name='Child Group', slug='child-group', parent=parent)
+        site = Site.objects.create(name='Site 8', slug='site-8', group=child)
+        group = VLANGroup.objects.create(name='Parent scope', slug='parent-scope', scope=parent)
+        VLAN.objects.create(vid=60, name='Parent scoped', group=group)
+
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_related_to_site_ignores_matching_id_on_another_scope_type(self):
+        """A scope id equal to the site's pk under a different scope type does not match."""
+        site = Site.objects.get(slug='site-1')
+        group = VLANGroup.objects.create(
+            name='Region scope collision',
+            slug='region-scope-collision',
+            scope_type=ContentType.objects.get_by_natural_key('dcim', 'region'),
+            scope_id=site.pk
+        )
+        VLAN.objects.create(vid=61, name='Collision', group=group)
+
+        # Still only the site-scoped and site-group-scoped VLANs
+        params = {'related_to_site': [site.pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_related_to_site_narrows_the_supplied_queryset(self):
+        """The filter narrows the given queryset and cannot restore excluded VLANs."""
+        site = Site.objects.get(slug='site-1')
+        params = {'related_to_site': [site.pk]}
+        queryset = self.queryset.exclude(vid=4)
+
+        self.assertEqual(self.filterset(params, queryset).qs.count(), 1)
+
+    def test_related_to_site_negated(self):
+        """The negation lookup excludes everything the positive lookup returns."""
+        # related_to_site__n drops the 2 VLANs related to site-1
+        site = Site.objects.get(slug='site-1')
+        params = {'related_to_site__n': [site.pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), self.queryset.count() - 2)
+
+    def test_related_to_site_resolves_site_groups_in_constant_queries(self):
+        """The query count is constant in the number of sites, and drops to one without groups."""
+        sites = list(Site.objects.filter(slug__in=('site-1', 'site-2', 'site-3')))
+        site_without_group = Site.objects.get(slug='site-7')
+        # Both scope types are resolved through the ContentType cache, so warm it first.
+        ContentType.objects.get_by_natural_key('dcim', 'site')
+        ContentType.objects.get_by_natural_key('dcim', 'sitegroup')
+
+        # One query for the selected site groups, one for the VLANs
+        with self.assertNumQueries(2):
+            self.queryset.get_related_to_sites(sites[:1]).count()
+
+        with self.assertNumQueries(2):
+            self.queryset.get_related_to_sites(sites).count()
+
+        with self.assertNumQueries(2):
+            self.queryset.get_related_to_sites(sites, negate=True).count()
+
+        with self.assertNumQueries(1):
+            self.queryset.get_related_to_sites([site_without_group]).count()
+
+    def test_related_to_site_negation_partitions_the_queryset(self):
+        """The positive and negated lookups are disjoint and together cover the queryset."""
+        pks = [Site.objects.get(slug='site-1').pk, Site.objects.get(slug='site-4').pk]
+        # A VLAN with neither a site nor a group, and one in an unscoped group, belong to the negation.
+        VLAN.objects.create(vid=70, name='Unassigned')
+        VLAN.objects.create(vid=71, name='Unscoped group', group=VLANGroup.objects.get(slug='vlan-group-1'))
+
+        related_qs = self.filterset({'related_to_site': pks}, self.queryset).qs
+        unrelated_qs = self.filterset({'related_to_site__n': pks}, self.queryset).qs
+        related = set(related_qs.values_list('pk', flat=True))
+        unrelated = set(unrelated_qs.values_list('pk', flat=True))
+
+        self.assertEqual(related_qs.count(), len(related))
+        self.assertEqual(unrelated_qs.count(), len(unrelated))
+        self.assertEqual(related & unrelated, set())
+        self.assertEqual(related | unrelated, set(self.queryset.values_list('pk', flat=True)))
+        self.assertTrue(related)
+
+    def test_related_to_site_without_sites(self):
+        """No sites means no related VLANs, and the negation leaves the queryset untouched."""
+        self.assertEqual(self.queryset.get_related_to_sites([]).count(), 0)
+        self.assertEqual(self.queryset.get_related_to_sites([], negate=True).count(), self.queryset.count())
+
     def test_group(self):
         groups = VLANGroup.objects.filter(name__startswith='VLAN Group')[:2]
         params = {'group_id': [groups[0].pk, groups[1].pk]}
@@ -2138,6 +2428,26 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'available_on_device': device_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 7)  # 5 scoped + 1 global group + 1 global
 
+    def test_available_on_device_cluster_scopes(self):
+        device = Device.objects.get(name='Device 1')
+        device.cluster = Cluster.objects.get(name='Cluster 1')
+        device.save(update_fields=('cluster',))
+
+        params = {'available_on_device': device.pk}
+        vlans = self.filterset(params, self.queryset).qs
+
+        # VLANs from groups scoped to the assigned cluster or its cluster group
+        self.assertIn(VLAN.objects.get(name='Cluster 1'), vlans)
+        self.assertIn(VLAN.objects.get(name='Cluster Group 1'), vlans)
+        # VLANs from groups scoped to unrelated clusters or cluster groups
+        self.assertNotIn(VLAN.objects.get(name='Cluster 2'), vlans)
+        self.assertNotIn(VLAN.objects.get(name='Cluster Group 2'), vlans)
+        # Site, location, rack and global availability is unchanged
+        self.assertEqual(
+            set(vlans.values_list('vid', flat=True)),
+            {1, 4, 7, 10, 13, 16, 19, 500, 1000}
+        )
+
     def test_available_on_virtualmachine(self):
         vm_id = VirtualMachine.objects.first().pk
         params = {'available_on_virtualmachine': vm_id}
@@ -2151,15 +2461,59 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'available_at_site': site_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 5)  # 4 scoped + 1 global group + 1 global
 
+    def test_available_at_site_group(self):
+        site_group = SiteGroup.objects.get(name='Site Group 1')
+        params = {'available_at_site_group': site_group.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)  # 1 scoped + 1 global group + 1 global
+
     def test_interface(self):
         interface_id = Interface.objects.first().pk
         params = {'interface_id': interface_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
+        # An interface untagged on one VLAN and tagged on a different VLAN should return both (UNION across paths)
+        vlans = self.queryset.all()[:2]
+        interface = Interface.objects.create(
+            device=Device.objects.first(),
+            name='Interface X',
+            type=InterfaceTypeChoices.TYPE_1GE_FIXED,
+            mode=InterfaceModeChoices.MODE_TAGGED,
+            untagged_vlan=vlans[0],
+        )
+        interface.tagged_vlans.add(vlans[1])
+        params = {'interface_id': interface.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # A VLAN that is both untagged and tagged on the same interface should be returned only once (deduplication)
+        interface.tagged_vlans.add(vlans[0])
+        params = {'interface_id': interface.pk}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual(len(qs), len(set(qs.values_list('pk', flat=True))))
+
     def test_vminterface(self):
         vminterface_id = VMInterface.objects.first().pk
         params = {'vminterface_id': vminterface_id}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+        # A VM interface untagged on one VLAN and tagged on a different VLAN should return both (UNION across paths)
+        vlans = self.queryset.all()[:2]
+        vminterface = VMInterface.objects.create(
+            virtual_machine=VirtualMachine.objects.first(),
+            name='VM Interface X',
+            mode=InterfaceModeChoices.MODE_TAGGED,
+            untagged_vlan=vlans[0],
+        )
+        vminterface.tagged_vlans.add(vlans[1])
+        params = {'vminterface_id': vminterface.pk}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+        # A VLAN that is both untagged and tagged on the same interface should be returned only once (deduplication)
+        vminterface.tagged_vlans.add(vlans[0])
+        params = {'vminterface_id': vminterface.pk}
+        qs = self.filterset(params, self.queryset).qs
+        self.assertEqual(qs.count(), 2)
+        self.assertEqual(len(qs), len(set(qs.values_list('pk', flat=True))))
 
     def test_qinq_role(self):
         params = {'qinq_role': [VLANQinQRoleChoices.ROLE_SERVICE, VLANQinQRoleChoices.ROLE_CUSTOMER]}
@@ -2173,7 +2527,7 @@ class VLANTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VLANTranslationPolicyTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VLANTranslationPolicyTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VLANTranslationPolicy.objects.all()
     filterset = VLANTranslationPolicyFilterSet
 
@@ -2205,7 +2559,7 @@ class VLANTranslationPolicyTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VLANTranslationRuleTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VLANTranslationRuleTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VLANTranslationRule.objects.all()
     filterset = VLANTranslationRuleFilterSet
 
@@ -2266,49 +2620,20 @@ class VLANTranslationRuleTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ServiceTemplateTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ServiceTemplateTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ServiceTemplate.objects.all()
     filterset = ServiceTemplateFilterSet
-    ignore_fields = ('ports',)
 
     @classmethod
     def setUpTestData(cls):
-        service_templates = (
-            ServiceTemplate(
-                name='Service Template 1',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1001],
-                description='foobar1'
-            ),
-            ServiceTemplate(
-                name='Service Template 2',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1002],
-                description='foobar2'
-            ),
-            ServiceTemplate(
-                name='Service Template 3',
-                protocol=ServiceProtocolChoices.PROTOCOL_UDP,
-                ports=[1003],
-                description='foobar3'
-            ),
-            ServiceTemplate(
-                name='Service Template 4',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[2001]
-            ),
-            ServiceTemplate(
-                name='Service Template 5',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[2002]
-            ),
-            ServiceTemplate(
-                name='Service Template 6',
-                protocol=ServiceProtocolChoices.PROTOCOL_UDP,
-                ports=[2003]
-            ),
-        )
-        ServiceTemplate.objects.bulk_create(service_templates)
+        ServiceTemplate.objects.bulk_create((
+            ServiceTemplate(name='Service Template 1', description='foobar1', port_mappings=['tcp/1001']),
+            ServiceTemplate(name='Service Template 2', description='foobar2', port_mappings=['tcp/1002']),
+            ServiceTemplate(name='Service Template 3', description='foobar3', port_mappings=['udp/1003']),
+            ServiceTemplate(name='Service Template 4', port_mappings=['tcp/2001']),
+            ServiceTemplate(name='Service Template 5', port_mappings=['tcp/2002']),
+            ServiceTemplate(name='Service Template 6', port_mappings=['udp/2003']),
+        ))
 
     def test_q(self):
         params = {'q': 'foobar1'}
@@ -2318,23 +2643,129 @@ class ServiceTemplateTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'name': ['Service Template 1', 'Service Template 2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_port_mappings(self):
+        # A whole-mapping lookup matches only that exact protocol/port pair.
+        params = {'port_mappings': ['tcp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # udp/1001 does not exist, though tcp/1001 does
+        params = {'port_mappings': ['udp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        # Multiple values are OR'd
+        params = {'port_mappings': ['tcp/1001', 'udp/1003']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_port_mappings_normalized(self):
+        # Input is canonicalized for lookup, so case and leading zeros still match stored values.
+        ServiceTemplate.objects.create(name='Padded', port_mappings=['tcp/80'])
+        for value in ('TCP/80', 'tcp/080', 'TCP/080'):
+            params = {'port_mappings': [value]}
+            self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1, msg=value)
+
+    def test_port_mappings_unmatchable(self):
+        # An unknown protocol or malformed pair yields no results rather than a validation error.
+        for value in ('bogus/80', 'tcp/notaport', 'tcp'):
+            params = {'port_mappings': [value]}
+            filterset = self.filterset(params, self.queryset)
+            self.assertTrue(filterset.is_valid(), msg=value)
+            self.assertEqual(filterset.qs.count(), 0, msg=value)
+
+        # An empty value is a no-op, as it is for every other filter
+        filterset = self.filterset({'port_mappings': ['']}, self.queryset)
+        self.assertTrue(filterset.is_valid())
+        self.assertEqual(filterset.qs.count(), self.queryset.count())
+
+    def test_port_mappings_negated(self):
+        # port_mappings__n excludes objects exposing the given mapping (1 of 6 templates has tcp/1001).
+        params = {'port_mappings__n': ['tcp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 5)
+
+    def test_port_mappings_multiprotocol(self):
+        # A mapping lookup is satisfied by any one of an object's mappings.
+        ServiceTemplate.objects.create(name='DNS', port_mappings=['tcp/53', 'udp/53'])
+        params = {'port_mappings': ['udp/53']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # Combined with the correlated protocol/port filters, both must hold (independently)
+        params = {'port_mappings': ['udp/53'], 'protocol': [ServiceProtocolChoices.PROTOCOL_TCP]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'port_mappings': ['udp/53'], 'port': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+
     def test_protocol(self):
-        params = {'protocol': ServiceProtocolChoices.PROTOCOL_TCP}
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
 
+    def test_protocol_negated(self):
+        # protocol__n excludes objects exposing the given protocol (2 of 6 templates are udp-only).
+        params = {'protocol__n': [ServiceProtocolChoices.PROTOCOL_TCP]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
     def test_port(self):
-        params = {'port': '1001'}
+        params = {'port': [1001]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_protocol_and_port(self):
+        # A combined protocol+port filter must match a single mapping, not protocol and port matched
+        # independently across different mappings on the same object.
+        ServiceTemplate.objects.create(name='DNS', port_mappings=['tcp/8080', 'udp/53'])
+
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port': [8080]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # udp/8080 does not exist, even though this template has udp (on 53) and 8080 (on tcp)
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_UDP], 'port': [8080]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        # Single-mapping composition still works
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_port_negated(self):
+        # port__n excludes objects exposing the given port (1 of 6 templates uses 1001).
+        params = {'port__n': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 5)
+
+    def test_port_range_lookups(self):
+        # Ports in play: tcp/1001, tcp/1002, udp/1003, tcp/2001, tcp/2002, udp/2003
+        params = {'port__gt': [2000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'port__gte': [2001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'port__lt': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'port__lte': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_port_range_bounds_combined(self):
+        # gte + lte describe one range, so both bounds must hold for the same mapping.
+        ServiceTemplate.objects.create(name='Straddling', port_mappings=['tcp/500', 'tcp/5000'])
+
+        params = {'port__gte': [1000], 'port__lte': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_protocol_and_port_range(self):
+        # A range lookup is correlated with protocol, so this template's udp mapping (53) must not be
+        # matched by way of its tcp mapping (8080).
+        ServiceTemplate.objects.create(name='DNS', port_mappings=['tcp/8080', 'udp/53'])
+
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port__gt': [2000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_UDP], 'port__gt': [1000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_port_mappings_filter_is_idempotent(self):
+        # The correlated protocol/port predicate is applied by filter_queryset() rather than by the
+        # individual filters. Filtering twice with the same FilterSet instance must yield the same result,
+        # i.e. that must stay free of per-instance state which would drop or double the predicate.
+        filterset = self.filterset({'protocol': [ServiceProtocolChoices.PROTOCOL_UDP]}, self.queryset)
+        self.assertEqual(filterset.qs.count(), 2)
+        self.assertEqual(filterset.filter_queryset(self.queryset).count(), 2)
 
     def test_description(self):
         params = {'description': ['foobar1', 'foobar2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ServiceTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ServiceTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Service.objects.all()
     filterset = ServiceFilterSet
-    ignore_fields = ('ports',)
 
     @classmethod
     def setUpTestData(cls):
@@ -2380,50 +2811,13 @@ class ServiceTestCase(TestCase, ChangeLoggedFilterSetTests):
         )
 
         services = (
-            Service(
-                parent=devices[0],
-                name='Service 1',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1001],
-                description='foobar1',
-            ),
-            Service(
-                parent=devices[1],
-                name='Service 2',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[1002],
-                description='foobar2',
-            ),
-            Service(
-                parent=devices[2],
-                name='Service 3',
-                protocol=ServiceProtocolChoices.PROTOCOL_UDP,
-                ports=[1003]
-            ),
-            Service(
-                parent=virtual_machines[0],
-                name='Service 4',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[2001],
-            ),
-            Service(
-                parent=virtual_machines[1],
-                name='Service 5',
-                protocol=ServiceProtocolChoices.PROTOCOL_TCP,
-                ports=[2002],
-            ),
-            Service(
-                parent=virtual_machines[2],
-                name='Service 6',
-                protocol=ServiceProtocolChoices.PROTOCOL_UDP,
-                ports=[2003],
-            ),
-            Service(
-                parent=fhrp_group,
-                name='Service 7',
-                protocol=ServiceProtocolChoices.PROTOCOL_UDP,
-                ports=[2004],
-            ),
+            Service(parent=devices[0], name='Service 1', description='foobar1', port_mappings=['tcp/1001']),
+            Service(parent=devices[1], name='Service 2', description='foobar2', port_mappings=['tcp/1002']),
+            Service(parent=devices[2], name='Service 3', port_mappings=['udp/1003']),
+            Service(parent=virtual_machines[0], name='Service 4', port_mappings=['tcp/2001']),
+            Service(parent=virtual_machines[1], name='Service 5', port_mappings=['tcp/2002']),
+            Service(parent=virtual_machines[2], name='Service 6', port_mappings=['udp/2003']),
+            Service(parent=fhrp_group, name='Service 7', port_mappings=['udp/2004']),
         )
         Service.objects.bulk_create(services)
         services[0].ipaddresses.add(ip_addresses[0])
@@ -2438,17 +2832,119 @@ class ServiceTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'name': ['Service 1', 'Service 2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_port_mappings(self):
+        # A whole-mapping lookup matches only that exact protocol/port pair.
+        params = {'port_mappings': ['tcp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # udp/1001 does not exist, though tcp/1001 does
+        params = {'port_mappings': ['udp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        # Multiple values are OR'd
+        params = {'port_mappings': ['tcp/1001', 'udp/1003']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_port_mappings_normalized(self):
+        # Input is canonicalized for lookup, so case and leading zeros still match stored values.
+        Service.objects.create(parent=Device.objects.first(), name='Padded', port_mappings=['tcp/80'])
+        for value in ('TCP/80', 'tcp/080', 'TCP/080'):
+            params = {'port_mappings': [value]}
+            self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1, msg=value)
+
+    def test_port_mappings_unmatchable(self):
+        # An unknown protocol or malformed pair yields no results rather than a validation error.
+        for value in ('bogus/80', 'tcp/notaport', 'tcp'):
+            params = {'port_mappings': [value]}
+            filterset = self.filterset(params, self.queryset)
+            self.assertTrue(filterset.is_valid(), msg=value)
+            self.assertEqual(filterset.qs.count(), 0, msg=value)
+
+        # An empty value is a no-op, as it is for every other filter
+        filterset = self.filterset({'port_mappings': ['']}, self.queryset)
+        self.assertTrue(filterset.is_valid())
+        self.assertEqual(filterset.qs.count(), self.queryset.count())
+
+    def test_port_mappings_negated(self):
+        # port_mappings__n excludes objects exposing the given mapping (1 of 7 services has tcp/1001).
+        params = {'port_mappings__n': ['tcp/1001']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
+
+    def test_port_mappings_multiprotocol(self):
+        # A mapping lookup is satisfied by any one of an object's mappings.
+        Service.objects.create(parent=Device.objects.first(), name='DNS', port_mappings=['tcp/53', 'udp/53'])
+        params = {'port_mappings': ['udp/53']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # Combined with the correlated protocol/port filters, both must hold (independently)
+        params = {'port_mappings': ['udp/53'], 'protocol': [ServiceProtocolChoices.PROTOCOL_TCP]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'port_mappings': ['udp/53'], 'port': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+
     def test_protocol(self):
-        params = {'protocol': ServiceProtocolChoices.PROTOCOL_TCP}
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+
+    def test_protocol_negated(self):
+        # protocol__n excludes objects exposing the given protocol (3 of 7 services are udp-only).
+        params = {'protocol__n': [ServiceProtocolChoices.PROTOCOL_TCP]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
     def test_description(self):
         params = {'description': ['foobar1', 'foobar2']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_port(self):
-        params = {'port': '1001'}
+        params = {'port': [1001]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_protocol_and_port(self):
+        # A combined protocol+port filter must match a single mapping, not protocol and port matched
+        # independently across different mappings on the same object.
+        device = Device.objects.first()
+        Service.objects.create(parent=device, name='DNS', port_mappings=['tcp/8080', 'udp/53'])
+
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port': [8080]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        # udp/8080 does not exist, even though this service has udp (on 53) and 8080 (on tcp)
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_UDP], 'port': [8080]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
+        # Single-mapping composition still works
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_port_negated(self):
+        # port__n excludes objects exposing the given port (1 of 7 services uses 1001).
+        params = {'port__n': [1001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 6)
+
+    def test_port_range_lookups(self):
+        # Ports in play: tcp/1001, tcp/1002, udp/1003, tcp/2001, tcp/2002, udp/2003, udp/2004
+        params = {'port__gt': [2000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+        params = {'port__gte': [2001]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 4)
+        params = {'port__lt': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'port__lte': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_port_range_bounds_combined(self):
+        # gte + lte describe one range, so both bounds must hold for the same mapping.
+        device = Device.objects.first()
+        Service.objects.create(parent=device, name='Straddling', port_mappings=['tcp/500', 'tcp/5000'])
+
+        params = {'port__gte': [1000], 'port__lte': [1003]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+
+    def test_protocol_and_port_range(self):
+        # A range lookup is correlated with protocol, so this service's udp mapping (53) must not be
+        # matched by way of its tcp mapping (8080).
+        device = Device.objects.first()
+        Service.objects.create(parent=device, name='DNS', port_mappings=['tcp/8080', 'udp/53'])
+
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_TCP], 'port__gt': [2000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
+        params = {'protocol': [ServiceProtocolChoices.PROTOCOL_UDP], 'port__gt': [1000]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
     def test_device(self):
         devices = Device.objects.all()[:2]

@@ -1,7 +1,6 @@
 from django.utils.translation import gettext_lazy as _
-from rest_framework import serializers
-
 from netaddr import AddrFormatError, IPNetwork
+from rest_framework import serializers
 
 __all__ = (
     'IPAddressField',
@@ -21,7 +20,7 @@ class IPAddressField(serializers.CharField):
         try:
             return IPNetwork(data)
         except AddrFormatError:
-            raise serializers.ValidationError(_("Invalid IP address format: {data}").format(data))
+            raise serializers.ValidationError(_("Invalid IP address format: {data}").format(data=data))
         except (TypeError, ValueError) as e:
             raise serializers.ValidationError(e)
 
@@ -41,7 +40,7 @@ class IPNetworkField(serializers.CharField):
         try:
             return IPNetwork(data)
         except AddrFormatError:
-            raise serializers.ValidationError(_("Invalid IP prefix format: {data}").format(data))
+            raise serializers.ValidationError(_("Invalid IP prefix format: {data}").format(data=data))
         except (TypeError, ValueError) as e:
             raise serializers.ValidationError(e)
 

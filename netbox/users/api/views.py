@@ -15,6 +15,7 @@ from users import filtersets
 from users.models import Group, ObjectPermission, Owner, OwnerGroup, Token, User, UserConfig
 from utilities.data import deepmerge
 from utilities.querysets import RestrictedQuerySet
+
 from . import serializers
 
 
@@ -50,6 +51,8 @@ class TokenViewSet(NetBoxModelViewSet):
     queryset = Token.objects.all()
     serializer_class = serializers.TokenSerializer
     filterset_class = filtersets.TokenFilterSet
+    # A created v2 Token's plaintext must not be retained in a job record.
+    background_enabled = False
 
 
 class TokenProvisionView(APIView):

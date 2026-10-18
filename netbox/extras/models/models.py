@@ -1,16 +1,19 @@
 import json
+import re
 import urllib.parse
 from pathlib import Path
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.postgres.fields import ArrayField
-from django.core.validators import ValidationError
+from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
+from django.utils.text import format_lazy
 from django.utils.translation import gettext_lazy as _
 from rest_framework.utils.encoders import JSONEncoder
 
@@ -18,16 +21,25 @@ from extras.choices import *
 from extras.conditions import ConditionSet, InvalidCondition
 from extras.constants import *
 from extras.models.mixins import RenderTemplateMixin
+from extras.querysets import SharedObjectQuerySet
 from extras.utils import image_upload
 from netbox.config import get_config
+from netbox.event_rules import get_event_rule_action, get_event_rule_action_choices
 from netbox.events import get_event_type_choices
 from netbox.models import ChangeLoggedModel
 from netbox.models.features import (
-    CloningMixin, CustomFieldsMixin, CustomLinksMixin, ExportTemplatesMixin, SyncedDataMixin, TagsMixin, has_feature
+    CloningMixin,
+    CustomFieldsMixin,
+    CustomLinksMixin,
+    ExportTemplatesMixin,
+    SyncedDataMixin,
+    TagsMixin,
+    has_feature,
 )
 from netbox.models.mixins import OwnerMixin
+from netbox.settings_utils import parse_job_timeout
 from utilities.html import clean_html
-from utilities.jinja2 import render_jinja2
+from utilities.jinja2 import JINJA2_TEMPLATE_RE, render_jinja2, sanitize_http_header, validate_jinja2_syntax
 from utilities.querydict import dict_to_querydict
 from utilities.querysets import RestrictedQuerySet
 from utilities.tables import get_table_for_model
@@ -43,6 +55,11 @@ __all__ = (
     'TableConfig',
     'Webhook',
 )
+
+# Matches a literal URL scheme (RFC 3986), independent of urlsplit()'s netloc parsing -- which can
+# raise ValueError on a malformed host -- so a payload_url's scheme can always be read even when
+# its host is templated or malformed.
+LITERAL_SCHEME_RE = re.compile(r'^([a-zA-Z][a-zA-Z0-9+.-]*):')
 
 
 class EventRule(CustomFieldsMixin, ExportTemplatesMixin, OwnerMixin, TagsMixin, ChangeLoggedModel):
@@ -84,15 +101,19 @@ class EventRule(CustomFieldsMixin, ExportTemplatesMixin, OwnerMixin, TagsMixin, 
 
     # Action to take
     action_type = models.CharField(
-        max_length=30,
-        choices=EventRuleActionChoices,
+        max_length=100,
+        # Bare callable, re-evaluated fresh on each access via Django's CallableChoiceIterator,
+        # so a plugin action registered after this module was first imported is still reflected.
+        choices=get_event_rule_action_choices,
         default=EventRuleActionChoices.WEBHOOK,
         verbose_name=_('action type')
     )
     action_object_type = models.ForeignKey(
         to='contenttypes.ContentType',
         related_name='eventrule_actions',
-        on_delete=models.CASCADE
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
     )
     action_object_id = models.PositiveBigIntegerField(
         blank=True,
@@ -127,6 +148,26 @@ class EventRule(CustomFieldsMixin, ExportTemplatesMixin, OwnerMixin, TagsMixin, 
     def get_absolute_url(self):
         return reverse('extras:eventrule', args=[self.pk])
 
+    @property
+    def action_provider(self):
+        """
+        Return the registered EventRuleAction instance for this rule's action_type, or None if it
+        is not currently registered (e.g. the providing plugin is not installed).
+        """
+        return get_event_rule_action(self.action_type)
+
+    @property
+    def action_is_available(self):
+        return self.action_provider is not None
+
+    def get_action_type_display(self):
+        if action := self.action_provider:
+            return action.label
+        return _('{slug} (unavailable)').format(slug=self.action_type)
+
+    def get_action_type_color(self):
+        return None if self.action_is_available else 'red'
+
     def clean(self):
         super().clean()
 
@@ -136,6 +177,15 @@ class EventRule(CustomFieldsMixin, ExportTemplatesMixin, OwnerMixin, TagsMixin, 
                 ConditionSet(self.conditions)
             except ValueError as e:
                 raise ValidationError({'conditions': e})
+
+        # action_data must be a JSON object (or null)
+        if self.action_data is not None and not isinstance(self.action_data, dict):
+            raise ValidationError({'action_data': _('Action data must be a JSON object or null.')})
+
+        # action_type's own validity is already enforced by the field's dynamic choices= (Field.
+        # validate(), earlier in full_clean()); guard here only in case clean() ran standalone.
+        if self.action_is_available:
+            self.action_provider._validate(action_object=self.action_object, action_data=self.action_data)
 
     def eval_conditions(self, data):
         """
@@ -176,8 +226,9 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         max_length=500,
         verbose_name=_('URL'),
         help_text=_(
-            "This URL will be called using the HTTP method defined when the webhook is called. Jinja2 template "
-            "processing is supported with the same context as the request body."
+            "This URL will be called using the HTTP method defined when the webhook is called. Must be "
+            "http:// or https://. Jinja2 template processing is supported (with the same context as the "
+            "request body) for part or all of the URL."
         )
     )
     http_method = models.CharField(
@@ -201,7 +252,9 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         help_text=_(
             "User-supplied HTTP headers to be sent with the request in addition to the HTTP content type. Headers "
             "should be defined in the format <code>Name: Value</code>. Jinja2 template processing is supported with "
-            "the same context as the request body (below)."
+            "the same context as the request body (below). When interpolating untrusted data (such as object "
+            "attributes) into a header value, apply the <code>header_safe</code> filter to guard against HTTP header "
+            "injection, e.g. <code>X-Object: {{ data.name | header_safe }}</code>."
         )
     )
     body_template = models.TextField(
@@ -210,7 +263,7 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         help_text=_(
             "Jinja2 template for a custom request body. If blank, a JSON object representing the change will be "
             "included. Available context data includes: <code>event</code>, <code>model</code>, "
-            "<code>timestamp</code>, <code>username</code>, <code>request_id</code>, and <code>data</code>."
+            "<code>timestamp</code>, <code>request</code>, and <code>data</code>."
         )
     )
     secret = models.CharField(
@@ -234,6 +287,22 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         verbose_name=_('CA File Path'),
         help_text=_(
             "The specific CA certificate file to use for SSL verification. Leave blank to use the system defaults."
+        )
+    )
+    timeout = models.PositiveSmallIntegerField(
+        verbose_name=_('timeout'),
+        null=True,
+        blank=True,
+        validators=(
+            MinValueValidator(1),
+            MaxValueValidator(3600),
+        ),
+        help_text=format_lazy(
+            _(
+                "The maximum time (in seconds) to wait for a response before failing the request. Leave blank to use "
+                "the system default ({default_timeout} seconds)."
+            ),
+            default_timeout=settings.WEBHOOK_DEFAULT_TIMEOUT
         )
     )
     events = GenericRelation(
@@ -260,10 +329,50 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
     def clean(self):
         super().clean()
 
+        errors = {}
+
         # CA file path requires SSL verification enabled
         if not self.ssl_verification and self.ca_file_path:
+            errors['ca_file_path'] = _('Do not specify a CA certificate file if SSL verification is disabled.')
+
+        # payload_url may be a literal URL or a Jinja2 template (see its help_text). Skipped when
+        # blank; clean_fields() already flags that.
+        if self.payload_url:
+            if JINJA2_TEMPLATE_RE.search(self.payload_url):
+                # A literal, disallowed scheme (e.g. "file://") can never resolve no matter what
+                # else in the value is templated; anything else is checked for template syntax
+                # only, since its rendered result isn't known here.
+                match = LITERAL_SCHEME_RE.match(self.payload_url)
+                if match and match.group(1).lower() not in ('http', 'https'):
+                    errors['payload_url'] = _("Enter a valid URL, beginning with http:// or https://.")
+                else:
+                    try:
+                        validate_jinja2_syntax(self.payload_url)
+                    except ValidationError as e:
+                        errors['payload_url'] = e
+            else:
+                # Fully literal -- validate directly rather than via URLValidator, which rejects
+                # single-label and underscore hosts that `requests` accepts fine. urlsplit() can
+                # raise ValueError for a malformed netloc (e.g. an unbalanced IPv6 bracket).
+                try:
+                    scheme, netloc = urllib.parse.urlsplit(self.payload_url)[:2]
+                except ValueError:
+                    scheme, netloc = '', ''
+                if scheme not in ('http', 'https') or not netloc:
+                    errors['payload_url'] = _("Enter a valid URL, beginning with http:// or https://.")
+
+        if errors:
+            raise ValidationError(errors)
+
+        # A timeout which meets or exceeds the background job timeout leaves no room for the request's own timeout
+        # to apply: the worker will terminate the job first. (Staying below the job timeout does not guarantee that
+        # the request times out on its own, as the timeout applies separately to connecting and to reading data.)
+        job_timeout = parse_job_timeout(settings.RQ_DEFAULT_TIMEOUT)
+        if self.timeout is not None and job_timeout is not None and self.timeout >= job_timeout:
             raise ValidationError({
-                'ca_file_path': _('Do not specify a CA certificate file if SSL verification is disabled.')
+                'timeout': _(
+                    "Timeout must be less than the background job timeout ({timeout} seconds)."
+                ).format(timeout=job_timeout)
             })
 
     def render_headers(self, context):
@@ -273,8 +382,12 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         if not self.additional_headers:
             return {}
         ret = {}
-        data = render_jinja2(self.additional_headers, context)
+        # Expose the `header_safe` filter so template authors can sanitize interpolated values (e.g. user-controlled
+        # object data) against HTTP header (CR/LF) injection. See utilities.jinja2.sanitize_http_header.
+        data = render_jinja2(self.additional_headers, context, filters={'header_safe': sanitize_http_header})
         for line in data.splitlines():
+            if ':' not in line:
+                continue
             header, value = line.split(':', 1)
             ret[header.strip()] = value.strip()
         return ret
@@ -285,8 +398,7 @@ class Webhook(CustomFieldsMixin, ExportTemplatesMixin, TagsMixin, OwnerMixin, Ch
         """
         if self.body_template:
             return render_jinja2(self.body_template, context)
-        else:
-            return json.dumps(context, cls=JSONEncoder)
+        return json.dumps(context, cls=JSONEncoder)
 
     def render_payload_url(self, context):
         """
@@ -351,6 +463,9 @@ class CustomLink(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMod
 
     class Meta:
         ordering = ['group_name', 'weight', 'name']
+        indexes = (
+            models.Index(fields=('group_name', 'weight', 'name')),  # Default ordering
+        )
         verbose_name = _('custom link')
         verbose_name_plural = _('custom links')
 
@@ -424,6 +539,9 @@ class ExportTemplate(
 
     class Meta:
         ordering = ('name',)
+        indexes = (
+            models.Index(fields=('name',)),  # Default ordering
+        )
         verbose_name = _('export template')
         verbose_name_plural = _('export templates')
 
@@ -449,18 +567,12 @@ class ExportTemplate(
         """
         Synchronize template content from the designated DataFile (if any).
         """
-        self.template_code = self.data_file.data_as_string
+        self.template_code = self.validate_synced_value('template_code', self.data_file.data_as_string)
     sync_data.alters_data = True
 
     def get_context(self, context=None, queryset=None):
-        _context = {
-            'queryset': queryset,
-        }
-
-        # Apply the provided context data, if any
-        if context is not None:
-            _context.update(context)
-
+        _context = super().get_context(context=context, queryset=queryset)
+        _context['queryset'] = queryset
         return _context
 
 
@@ -510,12 +622,17 @@ class SavedFilter(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         verbose_name=_('parameters')
     )
 
+    objects = SharedObjectQuerySet.as_manager()
+
     clone_fields = (
         'object_types', 'weight', 'enabled', 'parameters',
     )
 
     class Meta:
         ordering = ('weight', 'name')
+        indexes = (
+            models.Index(fields=('weight', 'name')),  # Default ordering
+        )
         verbose_name = _('saved filter')
         verbose_name_plural = _('saved filters')
 
@@ -594,10 +711,15 @@ class TableConfig(CloningMixin, ChangeLoggedModel):
         null=True,
     )
 
+    objects = SharedObjectQuerySet.as_manager()
+
     clone_fields = ('object_type', 'table', 'enabled', 'shared', 'columns', 'ordering')
 
     class Meta:
         ordering = ('weight', 'name')
+        indexes = (
+            models.Index(fields=('weight', 'name')),  # Default ordering
+        )
         verbose_name = _('table config')
         verbose_name_plural = _('table configs')
 
@@ -634,6 +756,10 @@ class TableConfig(CloningMixin, ChangeLoggedModel):
     def clean(self):
         super().clean()
 
+        # Skip table validation until the object type and table have been set
+        if not self.object_type_id or not self.table:
+            return
+
         # Validate table
         if self.table_class is None:
             raise ValidationError({
@@ -643,7 +769,7 @@ class TableConfig(CloningMixin, ChangeLoggedModel):
         table = self.table_class([])
 
         # Validate ordering columns
-        for name in self.ordering:
+        for name in self.ordering or []:
             if name.startswith('-'):
                 name = name[1:]  # Strip leading hyphen
             if name not in table.columns:
@@ -652,7 +778,7 @@ class TableConfig(CloningMixin, ChangeLoggedModel):
                 })
 
         # Validate selected columns
-        for name in self.columns:
+        for name in self.columns or []:
             if name not in table.columns:
                 raise ValidationError({
                     'columns': _('Unknown column: {name}').format(name=name)
@@ -683,6 +809,14 @@ class ImageAttachment(ChangeLoggedModel):
     image_width = models.PositiveSmallIntegerField(
         verbose_name=_('image width'),
     )
+    # Unlike image_height/image_width (populated automatically by ImageField), there is no native size_field, so
+    # this is populated in save(). It is nullable because existing rows predate the field and storage reads can
+    # fail; a null value means "not yet computed" and the size property falls back to reading storage.
+    image_size = models.PositiveBigIntegerField(
+        verbose_name=_('image size'),
+        blank=True,
+        null=True,
+    )
     name = models.CharField(
         verbose_name=_('name'),
         max_length=50,
@@ -696,11 +830,31 @@ class ImageAttachment(ChangeLoggedModel):
 
     objects = RestrictedQuerySet.as_manager()
 
-    clone_fields = ('object_type', 'object_id')
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Cache an identity for the current image so save() can detect a new/replaced file and recompute the cached
+        # image_size. We combine the file name with the (auto-populated) dimensions: a replacement that reuses the
+        # same name is still caught when its dimensions differ. Read the raw image value from __dict__ to avoid
+        # triggering the ImageField descriptor here (doing so during ORM/GraphQL instantiation can recurse).
+        self._orig_image_key = self._image_identity()
+
+    def _image_identity(self):
+        """
+        Return a tuple identifying the current image file for change detection: its name plus the dimensions Django
+        populates from it. All three are read raw from __dict__ to avoid triggering the ImageField descriptor
+        (accessing `self.image` during ORM/GraphQL instantiation can recurse). Not a content fingerprint: a
+        replacement with an identical name AND identical dimensions is not distinguished (would require reading the
+        file, the storage round-trip this caching avoids).
+        """
+        original = self.__dict__.get('image')
+        name = getattr(original, 'name', original)
+        return (name, self.__dict__.get('image_height'), self.__dict__.get('image_width'))
 
     class Meta:
         ordering = ('name', 'pk')  # name may be non-unique
         indexes = (
+            models.Index(fields=('name', 'id')),  # Default ordering
             models.Index(fields=('object_type', 'object_id')),
         )
         verbose_name = _('image attachment')
@@ -752,12 +906,15 @@ class ImageAttachment(ChangeLoggedModel):
             alt_text=escape(self.description or self.name),
         ))
 
-    @property
-    def size(self):
+    def _read_image_size(self):
         """
-        Wrapper around `image.size` to suppress an OSError in case the file is inaccessible. Also opportunistically
-        catch other exceptions that we know other storage back-ends to throw.
+        Read the image file's size from storage, suppressing an OSError in case the file is inaccessible. Also
+        opportunistically catch other exceptions that we know other storage back-ends to throw. Returns None if the
+        size cannot be determined. This may issue a request to the storage backend (e.g. a HEAD request to S3).
         """
+        if not self.image:
+            return None
+
         expected_exceptions = [OSError]
 
         try:
@@ -770,6 +927,33 @@ class ImageAttachment(ChangeLoggedModel):
             return self.image.size
         except tuple(expected_exceptions):
             return None
+
+    @property
+    def size(self):
+        """
+        Return the size of the image file in bytes. Prefer the cached `image_size` value to avoid a storage request;
+        fall back to reading from storage for legacy rows where `image_size` has not yet been populated.
+        """
+        if self.image_size is not None:
+            return self.image_size
+        return self._read_image_size()
+
+    def save(self, *args, **kwargs):
+        # Populate image_size on creation or when the image file has changed. Reading the size may touch the storage
+        # backend (e.g. a HEAD request to S3), so we only do it when necessary: bulk operations that don't alter the
+        # image (bulk edit, rename) leave the identity unchanged and skip the read entirely. We never overwrite a good
+        # value with None (e.g. on a transient storage error); a failed read while replacing a file keeps the prior
+        # size until the next successful save, which is preferred over storing None.
+        orig_image_key = getattr(self, '_orig_image_key', None)
+        if self._state.adding or self._image_identity() != orig_image_key:
+            size = self._read_image_size()
+            if size is not None:
+                self.image_size = size
+
+        super().save(*args, **kwargs)
+
+        # Refresh the cached identity so subsequent saves on this instance detect further changes correctly.
+        self._orig_image_key = self._image_identity()
 
     def to_objectchange(self, action):
         objectchange = super().to_objectchange(action)
@@ -811,6 +995,7 @@ class JournalEntry(CustomFieldsMixin, CustomLinksMixin, TagsMixin, ExportTemplat
     class Meta:
         ordering = ('-created',)
         indexes = (
+            models.Index(fields=('-created',)),  # Default ordering
             models.Index(fields=('assigned_object_type', 'assigned_object_id')),
         )
         verbose_name = _('journal entry')
@@ -866,6 +1051,7 @@ class Bookmark(models.Model):
     class Meta:
         ordering = ('created', 'pk')
         indexes = (
+            models.Index(fields=('created', 'id')),  # Default ordering
             models.Index(fields=('object_type', 'object_id')),
         )
         constraints = (

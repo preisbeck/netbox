@@ -29,13 +29,12 @@ The resulting webhook payload will look like the following:
     "event": "updated",
     "timestamp": "2025-08-07T14:24:30.627321+00:00",
     "object_type": "dcim.site",
-    "username": "admin",
-    "request_id": "49e3e39e-7333-4b9c-a9af-19f0dc1e7dc9",
     "data": {
         "id": 2,
         "url": "/api/dcim/sites/2/",
         ...
     },
+    "request": {...},
     "snapshots": {...},
     "context": {
         "foo": 123

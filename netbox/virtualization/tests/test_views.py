@@ -1,12 +1,14 @@
+from decimal import Decimal
+
 from django.contrib.contenttypes.models import ContentType
 from django.test import override_settings
 from django.urls import reverse
 
 from dcim.choices import InterfaceModeChoices
-from dcim.models import DeviceRole, Platform, Site
-from extras.models import ConfigTemplate
+from dcim.models import DeviceRole, MACAddress, Platform, Site
+from extras.models import ConfigContext, ConfigTemplate
 from ipam.models import VLAN, VRF
-from utilities.testing import ViewTestCases, create_tags, create_test_device, create_test_virtualmachine
+from utilities.testing import ViewTestCases, create_tags, create_test_device, create_test_virtualmachine, post_data
 from virtualization.choices import *
 from virtualization.models import *
 
@@ -151,18 +153,26 @@ class ClusterTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'type': clustertypes[1].pk,
             'status': ClusterStatusChoices.STATUS_OFFLINE,
             'tenant': None,
-            'scope_type': ContentType.objects.get_for_model(Site).pk,
-            'scope': sites[1].pk,
+            'scope_content_type': ContentType.objects.get_for_model(Site).pk,
+            'scope_object_id': sites[1].pk,
             'comments': 'Some comments',
             'tags': [t.pk for t in tags],
         }
 
-        cls.csv_data = (
-            "name,type,status",
-            "Cluster 4,Cluster Type 1,active",
-            "Cluster 5,Cluster Type 1,active",
-            "Cluster 6,Cluster Type 1,active",
-        )
+        cls.csv_data = {
+            'default': (
+                "name,type,status,scope_type,scope_id",
+                f"Cluster 4,Cluster Type 1,active,dcim.site,{sites[0].pk}",
+                f"Cluster 5,Cluster Type 1,active,dcim.site,{sites[0].pk}",
+                f"Cluster 6,Cluster Type 1,active,dcim.site,{sites[0].pk}",
+            ),
+            'scope_name': (
+                "name,type,status,scope_type,scope_name",
+                f"Cluster 4,Cluster Type 1,active,dcim.site,{sites[0].name}",
+                f"Cluster 5,Cluster Type 1,active,dcim.site,{sites[0].name}",
+                f"Cluster 6,Cluster Type 1,active,dcim.site,{sites[0].name}",
+            ),
+        }
 
         cls.csv_update_data = (
             "id,name,comments",
@@ -179,19 +189,94 @@ class ClusterTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'comments': 'New comments',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_cluster_virtualmachines(self):
+        self.add_permissions('virtualization.view_cluster', 'virtualization.view_virtualmachine')
         cluster = Cluster.objects.first()
 
         url = reverse('virtualization:cluster_virtualmachines', kwargs={'pk': cluster.pk})
         self.assertHttpStatus(self.client.get(url), 200)
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_cluster_devices(self):
+        self.add_permissions('virtualization.view_cluster', 'dcim.view_device')
         cluster = Cluster.objects.first()
 
         url = reverse('virtualization:cluster_devices', kwargs={'pk': cluster.pk})
         self.assertHttpStatus(self.client.get(url), 200)
+
+
+class VirtualMachineTypeTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = VirtualMachineType
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cls.platforms = (
+            Platform(name='Platform 1', slug='platform-1'),
+            Platform(name='Platform 2', slug='platform-2'),
+            Platform(name='Platform 3', slug='platform-3'),
+        )
+        for platform in cls.platforms:
+            platform.save()
+
+        cls.virtual_machine_types = (
+            VirtualMachineType(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=cls.platforms[0],
+                default_vcpus=Decimal('1.00'),
+                default_memory=1024,
+            ),
+            VirtualMachineType(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=cls.platforms[1],
+                default_vcpus=Decimal('2.00'),
+                default_memory=2048,
+            ),
+            VirtualMachineType(
+                name='Virtual Machine Type 3',
+                slug='virtual-machine-type-3',
+                default_platform=cls.platforms[2],
+                default_vcpus=Decimal('4.00'),
+                default_memory=4096,
+            ),
+        )
+        for virtual_machine_type in cls.virtual_machine_types:
+            virtual_machine_type.save()
+
+        tags = create_tags('Alpha', 'Bravo', 'Charlie')
+
+        cls.form_data = {
+            'name': 'Virtual Machine Type X',
+            'slug': 'virtual-machine-type-x',
+            'default_platform': cls.platforms[1].pk,
+            'default_vcpus': 8,
+            'default_memory': 8192,
+            'description': 'A new virtual machine type',
+            'comments': 'Some comments',
+            'tags': [t.pk for t in tags],
+        }
+
+        cls.csv_data = (
+            'name,slug,default_platform,default_vcpus,default_memory,description',
+            'Virtual Machine Type 4,virtual-machine-type-4,Platform 1,1.00,1024,Fourth virtual machine type',
+            'Virtual Machine Type 5,virtual-machine-type-5,Platform 2,2.00,2048,Fifth virtual machine type',
+            'Virtual Machine Type 6,virtual-machine-type-6,Platform 3,4.00,4096,Sixth virtual machine type',
+        )
+
+        cls.csv_update_data = (
+            'id,name,description',
+            f'{cls.virtual_machine_types[0].pk},Virtual Machine Type 7,New description 7',
+            f'{cls.virtual_machine_types[1].pk},Virtual Machine Type 8,New description 8',
+            f'{cls.virtual_machine_types[2].pk},Virtual Machine Type 9,New description 9',
+        )
+
+        cls.bulk_edit_data = {
+            'default_platform': cls.platforms[2].pk,
+            'default_vcpus': 16,
+            'default_memory': 16384,
+            'description': 'New description',
+        }
 
 
 class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
@@ -207,57 +292,79 @@ class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         for role in roles:
             role.save()
 
-        platforms = (
+        cls.platforms = (
             Platform(name='Platform 1', slug='platform-1'),
             Platform(name='Platform 2', slug='platform-2'),
         )
-        for platform in platforms:
+        for platform in cls.platforms:
             platform.save()
 
-        sites = (
+        cls.sites = (
             Site(name='Site 1', slug='site-1'),
             Site(name='Site 2', slug='site-2'),
         )
-        Site.objects.bulk_create(sites)
+        Site.objects.bulk_create(cls.sites)
 
         clustertype = ClusterType.objects.create(name='Cluster Type 1', slug='cluster-type-1')
 
-        clusters = (
-            Cluster(name='Cluster 1', type=clustertype, scope=sites[0]),
-            Cluster(name='Cluster 2', type=clustertype, scope=sites[1]),
+        cls.clusters = (
+            Cluster(name='Cluster 1', type=clustertype, scope=cls.sites[0]),
+            Cluster(name='Cluster 2', type=clustertype, scope=cls.sites[1]),
         )
-        for cluster in clusters:
+        for cluster in cls.clusters:
             cluster.save()
 
-        devices = (
-            create_test_device('device1', site=sites[0], cluster=clusters[0]),
-            create_test_device('device2', site=sites[1], cluster=clusters[1]),
+        cls.devices = (
+            create_test_device('device1', site=cls.sites[0], cluster=cls.clusters[0]),
+            create_test_device('device2', site=cls.sites[1], cluster=cls.clusters[1]),
         )
+
+        cls.vm_types = (
+            VirtualMachineType(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=cls.platforms[0],
+                default_vcpus=Decimal('2.00'),
+                default_memory=4096,
+            ),
+            VirtualMachineType(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=cls.platforms[1],
+                default_vcpus=Decimal('4.00'),
+                default_memory=8192,
+            ),
+        )
+        for vm_type in cls.vm_types:
+            vm_type.save()
 
         virtual_machines = (
             VirtualMachine(
                 name='Virtual Machine 1',
-                site=sites[0],
-                cluster=clusters[0],
-                device=devices[0],
+                virtual_machine_type=cls.vm_types[0],
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                device=cls.devices[0],
                 role=roles[0],
-                platform=platforms[0],
+                platform=cls.platforms[0],
             ),
             VirtualMachine(
                 name='Virtual Machine 2',
-                site=sites[0],
-                cluster=clusters[0],
-                device=devices[0],
+                virtual_machine_type=cls.vm_types[0],
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                device=cls.devices[0],
                 role=roles[0],
-                platform=platforms[0],
+                platform=cls.platforms[0],
             ),
             VirtualMachine(
                 name='Virtual Machine 3',
-                site=sites[0],
-                cluster=clusters[0],
-                device=devices[0],
+                virtual_machine_type=cls.vm_types[1],
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                device=cls.devices[0],
                 role=roles[0],
-                platform=platforms[0],
+                platform=cls.platforms[0],
             ),
         )
         VirtualMachine.objects.bulk_create(virtual_machines)
@@ -265,11 +372,12 @@ class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         tags = create_tags('Alpha', 'Bravo', 'Charlie')
 
         cls.form_data = {
-            'cluster': clusters[1].pk,
-            'device': devices[1].pk,
-            'site': sites[1].pk,
+            'virtual_machine_type': cls.vm_types[1].pk,
+            'cluster': cls.clusters[1].pk,
+            'device': cls.devices[1].pk,
+            'site': cls.sites[1].pk,
             'tenant': None,
-            'platform': platforms[1].pk,
+            'platform': cls.platforms[1].pk,
             'name': 'Virtual Machine X',
             'status': VirtualMachineStatusChoices.STATUS_STAGED,
             'start_on_boot': VirtualMachineStartOnBootChoices.STATUS_ON,
@@ -286,36 +394,69 @@ class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         }
 
         cls.csv_data = (
-            "name,status,site,cluster,device",
-            "Virtual Machine 4,active,Site 1,Cluster 1,device1",
-            "Virtual Machine 5,active,Site 1,Cluster 1,device1",
-            "Virtual Machine 6,active,Site 1,Cluster 1,",
+            'name,status,site,cluster,device,virtual_machine_type',
+            'Virtual Machine 4,active,Site 1,Cluster 1,device1,Virtual Machine Type 1',
+            'Virtual Machine 5,active,Site 1,Cluster 1,device1,Virtual Machine Type 2',
+            'Virtual Machine 6,active,Site 1,Cluster 1,,Virtual Machine Type 1',
         )
 
         cls.csv_update_data = (
-            "id,name,comments",
-            f"{virtual_machines[0].pk},Virtual Machine 7,New comments 7",
-            f"{virtual_machines[1].pk},Virtual Machine 8,New comments 8",
-            f"{virtual_machines[2].pk},Virtual Machine 9,New comments 9",
+            'id,name,comments',
+            f'{virtual_machines[0].pk},Virtual Machine 7,New comments 7',
+            f'{virtual_machines[1].pk},Virtual Machine 8,New comments 8',
+            f'{virtual_machines[2].pk},Virtual Machine 9,New comments 9',
         )
 
         cls.bulk_edit_data = {
-            'site': sites[1].pk,
-            'cluster': clusters[1].pk,
-            'device': devices[1].pk,
+            'virtual_machine_type': cls.vm_types[1].pk,
+            'site': cls.sites[1].pk,
+            'cluster': cls.clusters[1].pk,
+            'device': cls.devices[1].pk,
             'tenant': None,
-            'platform': platforms[1].pk,
+            'platform': cls.platforms[1].pk,
             'status': VirtualMachineStatusChoices.STATUS_STAGED,
             'role': roles[1].pk,
-            'vcpus': 8,
+            'vcpus': Decimal('8.00'),
             'memory': 65535,
             'disk': 8000,
             'comments': 'New comments',
             'start_on_boot': VirtualMachineStartOnBootChoices.STATUS_OFF,
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
+    def test_create_virtualmachine_with_type_defaults(self):
+        self.add_permissions(
+            'virtualization.view_virtualmachine',
+            'virtualization.add_virtualmachine',
+            'virtualization.view_cluster',
+            'virtualization.view_virtualmachinetype',
+            'dcim.view_site',
+            'dcim.view_platform',
+        )
+
+        response = self.client.post(
+            self._get_url('add'),
+            data={
+                'name': 'Virtual Machine Defaults',
+                'virtual_machine_type': self.vm_types[0].pk,
+                'status': VirtualMachineStatusChoices.STATUS_ACTIVE,
+                'start_on_boot': VirtualMachineStartOnBootChoices.STATUS_OFF,
+                'site': self.sites[0].pk,
+                'cluster': self.clusters[0].pk,
+                'platform': '',
+                'vcpus': '',
+                'memory': '',
+            },
+        )
+        self.assertHttpStatus(response, 302)
+
+        vm = VirtualMachine.objects.get(name='Virtual Machine Defaults')
+        self.assertEqual(vm.virtual_machine_type, self.vm_types[0])
+        self.assertEqual(vm.platform, self.platforms[0])
+        self.assertEqual(vm.vcpus, self.vm_types[0].default_vcpus)
+        self.assertEqual(vm.memory, self.vm_types[0].default_memory)
+
     def test_virtualmachine_interfaces(self):
+        self.add_permissions('virtualization.view_virtualmachine', 'virtualization.view_vminterface')
         virtualmachine = VirtualMachine.objects.first()
         vminterfaces = (
             VMInterface(virtual_machine=virtualmachine, name='Interface 1'),
@@ -326,6 +467,33 @@ class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
 
         url = reverse('virtualization:virtualmachine_interfaces', kwargs={'pk': virtualmachine.pk})
         self.assertHttpStatus(self.client.get(url), 200)
+
+    def test_bulk_edit_device_context_preserves_device(self):
+        """
+        Regression test for #21990: Bulk editing VMs from the Device's VMs tab (URL contains
+        ?device=<id>) must not clear the device field on those VMs.
+        """
+        self.add_permissions('virtualization.view_virtualmachine', 'virtualization.change_virtualmachine')
+
+        device = VirtualMachine.objects.filter(device__isnull=False).first().device
+        vms = list(VirtualMachine.objects.filter(device=device)[:3])
+        pk_list = [vm.pk for vm in vms]
+
+        data = {
+            'pk': pk_list,
+            '_apply': True,
+            # Only change status — device is intentionally omitted
+            'status': VirtualMachineStatusChoices.STATUS_STAGED,
+        }
+
+        # Simulate navigation from Device -> Virtual Machines tab by passing ?device=<id> as GET param
+        url = reverse('virtualization:virtualmachine_bulk_edit') + f'?device={device.pk}'
+        response = self.client.post(url, data)
+        self.assertHttpStatus(response, 302)
+
+        for vm in VirtualMachine.objects.filter(pk__in=pk_list):
+            self.assertEqual(vm.device, device, msg=f"Device was unexpectedly cleared on VM '{vm.name}'")
+            self.assertEqual(vm.status, VirtualMachineStatusChoices.STATUS_STAGED)
 
     def test_virtualmachine_renderconfig(self):
         configtemplate = ConfigTemplate.objects.create(
@@ -348,6 +516,94 @@ class VirtualMachineTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         # With view permission removed should NOT be able to render config
         self.remove_permissions('virtualization.view_virtualmachine')
         self.assertHttpStatus(self.client.get(url), 403)
+
+    def test_virtualmachine_renderconfig_with_config_template_id(self):
+        default_template = ConfigTemplate.objects.create(
+            name='Default Template',
+            template_code='Default config for {{ virtualmachine.name }}'
+        )
+        override_template = ConfigTemplate.objects.create(
+            name='Override Template',
+            template_code='Override config for {{ virtualmachine.name }}'
+        )
+        vm = VirtualMachine.objects.first()
+        vm.config_template = default_template
+        vm.save()
+
+        self.add_permissions(
+            'virtualization.view_virtualmachine', 'virtualization.render_config_virtualmachine',
+            'extras.view_configtemplate'
+        )
+        url = reverse('virtualization:virtualmachine_render-config', kwargs={'pk': vm.pk})
+
+        # Render with override config_template_id
+        response = self.client.get(url, {'config_template_id': override_template.pk})
+        self.assertHttpStatus(response, 200)
+        self.assertIn(b'Override config for', response.content)
+
+        # Render with nonexistent config_template_id still returns 200 with error message
+        response = self.client.get(url, {'config_template_id': 999999})
+        self.assertHttpStatus(response, 200)
+        self.assertIn(b'Error rendering template', response.content)
+
+        # Render with non-integer config_template_id still returns 200 with error message
+        response = self.client.get(url, {'config_template_id': 'abc'})
+        self.assertHttpStatus(response, 200)
+        self.assertIn(b'Error rendering template', response.content)
+
+        # Without view_configtemplate permission, override template should not be accessible
+        self.remove_permissions('extras.view_configtemplate')
+        response = self.client.get(url, {'config_template_id': override_template.pk})
+        self.assertHttpStatus(response, 200)
+        self.assertIn(b'Error rendering template', response.content)
+
+    def test_virtualmachine_configcontext_is_not_cacheable(self):
+        """
+        The config context tab renders the merged context data, which may contain sensitive
+        values, so the response must not be cached by the browser.
+        """
+        ConfigContext.objects.create(name='Config Context 1', data={'password': 'super-secret-password'})
+        vm = VirtualMachine.objects.first()
+
+        self.add_permissions('virtualization.view_virtualmachine', 'extras.view_configcontext')
+        url = reverse('virtualization:virtualmachine_configcontext', kwargs={'pk': vm.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the context data is in fact rendered in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+    def test_virtualmachine_renderconfig_is_not_cacheable(self):
+        """
+        The render config tab renders the config template with context data substituted into it,
+        which may contain sensitive values, so the response must not be cached by the browser.
+        """
+        configtemplate = ConfigTemplate.objects.create(
+            name='Test Config Template',
+            template_code='enable secret super-secret-password'
+        )
+        vm = VirtualMachine.objects.first()
+        vm.config_template = configtemplate
+        vm.save()
+
+        self.add_permissions('virtualization.view_virtualmachine', 'virtualization.render_config_virtualmachine')
+        url = reverse('virtualization:virtualmachine_render-config', kwargs={'pk': vm.pk})
+
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the rendered config is in fact present in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+        # The direct export of the rendered config must not be cached either
+        response = self.client.get(url, {'export': 1})
+        self.assertHttpStatus(response, 200)
+        self.assertIn(b'super-secret-password', response.content)
+        self.assertNotCacheable(response)
 
 
 class VMInterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
@@ -479,6 +735,59 @@ class VMInterfaceTestCase(ViewTestCases.DeviceComponentViewTestCase):
         }
         self.client.post(self._get_url('bulk_delete'), data)
         self.assertEqual(virtual_machine.interfaces.count(), 2)  # Child & parent were both deleted
+
+    def test_mac_address_shortcut_create(self):
+        """
+        Submitting the VMInterface form with a mac_address string creates a MACAddress
+        and sets it as primary in one request.
+        """
+        self.add_permissions('virtualization.add_vminterface', 'dcim.add_macaddress')
+
+        data = {**self.form_data, 'mac_address': 'AA:BB:CC:DD:EE:FF', 'changelog_message': 'test'}
+        response = self.client.post(self._get_url('add'), data=post_data(data))
+        self.assertHttpStatus(response, 302)
+
+        interface = VMInterface.objects.get(virtual_machine=data['virtual_machine'], name=data['name'])
+        self.assertIsNotNone(interface.primary_mac_address)
+        self.assertEqual(str(interface.primary_mac_address.mac_address), 'AA:BB:CC:DD:EE:FF')
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_mac_address_shortcut_edit(self):
+        """
+        Submitting the VMInterface edit form with a mac_address string creates a MACAddress
+        and assigns it as primary when none existed before.
+        """
+        self.add_permissions('virtualization.change_vminterface', 'dcim.add_macaddress')
+
+        instance = VMInterface.objects.filter(virtual_machine_id=self.form_data['virtual_machine']).first()
+        self.assertIsNone(instance.primary_mac_address)
+
+        data = {**self.form_data, 'mac_address': '11:22:33:44:55:66', 'changelog_message': 'test'}
+        response = self.client.post(self._get_url('edit', instance), data=post_data(data))
+        self.assertHttpStatus(response, 302)
+
+        instance.refresh_from_db()
+        self.assertIsNotNone(instance.primary_mac_address)
+        self.assertEqual(str(instance.primary_mac_address.mac_address), '11:22:33:44:55:66')
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_mac_address_shortcut_clear(self):
+        """
+        Submitting the VMInterface edit form with an empty mac_address clears the primary MAC.
+        """
+        self.add_permissions('virtualization.change_vminterface')
+
+        instance = VMInterface.objects.filter(virtual_machine_id=self.form_data['virtual_machine']).first()
+        mac = MACAddress.objects.create(mac_address='AA:BB:CC:DD:EE:FF', assigned_object=instance)
+        instance.primary_mac_address = mac
+        instance.save()
+
+        data = {**self.form_data, 'mac_address': '', 'changelog_message': 'test'}
+        response = self.client.post(self._get_url('edit', instance), data=post_data(data))
+        self.assertHttpStatus(response, 302)
+
+        instance.refresh_from_db()
+        self.assertIsNone(instance.primary_mac_address)
 
 
 class VirtualDiskTestCase(ViewTestCases.DeviceComponentViewTestCase):

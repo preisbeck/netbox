@@ -1,13 +1,29 @@
 import datetime
+import hashlib
+import re
+import sys
+from types import ModuleType
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
-from django.test import Client
+from django.contrib.messages.storage.fallback import FallbackStorage
+from django.http import HttpResponse
+from django.test import Client, RequestFactory, SimpleTestCase
+from django.test import TestCase as DjangoTestCase
 from django.test.utils import override_settings
 from django.urls import reverse
+from django.utils.timezone import now
 from rest_framework.test import APIClient
+from social_core.exceptions import AuthFailed
 
-from core.models import ObjectType
+from account.views import LoginView
+from core.choices import ManagedFileRootPathChoices
+from core.models import DataFile, DataSource, ManagedFile, ObjectType
 from dcim.models import Rack, Site
+from extras.models import ConfigTemplate, ExportTemplate, ScriptModule
+from netbox.authentication import LDAPBackend
+from netbox.authentication.misc import _mirror_groups
+from netbox.middleware import SocialAuthExceptionMiddleware
 from users.constants import TOKEN_PREFIX
 from users.models import Group, ObjectPermission, Token, User
 from utilities.testing import TestCase
@@ -97,7 +113,7 @@ class TokenAuthenticationTestCase(APITestCase):
         url = reverse('dcim-api:site-list')
 
         # Create v1 & v2 tokens
-        future = datetime.datetime(2100, 1, 1, tzinfo=datetime.timezone.utc)
+        future = datetime.datetime(2100, 1, 1, tzinfo=datetime.UTC)
         token1 = Token.objects.create(version=1, user=self.user, expires=future)
         token2 = Token.objects.create(version=2, user=self.user, expires=future)
 
@@ -108,7 +124,7 @@ class TokenAuthenticationTestCase(APITestCase):
         self.assertEqual(response.status_code, 200)
 
         # Request with an expired token should fail
-        past = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        past = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
         token1.expires = past
         token1.save()
         token2.expires = past
@@ -514,6 +530,84 @@ class ExternalAuthenticationTestCase(TestCase):
         )
 
 
+class LDAPMirrorGroupsTestCase(TestCase):
+    """
+    Test the custom _mirror_groups() patched onto django-auth-ldap's _LDAPUser.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create(username='ldapuser')
+        Group.objects.create(name='Group 1')
+
+    def _build_ldap_user(self, group_names):
+        """
+        Construct a mock _LDAPUser whose LDAP group search returns the given names.
+        """
+        ldap_user = MagicMock()
+        ldap_user._user = self.user
+        ldap_user._get_groups.return_value.get_group_names.return_value = group_names
+        # Disable allow/deny list handling
+        ldap_user.settings.MIRROR_GROUPS_EXCEPT = None
+        ldap_user.settings.MIRROR_GROUPS = None
+        return ldap_user
+
+    def test_mirror_groups_ignores_empty_names(self):
+        """
+        An LDAP group search returning an empty or null name must not attempt to
+        create a Group with a null name (see #21310).
+        """
+        ldap_user = self._build_ldap_user({'Group 1', '', None})
+
+        _mirror_groups(ldap_user)
+
+        # No group with a null or empty name should have been created
+        self.assertFalse(Group.objects.filter(name__isnull=True).exists())
+        self.assertFalse(Group.objects.filter(name='').exists())
+        # The user should be mirrored into the one valid, matching group
+        self.assertListEqual(
+            ['Group 1'],
+            list(self.user.groups.values_list('name', flat=True))
+        )
+
+
+class LDAPBackendTest(SimpleTestCase):
+    """The LDAP backend reads ldap_config.py from the active configuration directory."""
+
+    def test_backend_loads_ldap_config_from_configuration_dir(self):
+        with override_settings(CONFIGURATION_DIR='/srv/netbox/conf', NETBOX_INSTALL_MODE='checkout'):
+            backend, loader = self._build_backend()
+        loader.assert_called_once_with('/srv/netbox/conf', allow_legacy_fallback=True)
+        self.assertEqual(backend.settings.SERVER_URI, 'ldaps://example')
+
+    def test_backend_disables_legacy_fallback_for_wheel_installs(self):
+        with override_settings(CONFIGURATION_DIR='/opt/netbox/conf', NETBOX_INSTALL_MODE='wheel'):
+            backend, loader = self._build_backend()
+        loader.assert_called_once_with('/opt/netbox/conf', allow_legacy_fallback=False)
+        self.assertEqual(backend.settings.SERVER_URI, 'ldaps://example')
+
+    def _build_backend(self):
+        fake_ldap = ModuleType('ldap')
+        fake_ldap.set_option = MagicMock()
+        backend_module = ModuleType('django_auth_ldap.backend')
+        backend_module.LDAPSettings = type('LDAPSettings', (), {'_prefix': 'AUTH_LDAP_'})
+        package = ModuleType('django_auth_ldap')
+        package.backend = backend_module
+        ldap_config = ModuleType('netbox.ldap_config')
+        ldap_config.AUTH_LDAP_SERVER_URI = 'ldaps://example'
+        with (
+            patch.dict(sys.modules, {
+                'ldap': fake_ldap,
+                'django_auth_ldap': package,
+                'django_auth_ldap.backend': backend_module,
+            }),
+            patch('netbox.authentication.NBLDAPBackend', MagicMock(), create=True),
+            patch('netbox.authentication.load_ldap_config', return_value=ldap_config) as loader,
+        ):
+            backend = LDAPBackend()
+        return backend, loader
+
+
 class ObjectPermissionAPIViewTestCase(TestCase):
     client_class = APIClient
 
@@ -697,3 +791,487 @@ class ObjectPermissionAPIViewTestCase(TestCase):
         url = reverse('dcim-api:rack-detail', kwargs={'pk': self.racks[0].pk})
         response = self.client.delete(url, format='json', **self.header)
         self.assertEqual(response.status_code, 204)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=[])
+    def test_sync_object(self):
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///tmp/netbox-datasource/',
+        )
+        file_data = b'{{ synced }}'
+        datafile = DataFile.objects.create(
+            source=datasource,
+            path='exports/devices.j2',
+            last_updated=now(),
+            size=len(file_data),
+            hash=hashlib.sha256(file_data).hexdigest(),
+            data=file_data,
+        )
+        # Bind the file without calling clean(), leaving the stored content unsynchronized
+        allowed = ExportTemplate.objects.create(
+            name='Allowed',
+            template_code='{# placeholder #}',
+            data_source=datasource,
+            data_file=datafile,
+            data_path=datafile.path,
+        )
+        forbidden = ExportTemplate.objects.create(
+            name='Forbidden',
+            template_code='{# placeholder #}',
+            data_source=datasource,
+            data_file=datafile,
+            data_path=datafile.path,
+        )
+        url_allowed = reverse('extras-api:exporttemplate-sync', kwargs={'pk': allowed.pk})
+        url_forbidden = reverse('extras-api:exporttemplate-sync', kwargs={'pk': forbidden.pk})
+
+        # Attempt to sync an object without permission
+        response = self.client.post(url_allowed, **self.header)
+        self.assertEqual(response.status_code, 403)
+
+        # Assign object permission. No add permission is granted: the sync action is governed by its own.
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            constraints={'name': 'Allowed'},
+            actions=['sync']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(ExportTemplate))
+
+        # Attempt to sync a non-permitted object
+        response = self.client.post(url_forbidden, **self.header)
+        self.assertEqual(response.status_code, 404)
+        forbidden.refresh_from_db()
+        self.assertEqual(forbidden.template_code, '{# placeholder #}')
+        self.assertIsNone(forbidden.data_synced)
+
+        # Sync a permitted object
+        response = self.client.post(url_allowed, **self.header)
+        self.assertEqual(response.status_code, 200)
+        allowed.refresh_from_db()
+        self.assertEqual(allowed.template_code, '{{ synced }}')
+        self.assertIsNotNone(allowed.data_synced)
+
+        # Session authentication is permitted alongside token authentication
+        self.client.force_login(self.user)
+        response = self.client.post(url_allowed)
+        self.assertEqual(response.status_code, 200)
+        self.client.logout()
+
+        # A read-only token cannot sync, and is refused before the object is touched
+        allowed.refresh_from_db()
+        data_synced = allowed.data_synced
+        self.token.write_enabled = False
+        self.token.save()
+        response = self.client.post(url_allowed, **self.header)
+        self.assertEqual(response.status_code, 403)
+        allowed.refresh_from_db()
+        self.assertEqual(allowed.data_synced, data_synced)
+
+    @override_settings(EXEMPT_VIEW_PERMISSIONS=[])
+    def test_sync_object_with_permissions_override(self):
+        """A viewset declaring its own get_permissions() still reaches the mixin's sync branch."""
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///tmp/netbox-datasource/',
+        )
+        file_data = b'{{ synced }}'
+        datafile = DataFile.objects.create(
+            source=datasource,
+            path='configs/device.j2',
+            last_updated=now(),
+            size=len(file_data),
+            hash=hashlib.sha256(file_data).hexdigest(),
+            data=file_data,
+        )
+        configtemplate = ConfigTemplate.objects.create(
+            name='Config Template 1',
+            template_code='{# placeholder #}',
+            data_source=datasource,
+            data_file=datafile,
+            data_path=datafile.path,
+        )
+
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['sync']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(ConfigTemplate))
+
+        url = reverse('extras-api:configtemplate-sync', kwargs={'pk': configtemplate.pk})
+        response = self.client.post(url, **self.header)
+        self.assertEqual(response.status_code, 200)
+        configtemplate.refresh_from_db()
+        self.assertEqual(configtemplate.template_code, '{{ synced }}')
+        self.assertIsNotNone(configtemplate.data_synced)
+
+
+class ObjectPermissionProxyModelTestCase(TestCase):
+    """
+    Object-level permission checks against proxy models (e.g. extras.ScriptModule proxying
+    core.ManagedFile) must evaluate the permission rather than raise ValueError.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.managed_file = ManagedFile.objects.create(
+            file_root=ManagedFileRootPathChoices.SCRIPTS,
+            file_path='proxy_permission_test.py'
+        )
+        cls.script_module = ScriptModule.objects.get(pk=cls.managed_file.pk)
+
+    def _grant_scriptmodule_permission(self, constraints=None):
+        obj_perm = ObjectPermission(name='ScriptModule change', actions=['change'], constraints=constraints)
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(ScriptModule, for_concrete_model=False))
+
+    def test_has_perm_cross_app_proxy_model(self):
+        """An unconstrained proxy-model permission grants access to a proxy instance."""
+        self._grant_scriptmodule_permission()
+        self.assertTrue(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_cross_app_proxy_model_matching_constraints(self):
+        """A constrained proxy-model permission grants access when the instance matches."""
+        self._grant_scriptmodule_permission(constraints={'file_path': 'proxy_permission_test.py'})
+        self.assertTrue(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_cross_app_proxy_model_nonmatching_constraints(self):
+        """A constrained proxy-model permission denies access when the instance does not match."""
+        self._grant_scriptmodule_permission(constraints={'file_path': 'other.py'})
+        self.assertFalse(self.user.has_perm('extras.change_scriptmodule', self.script_module))
+
+    def test_has_perm_invalid_permission_object_pair(self):
+        """A permission checked against an object of an unrelated model denies instead of raising."""
+        site = Site.objects.create(name='Proxy Test Site', slug='proxy-test-site')
+        self._grant_scriptmodule_permission()
+        self.assertFalse(self.user.has_perm('extras.change_scriptmodule', site))
+
+    @override_settings(DEFAULT_PERMISSIONS={'extras.change_nosuchmodel': None})
+    def test_has_perm_unknown_model_permission(self):
+        """A permission naming a nonexistent model denies and logs a warning instead of raising."""
+        self._grant_scriptmodule_permission()
+        with self.assertLogs('netbox.auth.ObjectPermissionBackend', level='WARNING'):
+            self.assertFalse(self.user.has_perm('extras.change_nosuchmodel', self.script_module))
+
+
+class SSOLoginButtonTestCase(DjangoTestCase):
+    """
+    Verify that the SSO buttons on the login page initiate authentication via POST. The social auth
+    begin view accepts only POST requests, so rendering these as plain links yields an HTTP 405
+    (see #23042).
+    """
+    SSO_BACKENDS = [
+        'social_core.backends.google.GoogleOAuth2',
+        'netbox.authentication.ObjectPermissionBackend',
+    ]
+
+    def setUp(self):
+        # load_backends() caches the discovered backends in a module-level dict, so isolate the
+        # backends overridden below from the remainder of the test suite.
+        cache_patcher = patch.dict('social_core.backends.utils.BACKENDSCACHE', {}, clear=True)
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
+
+    def get_sso_form(self, response):
+        """
+        Return the body of the rendered SSO form. The password login form renders its own hidden
+        `next` field, so assertions about the SSO parameters must be scoped to this form.
+        """
+        begin_url = reverse('social_auth_begin', args=['google-oauth2'])
+        match = re.search(
+            rf'<form[^>]*action="{re.escape(begin_url)}"[^>]*>(.*?)</form>',
+            response.content.decode(),
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(match, "No SSO form found on the login page")
+
+        return match.group(1)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_sso_button_submits_post(self):
+        """
+        Each SSO button must be rendered as a POST form (including a CSRF token) rather than a link.
+        """
+        begin_url = reverse('social_auth_begin', args=['google-oauth2'])
+        response = self.client.get(reverse('login'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, f'action="{begin_url}" method="post"')
+        self.assertContains(response, 'csrfmiddlewaretoken')
+        # A GET request to the begin view returns an HTTP 405
+        self.assertNotContains(response, f'href="{begin_url}"')
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_next_rendered_as_hidden_field(self):
+        """
+        The post-login redirect URL must be rendered as a form field: the begin view reads `next`
+        only from the POST data, so a query string parameter would be ignored.
+        """
+        response = self.client.get(reverse('login'), {'next': '/dcim/sites/'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertInHTML(
+            '<input type="hidden" name="next" value="/dcim/sites/" />',
+            self.get_sso_form(response)
+        )
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_next_retained_after_failed_login(self):
+        """
+        The login page is re-rendered as the response to a POST when authentication fails, at which
+        point `next` must still be conveyed to the SSO forms.
+        """
+        response = self.client.post(reverse('login'), {
+            'username': 'nonexistentuser',
+            'password': 'wrongpassword',
+            'next': '/dcim/sites/',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertInHTML(
+            '<input type="hidden" name="next" value="/dcim/sites/" />',
+            self.get_sso_form(response)
+        )
+
+    def get_saml_auth_backends(self, request, backends):
+        """
+        Return the auth backends for the given request, with two SAML IdPs configured. (The SAML
+        backend cannot be loaded here, as python3-saml is an optional dependency.)
+        """
+        with (
+            patch('account.views.load_backends', return_value={name: MagicMock() for name in backends}),
+            patch('account.views.get_saml_idps', return_value=['idp1', 'idp2']),
+        ):
+            return LoginView().get_auth_backends(request)
+
+    def test_saml_idp_params(self):
+        """
+        Each SAML IdP must be assigned its own `idp` form field.
+        """
+        request = RequestFactory().get(reverse('login'))
+        auth_backends = self.get_saml_auth_backends(request, ['saml'])
+
+        self.assertEqual(len(auth_backends), 2)
+        self.assertEqual([b['params'] for b in auth_backends], [{'idp': 'idp1'}, {'idp': 'idp2'}])
+
+    def test_next_retained_for_backends_after_saml(self):
+        """
+        Every backend must convey `next`, including those enumerated after SAML (which contributes
+        one entry per configured IdP).
+        """
+        request = RequestFactory().get(reverse('login'), {'next': '/dcim/sites/'})
+        auth_backends = self.get_saml_auth_backends(request, ['saml', 'google-oauth2'])
+
+        self.assertEqual(len(auth_backends), 3)
+        for auth_backend in auth_backends:
+            self.assertEqual(auth_backend['params'].get('next'), '/dcim/sites/')
+
+
+class SocialAuthBeginViewTestCase(DjangoTestCase):
+    """
+    Verify the view which initiates an SSO login. Chromium-based browsers evaluate the CSP
+    `form-action` directive against every hop in a form submission's redirect chain, so redirecting
+    the submission to the identity provider is blocked wherever `form-action 'self'` is enforced.
+    Clients which ask for JSON are handed the identity provider's URL to navigate to instead
+    (see #23112).
+    """
+    SSO_BACKENDS = [
+        'social_core.backends.google.GoogleOAuth2',
+        'netbox.authentication.ObjectPermissionBackend',
+    ]
+    AUTHORIZATION_URL = 'https://accounts.google.com/o/oauth2/auth'
+    # Stands in for the document rendered by a backend which does not redirect (see BaseAuth.start())
+    AUTH_HTML = '<html><body><form id="openid_message" action="https://idp.example.com/"></form></body></html>'
+
+    def setUp(self):
+        # load_backends() caches the discovered backends in a module-level dict, so isolate the
+        # backends overridden below from the remainder of the test suite.
+        cache_patcher = patch.dict('social_core.backends.utils.BACKENDSCACHE', {}, clear=True)
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
+
+        self.url = reverse('social_auth_begin', args=['google-oauth2'])
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_json_request_returns_authorization_url(self):
+        """
+        A client which requests JSON receives the identity provider's URL in the response body
+        rather than an HTTP redirect, so that it can navigate there itself.
+        """
+        response = self.client.post(self.url, headers={'accept': 'application/json'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Content-Type'], 'application/json')
+        self.assertNotIn('Location', response.headers)
+        self.assertTrue(response.json()['url'].startswith(self.AUTHORIZATION_URL))
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_form_submission_returns_redirect(self):
+        """
+        A client which has not asked for JSON (e.g. a browser with JavaScript disabled) receives the
+        unmodified redirect from python-social-auth.
+        """
+        response = self.client.post(self.url, headers={'accept': 'text/html'})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].startswith(self.AUTHORIZATION_URL))
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_session_state_recorded(self):
+        """
+        The anti-forgery state conveyed to the identity provider must be recorded in the session, as
+        the completion view compares the two. This is what makes the JSON response safe to follow:
+        the session established here is the one the callback is validated against.
+        """
+        response = self.client.post(self.url, headers={'accept': 'application/json'})
+
+        state = self.client.session['google-oauth2_state']
+        self.assertIn(f'state={state}', response.json()['url'])
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_next_recorded_in_session(self):
+        """
+        The post-login URL is read from the POST data by do_auth() and stashed in the session; the
+        wrapper must not interfere with the form fields rendered on the login page.
+        """
+        self.client.post(self.url, {'next': '/dcim/sites/'}, headers={'accept': 'application/json'})
+
+        self.assertEqual(self.client.session['next'], '/dcim/sites/')
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_get_request_not_allowed(self):
+        """
+        Authentication must be initiated by POST: a GET request is trivially forgeable, which is why
+        social-auth-app-django restricts its own begin view to POST.
+        """
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 405)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_csrf_token_required(self):
+        """
+        CSRF protection must be retained, so that a third party cannot silently initiate an SSO
+        login on the user's behalf.
+        """
+        client = Client(enforce_csrf_checks=True)
+        response = client.post(self.url, headers={'accept': 'application/json'})
+
+        self.assertEqual(response.status_code, 403)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_response_is_not_cached(self):
+        """
+        The authorization URL embeds a single-use state parameter and must never be cached.
+        """
+        response = self.client.post(self.url, headers={'accept': 'application/json'})
+
+        self.assertIn('no-store', response.headers['Cache-Control'])
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    def test_unknown_backend(self):
+        """
+        An unconfigured backend yields an HTTP 404, as it does via python-social-auth directly.
+        """
+        response = self.client.post(reverse('social_auth_begin', args=['nosuchbackend']))
+
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    @patch('social_core.backends.google.GoogleOAuth2.uses_redirect', return_value=False)
+    @patch('social_core.backends.google.GoogleOAuth2.auth_html', return_value=AUTH_HTML)
+    def test_json_request_returns_html_for_non_redirecting_backend(self, _auth_html, _uses_redirect):
+        """
+        A backend which renders its own HTML rather than redirecting has that document returned in
+        the response body. The client renders it in place: were it made to submit the form to fetch
+        the document again, the login would be initiated a second time.
+        """
+        response = self.client.post(self.url, headers={'accept': 'application/json'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Content-Type'], 'application/json')
+        self.assertNotIn('Location', response.headers)
+        self.assertEqual(response.json()['html'], self.AUTH_HTML)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    @patch('social_core.backends.google.GoogleOAuth2.uses_redirect', return_value=False)
+    @patch('social_core.backends.google.GoogleOAuth2.auth_html', return_value=AUTH_HTML)
+    def test_html_passed_through_for_non_redirecting_backend(self, _auth_html, _uses_redirect):
+        """
+        A client which has not asked for JSON receives that same document unmodified.
+        """
+        response = self.client.post(self.url, headers={'accept': 'text/html'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content.decode(), self.AUTH_HTML)
+
+    @override_settings(AUTHENTICATION_BACKENDS=SSO_BACKENDS)
+    @patch('account.views.social_auth_begin', side_effect=lambda *args, **kwargs: HttpResponse(status=502))
+    def test_json_request_passes_through_error_response(self, _begin):
+        """
+        Only a redirect or a rendered document is translated to JSON. An unsuccessful response is
+        passed through as-is, so that the client reports the failure rather than mistaking the
+        response for a login it can act on.
+        """
+        response = self.client.post(self.url, headers={'accept': 'application/json'})
+
+        self.assertEqual(response.status_code, 502)
+        self.assertNotEqual(response.headers.get('Content-Type'), 'application/json')
+
+
+class SocialAuthExceptionMiddlewareTestCase(SimpleTestCase):
+    """
+    Verify that SSO/SAML authentication failures are surfaced as a login-page message rather than
+    bubbling up as an HTTP 500 (see #22346).
+    """
+    GENERIC_MESSAGE = "Single sign-on failed. Please try again or contact your administrator."
+
+    class FakeStrategy:
+        # Mirror social_core's DjangoStrategy.setting(), which reads SOCIAL_AUTH_<NAME> from Django
+        # settings. This ensures the test exercises the real configured values (e.g.
+        # SOCIAL_AUTH_LOGIN_ERROR_URL) rather than hardcoded stand-ins.
+        def setting(self, name, default=None, backend=None):
+            return getattr(settings, f'SOCIAL_AUTH_{name}', default)
+
+    class FakeBackend:
+        name = 'saml'
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        self.middleware = SocialAuthExceptionMiddleware(lambda request: None)
+
+    def _make_request(self):
+        request = self.factory.get('/')
+        request.social_strategy = self.FakeStrategy()
+        request.backend = self.FakeBackend()
+        # Attach message storage (normally provided by MessageMiddleware)
+        setattr(request, 'session', {})
+        request._messages = FallbackStorage(request)
+        return request
+
+    def test_generic_message(self):
+        """
+        The raw exception text should never be surfaced to the user.
+        """
+        request = self._make_request()
+        exception = AuthFailed(self.FakeBackend(), 'raw internal SAML detail')
+        self.assertEqual(self.middleware.get_message(request, exception), self.GENERIC_MESSAGE)
+
+    def test_redirect_on_failure(self):
+        """
+        A SocialAuthBaseException should redirect to the login page with the generic message set.
+        """
+        request = self._make_request()
+        exception = AuthFailed(self.FakeBackend(), 'raw internal SAML detail')
+        response = self.middleware.process_exception(request, exception)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.url, settings.SOCIAL_AUTH_LOGIN_ERROR_URL)
+        self.assertEqual(response.url, settings.LOGIN_URL)
+        messages = [str(m) for m in request._messages]
+        self.assertEqual(messages, [self.GENERIC_MESSAGE])

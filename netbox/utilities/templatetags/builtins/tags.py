@@ -1,5 +1,5 @@
 import logging
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from django import template
 from django.templatetags.static import static
@@ -7,19 +7,28 @@ from django.utils.safestring import mark_safe
 
 from extras.choices import CustomFieldTypeChoices
 from utilities.querydict import dict_to_querydict
+from utilities.validators import url_scheme_is_allowed
 
 __all__ = (
     'badge',
     'checkmark',
     'copy_content',
     'customfield_value',
-    'htmx_table',
     'formaction',
+    'htmx_table',
     'static_with_params',
     'tag',
 )
 
 register = template.Library()
+
+# Query parameters which indicate that a URL has been cryptographically signed by the storage
+# backend. Parameters must not be appended to such URLs, as doing so invalidates the signature.
+SIGNED_URL_PARAMS = (
+    'signature',         # AWS signature v2; Google Cloud Storage v2
+    'x-amz-signature',   # AWS signature v4 (also MinIO, Ceph, Garage, Cloudflare R2, et al.)
+    'x-goog-signature',  # Google Cloud Storage v4
+)
 
 
 @register.inclusion_tag('builtins/tag.html')
@@ -46,30 +55,51 @@ def customfield_value(customfield, value):
         customfield: A CustomField instance
         value: The custom field value applied to an object
     """
+    color = None
+    value_has_colors = False
+    # Determines whether a URL value may be rendered as a clickable link
+    url_allowed = False
+
     if value:
         if customfield.type == CustomFieldTypeChoices.TYPE_SELECT:
+            color = customfield.get_choice_color(value)
             value = customfield.get_choice_label(value)
         elif customfield.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
-            value = [customfield.get_choice_label(v) for v in value]
+            value = [(customfield.get_choice_label(v), customfield.get_choice_color(v)) for v in value]
+            value_has_colors = any(choice_color for _, choice_color in value)
+            if not value_has_colors:
+                value = [choice_label for choice_label, _ in value]
+        elif customfield.type == CustomFieldTypeChoices.TYPE_URL:
+            # Only render as a link if the scheme is permitted by ALLOWED_URL_SCHEMES. This guards against
+            # dangerous schemes (e.g. javascript:) in values stored before validation was enforced or via
+            # paths which bypass model validation. A schemeless (relative) value is considered safe.
+            url_allowed = url_scheme_is_allowed(value)
     return {
         'customfield': customfield,
         'value': value,
+        'color': color,
+        'value_has_colors': value_has_colors,
+        'url_allowed': url_allowed,
     }
 
 
 @register.inclusion_tag('builtins/badge.html')
-def badge(value, bg_color=None, show_empty=False):
+def badge(value, bg_color=None, hex_color=None, url=None, show_empty=False):
     """
-    Display the specified number as a badge.
+    Display the specified value as a badge.
 
     Args:
         value: The value to be displayed within the badge
         bg_color: Background color CSS name
+        hex_color: Background color in hexadecimal RRGGBB format
+        url: If provided, wrap the badge in a hyperlink
         show_empty: If true, display the badge even if value is None or zero
     """
     return {
         'value': value,
         'bg_color': bg_color or 'secondary',
+        'hex_color': hex_color.lstrip('#') if hex_color else None,
+        'url': url,
         'show_empty': show_empty,
     }
 
@@ -146,6 +176,11 @@ def static_with_params(path, **params):
     parameter conflicts. A warning will be logged if any of the provided parameters
     conflict with existing parameters in the URL.
 
+    URLs which have been cryptographically signed by the storage backend (e.g. S3 presigned
+    URLs) are returned unmodified, as appending parameters to them would invalidate their
+    signature. Such URLs embed an expiration and are regenerated on each request, so they
+    require no cache-busting parameters.
+
     Args:
         path: The static file path (e.g., 'setmode.js')
         **params: Query parameters to append (e.g., v='4.3.1')
@@ -157,6 +192,8 @@ def static_with_params(path, **params):
         If any provided parameters conflict with existing URL parameters, a warning
         will be logged and the new parameter value will override the existing one.
     """
+    logger = logging.getLogger('netbox.utilities.templatetags.tags')
+
     # Get the base static URL
     static_url = static(path)
 
@@ -164,8 +201,17 @@ def static_with_params(path, **params):
     parsed = urlparse(static_url)
     existing_params = parse_qs(parsed.query)
 
+    # If the storage backend has signed the URL, return it as-is. Signature schemes such as AWS
+    # signature v4 cover the entire query string, so appending a parameter here would invalidate
+    # the signature and the request would be rejected by the storage backend.
+    if signature_params := [p for p in existing_params if p.lower() in SIGNED_URL_PARAMS]:
+        logger.debug(
+            "Static URL '%s' is signed (%s); omitting parameters %s",
+            static_url, ', '.join(signature_params), tuple(params)
+        )
+        return static_url
+
     # Check for duplicate parameters and log warnings
-    logger = logging.getLogger('netbox.utilities.templatetags.tags')
     for key, value in params.items():
         if key in existing_params:
             logger.warning(
@@ -188,3 +234,31 @@ def render(context, component):
     Render a UI component (e.g. a Panel) by calling its render() method and passing the current template context.
     """
     return mark_safe(component.render(context))
+
+
+@register.simple_tag(takes_context=True)
+def render_breadcrumbs(context):
+    """
+    Render the breadcrumb trail for the current object. The trail comprises a default root breadcrumb
+    (a link to the object's list view) followed by any breadcrumbs defined on the layout of the object's
+    base (detail) view. Resolving the trail from the base view—rather than the view currently rendering—
+    ensures that an object's detail view and all of its peer/tabbed views render the same trail. A layout
+    may suppress the default root breadcrumb (e.g. to substitute its own) via `root_breadcrumb=False`.
+    """
+    from netbox.ui.breadcrumbs import get_root_breadcrumb
+    from utilities.views import get_view
+
+    obj = context.get('object')
+    # The object on some pages (e.g. RQ workers/tasks) is not a model instance and has no associated view
+    if obj is None or not hasattr(obj, '_meta'):
+        return ''
+
+    # Pull the breadcrumbs from the layout of the object's base (detail) view
+    layout = getattr(get_view(obj), 'layout', None)
+    breadcrumbs = list(getattr(layout, 'breadcrumbs', None) or [])
+
+    # Prepend the default root breadcrumb unless the layout opts out
+    if getattr(layout, 'root_breadcrumb', True):
+        breadcrumbs.insert(0, get_root_breadcrumb(obj))
+
+    return mark_safe(''.join(breadcrumb.render(context) for breadcrumb in breadcrumbs))

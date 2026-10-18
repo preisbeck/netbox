@@ -1,22 +1,25 @@
+import copy
 import logging
 
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth import login as auth_login, logout as auth_logout, update_session_auth_hash
+from django.contrib.auth import login as auth_login
+from django.contrib.auth import logout as auth_logout
+from django.contrib.auth import update_session_auth_hash
 from django.contrib.auth.forms import AuthenticationForm, PasswordChangeForm
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.models import update_last_login
 from django.contrib.auth.signals import user_logged_in
-from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404, redirect
-from django.shortcuts import render, resolve_url
-from django.urls import reverse
+from django.http import HttpResponseRedirect, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render, resolve_url
+from django.urls import reverse, reverse_lazy
 from django.utils.decorators import method_decorator
-from django.utils.http import urlencode
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.cache import never_cache
 from django.views.decorators.debug import sensitive_post_parameters
 from django.views.generic import View
 from social_core.backends.utils import load_backends
+from social_django.views import auth as social_auth_begin
 
 from account.models import UserToken
 from core.models import ObjectChange
@@ -26,6 +29,7 @@ from extras.tables import BookmarkTable, NotificationTable, SubscriptionTable
 from netbox.authentication import get_auth_backend_display, get_saml_idps
 from netbox.config import get_config
 from netbox.ui import layout
+from netbox.ui.breadcrumbs import Breadcrumb
 from netbox.views import generic
 from users import forms
 from users.models import UserConfig
@@ -35,10 +39,10 @@ from utilities.request import safe_for_redirect
 from utilities.string import remove_linebreaks
 from utilities.views import register_model_view
 
-
 #
 # Login/logout
 #
+
 
 class LoginView(View):
     """
@@ -65,17 +69,21 @@ class LoginView(View):
             'display_name': display_name,
             'icon_name': icon_name,
             'icon_img': icon_img,
-            'url': f'{url}?{urlencode(params)}',
+            'url': url,
+            'params': dict(params),
         }
 
     def get_auth_backends(self, request):
         auth_backends = []
         saml_idps = get_saml_idps()
+        # The login page is re-rendered by post() when authentication fails, in which case the
+        # post-login URL is found in the POST data (as with redirect_to_next() below).
+        request_data = request.POST if request.method == 'POST' else request.GET
 
         for name in load_backends(settings.AUTHENTICATION_BACKENDS).keys():
-            url = reverse('social:begin', args=[name])
+            url = reverse('social_auth_begin', args=[name])
             params = {}
-            if next := request.GET.get('next'):
+            if next := request_data.get('next'):
                 params['next'] = next
             if name.lower() == 'saml' and saml_idps:
                 for idp in saml_idps:
@@ -123,8 +131,8 @@ class LoginView(View):
             # Ensure the user has a UserConfig defined. (This should normally be handled by
             # create_userconfig() on user creation.)
             if not hasattr(request.user, 'config'):
-                request.user.config = get_config()
-                UserConfig(user=request.user, data=request.user.config.DEFAULT_USER_PREFERENCES).save()
+                config = get_config()
+                UserConfig(user=request.user, data=copy.deepcopy(config.DEFAULT_USER_PREFERENCES)).save()
 
             response = self.redirect_to_next(request, logger)
 
@@ -139,9 +147,8 @@ class LoginView(View):
 
             return response
 
-        else:
-            username = form['username'].value()
-            logger.debug(f"Login form validation failed for username: {remove_linebreaks(username)}")
+        username = form['username'].value()
+        logger.debug(f"Login form validation failed for username: {remove_linebreaks(username)}")
 
         return render(request, self.template_name, {
             'form': form,
@@ -181,6 +188,50 @@ class LogoutView(View):
         response.delete_cookie('session_key')
         response.delete_cookie(settings.LANGUAGE_COOKIE_NAME)
 
+        return response
+
+
+class SocialAuthBeginView(View):
+    """
+    Initiate authentication against a social auth (SSO) backend.
+
+    This wraps python-social-auth's "begin" view, which responds with an HTTP redirect to the
+    identity provider. Chromium-based browsers evaluate the CSP `form-action` directive against
+    every hop in a form submission's redirect chain, so a deployment which serves NetBox with
+    `form-action 'self'` (a common reverse proxy default) blocks that redirect and the SSO button
+    appears to do nothing. A client which asks for JSON is given the identity provider's URL in the
+    response body instead, and navigates to it itself: `form-action` does not govern a navigation
+    initiated by a script. Any other client (e.g. a browser with JavaScript disabled) receives the
+    unmodified response from python-social-auth.
+
+    A backend which does not redirect (`uses_redirect()` is False, as for OpenID 2.0) renders its
+    own HTML instead, which is returned in the response body for the client to render in place so
+    that it need not repeat the request. This is not a way around `form-action`: that document
+    carries a form which submits itself to the identity provider, and such a submission is governed
+    by the policy wherever the document is rendered. Deployments using one of these backends still
+    require a `form-action` which admits the identity provider.
+
+    The underlying view is reused as-is so that CSRF protection, the callback URL, and the session
+    state recorded for the identity provider all remain identical to a direct form submission.
+    """
+    @method_decorator(never_cache)
+    def dispatch(self, *args, **kwargs):
+        return super().dispatch(*args, **kwargs)
+
+    def post(self, request, backend):
+        response = social_auth_begin(request, backend)
+
+        if 'application/json' in request.headers.get('Accept', ''):
+            if url := response.headers.get('Location'):
+                return JsonResponse({'url': url})
+            if response.status_code == 200:
+                # Some backends render an HTML form (which submits itself to the identity provider)
+                # rather than redirecting. Hand that document to the client to render, so that it
+                # need not repeat the request and initiate the login a second time.
+                return JsonResponse({'html': response.content.decode(response.charset)})
+
+        # Anything else (including the response to a client which has not asked for JSON) is passed
+        # through unchanged.
         return response
 
 
@@ -345,6 +396,12 @@ class UserTokenListView(LoginRequiredMixin, View):
 @register_model_view(UserToken)
 class UserTokenView(LoginRequiredMixin, View):
     layout = layout.SimpleLayout(
+        # The global UserToken list view is admin-only, so substitute the user's personal token list
+        # for the default root breadcrumb.
+        root_breadcrumb=False,
+        breadcrumbs=[
+            Breadcrumb(label=_('My API Tokens'), url=reverse_lazy('account:usertoken_list')),
+        ],
         left_panels=[
             TokenPanel(),
         ],
@@ -356,9 +413,16 @@ class UserTokenView(LoginRequiredMixin, View):
     def get(self, request, pk):
         token = get_object_or_404(UserToken.objects.filter(user=request.user), pk=pk)
 
-        return render(request, 'account/token.html', {
+        # Pop a one-time plaintext value (set by UserTokenEditView.post_save when a token is first created) and
+        # assemble the full HTTP authorization string for display. The plaintext is never persisted; popping
+        # ensures the banner only renders once.
+        plaintext = request.session.pop(f'_token_plaintext_{token.pk}', None)
+        token_auth_string = f'{token.get_auth_header_prefix()}{plaintext}' if plaintext else None
+
+        return render(request, 'users/token.html', {
             'object': token,
             'layout': self.layout,
+            'token_auth_string': token_auth_string,
         })
 
 
@@ -366,11 +430,14 @@ class UserTokenView(LoginRequiredMixin, View):
 class UserTokenEditView(generic.ObjectEditView):
     queryset = UserToken.objects.all()
     form = forms.UserTokenForm
+    template_name = 'account/usertoken_edit.html'
     default_return_url = 'account:usertoken_list'
 
     def alter_object(self, obj, request, url_args, url_kwargs):
         if not obj.pk:
             obj.user = request.user
+        # Attach the request so that UserTokenForm.save() can stash the newly-generated plaintext on the session.
+        obj._request = request
         return obj
 
 

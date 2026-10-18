@@ -1,6 +1,6 @@
 from netbox.api.routers import NetBoxRouter
-from . import views
 
+from . import views
 
 router = NetBoxRouter()
 router.APIRootView = views.DCIMRootView
@@ -12,6 +12,7 @@ router.register('sites', views.SiteViewSet)
 
 # Racks
 router.register('locations', views.LocationViewSet)
+router.register('rack-groups', views.RackGroupViewSet)
 router.register('rack-types', views.RackTypeViewSet)
 router.register('rack-roles', views.RackRoleViewSet)
 router.register('racks', views.RackViewSet)
@@ -22,12 +23,15 @@ router.register('manufacturers', views.ManufacturerViewSet)
 router.register('device-types', views.DeviceTypeViewSet)
 router.register('module-types', views.ModuleTypeViewSet)
 router.register('module-type-profiles', views.ModuleTypeProfileViewSet)
+router.register('module-bay-types', views.ModuleBayTypeViewSet)
 
 # Device type components
 router.register('console-port-templates', views.ConsolePortTemplateViewSet)
 router.register('console-server-port-templates', views.ConsoleServerPortTemplateViewSet)
 router.register('power-port-templates', views.PowerPortTemplateViewSet)
 router.register('power-outlet-templates', views.PowerOutletTemplateViewSet)
+router.register('cooling-intake-templates', views.CoolingIntakeTemplateViewSet)
+router.register('cooling-outflow-templates', views.CoolingOutflowTemplateViewSet)
 router.register('interface-templates', views.InterfaceTemplateViewSet)
 router.register('front-port-templates', views.FrontPortTemplateViewSet)
 router.register('rear-port-templates', views.RearPortTemplateViewSet)
@@ -47,6 +51,8 @@ router.register('console-ports', views.ConsolePortViewSet)
 router.register('console-server-ports', views.ConsoleServerPortViewSet)
 router.register('power-ports', views.PowerPortViewSet)
 router.register('power-outlets', views.PowerOutletViewSet)
+router.register('cooling-intakes', views.CoolingIntakeViewSet)
+router.register('cooling-outflows', views.CoolingOutflowViewSet)
 router.register('interfaces', views.InterfaceViewSet)
 router.register('front-ports', views.FrontPortViewSet)
 router.register('rear-ports', views.RearPortViewSet)
@@ -63,6 +69,7 @@ router.register('mac-addresses', views.MACAddressViewSet)
 # Cables
 router.register('cables', views.CableViewSet)
 router.register('cable-terminations', views.CableTerminationViewSet)
+router.register('cable-bundles', views.CableBundleViewSet)
 
 # Virtual chassis
 router.register('virtual-chassis', views.VirtualChassisViewSet)
@@ -70,6 +77,10 @@ router.register('virtual-chassis', views.VirtualChassisViewSet)
 # Power
 router.register('power-panels', views.PowerPanelViewSet)
 router.register('power-feeds', views.PowerFeedViewSet)
+
+# Cooling
+router.register('cooling-sources', views.CoolingSourceViewSet)
+router.register('cooling-feeds', views.CoolingFeedViewSet)
 
 # Miscellaneous
 router.register('connected-device', views.ConnectedDeviceViewSet, basename='connected-device')

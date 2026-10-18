@@ -4,34 +4,39 @@ import os
 import re
 
 from django import forms
+from django.core.exceptions import ValidationError
 from django.core.files.storage import storages
 from django.core.validators import RegexValidator
 from django.utils import timezone
 from django.utils.functional import classproperty
 from django.utils.translation import gettext as _
+from rq.exceptions import TimeoutFormatError
+from rq.utils import parse_timeout
 
+from core.choices import JobNotificationChoices
 from extras.choices import LogLevelChoices
+from extras.constants import SCRIPT_MODULE_NAME_PREFIX
 from extras.models import ScriptModule
 from ipam.formfields import IPAddressFormField, IPNetworkFormField
 from ipam.validators import MaxPrefixLengthValidator, MinPrefixLengthValidator, prefix_validator
 from utilities.forms import add_blank_choice
 from utilities.forms.fields import DynamicModelChoiceField, DynamicModelMultipleChoiceField
 from utilities.forms.widgets import DatePicker, DateTimePicker
-from .forms import ScriptForm
 
+from .forms import ScriptForm
 
 __all__ = (
     'BaseScript',
     'BooleanVar',
     'ChoiceVar',
-    'DateVar',
     'DateTimeVar',
-    'FileVar',
-    'IntegerVar',
+    'DateVar',
     'DecimalVar',
+    'FileVar',
     'IPAddressVar',
     'IPAddressWithMaskVar',
     'IPNetworkVar',
+    'IntegerVar',
     'MultiChoiceVar',
     'MultiObjectVar',
     'ObjectVar',
@@ -40,6 +45,14 @@ __all__ = (
     'TextVar',
     'get_module_and_script',
 )
+
+# Internal ScriptForm fields used to carry execution parameters (see ScriptForm in
+# extras/forms/scripts.py). These are validated/sourced separately from the script's own
+# declared variables and must never be treated as script data or surfaced as script errors.
+EXEC_PARAM_FIELDS = ('_commit', '_schedule_at', '_interval', '_notifications')
+
+# Sentinel distinguishing "argument not supplied" from an explicit None in validate_meta().
+_UNSET = object()
 
 
 #
@@ -233,10 +246,12 @@ class ObjectVar(ScriptVariable):
     :param null_option: The label to use as a "null" selection option (optional)
     :param selector: Include an advanced object selection widget to assist the user in identifying the desired
         object (optional)
+    :param quick_add: Include a widget to quickly create a new related object for assignment. (optional)
     """
     form_field = DynamicModelChoiceField
 
-    def __init__(self, model, query_params=None, context=None, null_option=None, selector=False, *args, **kwargs):
+    def __init__(self, model, query_params=None, context=None, null_option=None, selector=False, quick_add=False,
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.field_attrs.update({
@@ -245,6 +260,7 @@ class ObjectVar(ScriptVariable):
             'context': context,
             'null_option': null_option,
             'selector': selector,
+            'quick_add': quick_add,
         })
 
 
@@ -321,7 +337,7 @@ class BaseScript:
         self._current_test = None  # Tracks the current test method being run (if any)
 
         # Initiate the log
-        self.logger = logging.getLogger(f"netbox.scripts.{self.__module__}.{self.__class__.__name__}")
+        self.logger = logging.getLogger(f"netbox.scripts.{self.full_name}")
 
         # Declare the placeholder for the current request
         self.request = None
@@ -345,7 +361,12 @@ class BaseScript:
 
     @classproperty
     def module(self):
-        return self.__module__
+        # Strip the internal prefix applied when the module is loaded (see #22566) so that
+        # user-facing names (full_name, logger namespaces) reflect the original script filename.
+        name = self.__module__
+        if name.startswith(SCRIPT_MODULE_NAME_PREFIX):
+            name = name[len(SCRIPT_MODULE_NAME_PREFIX):]
+        return name
 
     @classproperty
     def class_name(self):
@@ -357,7 +378,7 @@ class BaseScript:
 
     @classmethod
     def root_module(cls):
-        return cls.__module__.split(".")[0]
+        return cls.module.split(".")[0]
 
     # Author-defined attributes
 
@@ -388,6 +409,55 @@ class BaseScript:
     @classproperty
     def scheduling_enabled(self):
         return getattr(self.Meta, 'scheduling_enabled', True)
+
+    @classproperty
+    def notifications_default(self):
+        return getattr(self.Meta, 'notifications_default', JobNotificationChoices.NOTIFICATION_ALWAYS)
+
+    @classmethod
+    def validate_meta(cls, job_timeout=_UNSET, notifications=_UNSET):
+        """
+        Validate the execution parameters used to run this script. Raises a ValidationError if any value is invalid,
+        so that a misconfigured script surfaces an actionable error rather than an unhandled exception when the job is
+        enqueued (see #22872).
+
+        The values actually enqueued are validated, not the raw Meta values: a caller may supply an explicit
+        `job_timeout` or `notifications` (e.g. via the REST API), in which case that value is checked. When a caller
+        omits a value, the corresponding Meta default is validated instead. Unset values fall back to valid defaults
+        and are not rejected.
+        """
+        errors = {}
+
+        job_timeout = cls.job_timeout if job_timeout is _UNSET else job_timeout
+        if job_timeout is not None:
+            # parse_timeout() is what RQ applies to the timeout downstream. It raises TimeoutFormatError for
+            # malformed duration strings, but a job_timeout of an unexpected type (e.g. a list) instead raises
+            # TypeError/ValueError/AssertionError from its internal int()/assert. Catch them all so any invalid value
+            # surfaces as an actionable error rather than an unhandled 500.
+            try:
+                parsed_timeout = parse_timeout(job_timeout)
+            except (TimeoutFormatError, TypeError, ValueError, AssertionError):
+                parsed_timeout = None
+                errors['job_timeout'] = _(
+                    "Invalid job_timeout value '{value}': must be an integer (seconds) or a duration string such as "
+                    "'1h' or '30m'."
+                ).format(value=job_timeout)
+            if parsed_timeout is not None and parsed_timeout <= 0:
+                errors['job_timeout'] = _(
+                    "Invalid job_timeout value '{value}': must be a positive duration."
+                ).format(value=job_timeout)
+
+        # A caller may pass notifications=None to mean "use the script's default"; treat that as unset.
+        if notifications is _UNSET or notifications is None:
+            notifications = cls.notifications_default
+        if notifications not in JobNotificationChoices.values():
+            valid = ', '.join(JobNotificationChoices.values())
+            errors['notifications_default'] = _(
+                "Invalid notifications value '{value}': must be one of {valid}."
+            ).format(value=notifications, valid=valid)
+
+        if errors:
+            raise ValidationError(errors)
 
     @property
     def filename(self):
@@ -491,7 +561,10 @@ class BaseScript:
             fieldsets.append((_('Script Data'), fields))
 
         # Append the default fieldset if defined in the Meta class
-        exec_parameters = ('_schedule_at', '_interval', '_commit') if self.scheduling_enabled else ('_commit',)
+        if self.scheduling_enabled:
+            exec_parameters = ('_schedule_at', '_interval', '_commit', '_notifications')
+        else:
+            exec_parameters = ('_commit', '_notifications')
         fieldsets.append((_('Script Execution Parameters'), exec_parameters))
 
         return fieldsets
@@ -510,6 +583,9 @@ class BaseScript:
 
         # Set initial "commit" checkbox state based on the script's Meta parameter
         form.fields['_commit'].initial = self.commit_default
+
+        # Set initial "notifications" selection based on the script's Meta parameter
+        form.fields['_notifications'].initial = self.notifications_default
 
         # Hide fields if scheduling has been disabled
         if not self.scheduling_enabled:
@@ -635,3 +711,27 @@ def get_module_and_script(module_name, script_name):
     module = ScriptModule.objects.get(file_path=f'{module_name}.py')
     script = module.scripts.get(name=script_name)
     return module, script
+
+
+def prepare_script_form(script_instance, data, files=None):
+    """
+    Return a bound ScriptForm for the given Script instance, back-filling the declared
+    `default` of any variable omitted from `data`.
+
+    `data` is copied rather than coerced to a plain dict, so a QueryDict retains the
+    multi-value semantics a MultiObjectVar's multi-select field depends on.
+    """
+    data = data.copy() if data is not None else {}
+    for name, var in script_instance._get_vars().items():
+        if name in data:
+            continue
+        if (initial := var.field_attrs.get('initial')) is None:
+            continue
+        if isinstance(initial, (list, tuple)) and hasattr(data, 'setlist'):
+            # Assigning a list to a QueryDict stores it as a single nested value, which a
+            # multi-select widget reads back as one bogus choice. Set the values individually
+            # so a MultiChoiceVar/MultiObjectVar default binds as it does for a plain dict.
+            data.setlist(name, list(initial))
+        else:
+            data[name] = initial
+    return script_instance.as_form(data=data, files=files)

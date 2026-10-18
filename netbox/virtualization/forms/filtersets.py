@@ -1,4 +1,5 @@
 from django import forms
+from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 
 from dcim.choices import *
@@ -12,17 +13,20 @@ from tenancy.forms import ContactModelFilterForm, TenancyFilterForm
 from utilities.forms import BOOLEAN_WITH_BLANK_CHOICES
 from utilities.forms.fields import DynamicModelMultipleChoiceField, TagFilterField
 from utilities.forms.rendering import FieldSet
-from virtualization.choices import *
-from virtualization.models import *
+from utilities.forms.utils import get_capacity_unit_label
 from vpn.models import L2VPN
+
+from ..choices import *
+from ..models import *
 
 __all__ = (
     'ClusterFilterForm',
     'ClusterGroupFilterForm',
     'ClusterTypeFilterForm',
+    'VMInterfaceFilterForm',
     'VirtualDiskFilterForm',
     'VirtualMachineFilterForm',
-    'VMInterfaceFilterForm',
+    'VirtualMachineTypeFilterForm',
 )
 
 
@@ -100,6 +104,51 @@ class ClusterFilterForm(TenancyFilterForm, ContactModelFilterForm, PrimaryModelF
     tag = TagFilterField(model)
 
 
+class VirtualMachineTypeFilterForm(PrimaryModelFilterSetForm):
+    model = VirtualMachineType
+
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet(
+            'default_platform_id', 'default_vcpus', 'default_memory', 'virtual_machine_count',
+            name=_('Attributes'),
+        ),
+        FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
+    )
+
+    selector_fields = ('filter_id', 'q')
+
+    default_platform_id = DynamicModelMultipleChoiceField(
+        queryset=Platform.objects.all(),
+        required=False,
+        label=_('Default platform'),
+    )
+    default_vcpus = forms.DecimalField(
+        label=_('Default vCPUs'),
+        required=False,
+    )
+    default_memory = forms.IntegerField(
+        label=_('Default memory'),
+        required=False,
+        min_value=0,
+    )
+    virtual_machine_count = forms.IntegerField(
+        label=_('Virtual machine count'),
+        required=False,
+        min_value=0,
+    )
+
+    tag = TagFilterField(model)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Set unit label based on configured RAM_BASE_UNIT (MB vs MiB)
+        self.fields['default_memory'].label = _('Default memory ({unit})').format(
+            unit=get_capacity_unit_label(settings.RAM_BASE_UNIT)
+        )
+
+
 class VirtualMachineFilterForm(
     LocalConfigContextFilterForm,
     TenancyFilterForm,
@@ -112,12 +161,19 @@ class VirtualMachineFilterForm(
         FieldSet('cluster_group_id', 'cluster_type_id', 'cluster_id', 'device_id', name=_('Cluster')),
         FieldSet('region_id', 'site_group_id', 'site_id', name=_('Location')),
         FieldSet(
-            'status', 'start_on_boot', 'role_id', 'platform_id', 'mac_address', 'has_primary_ip', 'config_template_id',
-            'local_context_data', 'serial', name=_('Attributes')
+            'virtual_machine_type_id', 'status', 'start_on_boot', 'role_id', 'platform_id', 'mac_address',
+            'has_primary_ip', 'config_template_id', 'local_context_data', 'serial',
+            name=_('Attributes')
         ),
         FieldSet('tenant_group_id', 'tenant_id', name=_('Tenant')),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
         FieldSet('contact', 'contact_role', 'contact_group', name=_('Contacts')),
+    )
+    virtual_machine_type_id = DynamicModelMultipleChoiceField(
+        queryset=VirtualMachineType.objects.all(),
+        required=False,
+        null_option='None',
+        label=_('Virtual machine type'),
     )
     cluster_group_id = DynamicModelMultipleChoiceField(
         queryset=ClusterGroup.objects.all(),
@@ -281,8 +337,14 @@ class VirtualDiskFilterForm(OwnerFilterMixin, NetBoxModelFilterSetForm):
         label=_('Virtual machine')
     )
     size = forms.IntegerField(
-        label=_('Size (MB)'),
+        label=_('Size'),
         required=False,
         min_value=1
     )
     tag = TagFilterField(model)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Set unit label based on configured DISK_BASE_UNIT (MB vs MiB)
+        self.fields['size'].label = _('Size ({unit})').format(unit=get_capacity_unit_label(settings.DISK_BASE_UNIT))

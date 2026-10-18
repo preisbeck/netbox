@@ -1,9 +1,9 @@
 from django.urls import include, path
 
-from netbox.api.routers import NetBoxRouter
 from . import views
+from .routers import ScriptRouter
 
-router = NetBoxRouter()
+router = ScriptRouter()
 router.APIRootView = views.ExtrasRootView
 
 router.register('event-rules', views.EventRuleViewSet)
@@ -25,6 +25,7 @@ router.register('journal-entries', views.JournalEntryViewSet)
 router.register('config-contexts', views.ConfigContextViewSet)
 router.register('config-context-profiles', views.ConfigContextProfileViewSet)
 router.register('config-templates', views.ConfigTemplateViewSet)
+router.register('scripts/upload', views.ScriptModuleViewSet)
 router.register('scripts', views.ScriptViewSet, basename='script')
 
 app_name = 'extras-api'

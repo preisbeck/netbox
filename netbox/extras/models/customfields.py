@@ -1,24 +1,27 @@
+import copy
 import decimal
 import json
 import re
-from datetime import datetime, date
+from datetime import date, datetime
 
 import django_filters
+import jsonschema
 from django import forms
 from django.conf import settings
-from django.contrib.postgres.fields import ArrayField
 from django.core.validators import RegexValidator, ValidationError
-from django.db import models
-from django.db.models import F, Func, Value
-from django.db.models.expressions import RawSQL
+from django.db import connections, models, router, transaction
+from django.db.models import F, Func, Q, Value
 from django.urls import reverse
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
+from jsonschema.exceptions import ValidationError as JSONValidationError
 
 from core.models import ObjectType
 from extras.choices import *
 from extras.data import CHOICE_SETS
+from extras.fields import ChoiceSetField
+from netbox.constants import ADVISORY_LOCK_KEYS
 from netbox.context import query_cache
 from netbox.models import ChangeLoggedModel
 from netbox.models.features import CloningMixin, ExportTemplatesMixin
@@ -26,15 +29,25 @@ from netbox.models.mixins import OwnerMixin
 from netbox.search import FieldTypes
 from utilities import filters
 from utilities.datetime import datetime_from_timestamp
+from utilities.exceptions import AbortRequest
 from utilities.forms.fields import (
-    CSVChoiceField, CSVModelChoiceField, CSVModelMultipleChoiceField, CSVMultipleChoiceField, DynamicChoiceField,
-    DynamicModelChoiceField, DynamicModelMultipleChoiceField, DynamicMultipleChoiceField, JSONField, LaxURLField,
+    CSVChoiceField,
+    CSVModelChoiceField,
+    CSVModelMultipleChoiceField,
+    CSVMultipleChoiceField,
+    DynamicChoiceField,
+    DynamicModelChoiceField,
+    DynamicModelMultipleChoiceField,
+    DynamicMultipleChoiceField,
+    JSONField,
+    LaxURLField,
 )
 from utilities.forms.utils import add_blank_choice
 from utilities.forms.widgets import APISelect, APISelectMultiple, DatePicker, DateTimePicker
-from utilities.querysets import RestrictedQuerySet
+from utilities.jsonschema import validate_schema
+from utilities.querysets import RestrictedQuerySet, chunked_update
 from utilities.templatetags.builtins.filters import render_markdown
-from utilities.validators import validate_regex
+from utilities.validators import url_scheme_is_allowed, validate_regex
 
 __all__ = (
     'CustomField',
@@ -55,33 +68,76 @@ SEARCH_TYPES = {
 class CustomFieldManager(models.Manager.from_queryset(RestrictedQuerySet)):
     use_in_migrations = True
 
-    def get_for_model(self, model):
+    def get_for_model(self, model, statuses=(CustomFieldStatusChoices.STATUS_ACTIVE,)):
         """
-        Return all CustomFields assigned to the given model.
+        Return a list of the CustomFields assigned to the given model which hold one of the given
+        statuses.
+
+        Only active fields are returned by default: a field awaiting a bulk update of its stored data
+        is not live, and must be invisible to every consumer of custom field data until that work
+        completes (see CustomFieldStatusChoices). This is the sole entry point by which custom fields
+        are resolved for an object, so excluding them here excludes them everywhere.
+
+        Every assigned field is fetched and cached whichever statuses are asked for, so that callers
+        wanting different subsets share one query per model per request.
+
+        Args:
+            model: The model whose custom fields are to be returned
+            statuses: The statuses to select (active only by default)
         """
-        # Check the request cache before hitting the database
         cache = query_cache.get()
-        if cache is not None:
-            if custom_fields := cache['custom_fields'].get(model._meta.model):
-                return custom_fields
 
-        content_type = ObjectType.objects.get_for_model(model._meta.concrete_model)
-        custom_fields = self.get_queryset().filter(object_types=content_type)
+        # Check the request cache before hitting the database. Test the cached value against None
+        # rather than for truthiness: a model with no custom fields caches an empty list, which
+        # would otherwise be treated as a miss and re-queried on every call.
+        custom_fields = cache['custom_fields'].get(model._meta.model) if cache is not None else None
+        if custom_fields is None:
+            content_type = ObjectType.objects.get_for_model(model._meta.concrete_model)
+            custom_fields = list(
+                self.get_queryset().filter(object_types=content_type).select_related(
+                    'related_object_type', 'choice_set'
+                )
+            )
 
-        # Populate the request cache to avoid redundant lookups
-        if cache is not None:
-            cache['custom_fields'][model._meta.model] = custom_fields
+            # Populate the request cache to avoid redundant lookups
+            if cache is not None:
+                cache['custom_fields'][model._meta.model] = custom_fields
 
-        return custom_fields
+        return [cf for cf in custom_fields if cf.status in statuses]
 
     def get_defaults_for_model(self, model):
         """
         Return a dictionary of serialized default values for all CustomFields applicable to the given model.
+
+        Fields still being provisioned are included, unlike in get_for_model(). The provisioning job
+        backfills only the objects which predate the field, so an object created while it runs must
+        pick up the default here or never receive one at all.
+
+        The defaults are assembled on each call from the fields cached by get_for_model() rather than
+        cached in their own right: building them costs a pass over a handful of objects already in
+        memory, where a second cache would have to be kept coherent with the first.
         """
-        custom_fields = self.get_for_model(model).filter(default__isnull=False)
+        custom_fields = self.get_for_model(model, statuses=CustomFieldStatusChoices.DATA_STATUSES)
+
+        # Copied so that a mutable default cannot be aliased into the object data of every object
+        # which takes it, the fields above being cached for the life of the request.
         return {
-            cf.name: cf.default for cf in custom_fields
+            cf.name: copy.deepcopy(cf.default) for cf in custom_fields if cf.default is not None
         }
+
+    @staticmethod
+    def clear_cache():
+        """
+        Discard the custom fields cached for the current request, so that a subsequent read reflects
+        a change which has been applied to the database without passing through save().
+
+        Called wherever a field's status is written directly (see CustomFieldStatusChoices): the
+        cache spans the whole of a request -- and the whole of a script or job run -- so a field
+        taken offline, brought live, or marked for deletion partway through one would otherwise
+        remain visible, or invisible, to everything which followed it there.
+        """
+        if (cache := query_cache.get()) is not None:
+            cache['custom_fields'].clear()
 
 
 class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedModel):
@@ -122,6 +178,14 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
                 inverse_match=True
             ),
         )
+    )
+    status = models.CharField(
+        max_length=50,
+        choices=CustomFieldStatusChoices,
+        default=CustomFieldStatusChoices.STATUS_ACTIVE,
+        verbose_name=_('status'),
+        help_text=_("Operational state of the field"),
+        editable=False
     )
     label = models.CharField(
         verbose_name=_('label'),
@@ -214,6 +278,13 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             'example, <code>^[A-Z]{3}$</code> will limit values to exactly three uppercase letters.'
         )
     )
+    validation_schema = models.JSONField(
+        blank=True,
+        null=True,
+        validators=[validate_schema],
+        verbose_name=_('validation schema'),
+        help_text=_('A JSON schema definition for validating the custom field value')
+    )
     choice_set = models.ForeignKey(
         to='CustomFieldChoiceSet',
         on_delete=models.PROTECT,
@@ -241,6 +312,11 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         verbose_name=_('is cloneable'),
         help_text=_('Replicate this value when cloning objects')
     )
+    nulls_first = models.BooleanField(
+        default=True,
+        verbose_name=_('nulls first'),
+        help_text=_('Sort null values before non-null values when ordering by this field')
+    )
     comments = models.TextField(
         verbose_name=_('comments'),
         blank=True
@@ -251,11 +327,15 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
     clone_fields = (
         'object_types', 'type', 'related_object_type', 'group_name', 'description', 'required', 'unique',
         'search_weight', 'filter_logic', 'default', 'weight', 'validation_minimum', 'validation_maximum',
-        'validation_regex', 'choice_set', 'ui_visible', 'ui_editable', 'is_cloneable',
+        'validation_regex', 'validation_schema', 'choice_set', 'ui_visible', 'ui_editable', 'is_cloneable',
+        'nulls_first',
     )
 
     class Meta:
         ordering = ['group_name', 'weight', 'name']
+        indexes = (
+            models.Index(fields=('group_name', 'weight', 'name')),  # Default ordering
+        )
         verbose_name = _('custom field')
         verbose_name_plural = _('custom fields')
 
@@ -285,6 +365,9 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             return self.choice_set.choices
         return []
 
+    def get_status_color(self):
+        return CustomFieldStatusChoices.colors.get(self.status)
+
     def get_ui_visible_color(self):
         return CustomFieldUIVisibleChoices.colors.get(self.ui_visible)
 
@@ -296,34 +379,254 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             self._choice_map = dict(self.choices)
         return self._choice_map.get(value, value)
 
-    def populate_initial_data(self, content_types):
+    def get_choice_color(self, value):
+        if self.choice_set:
+            return self.choice_set.get_choice_color(value)
+        return None
+
+    def resolve_selection_value(self, value):
+        """
+        For a Selection or Multiple selection field, wrap the value(s) with their resolved label as
+        {'value': ..., 'label': ...} (a list thereof for multi-select). Other field types pass through
+        unchanged. Shared by the REST API and GraphQL so selection labels resolve consistently (#20897).
+        """
+        if value is None:
+            return value
+        if self.type == CustomFieldTypeChoices.TYPE_SELECT:
+            return {'value': value, 'label': self.get_choice_label(value)}
+        if self.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
+            return [{'value': v, 'label': self.get_choice_label(v)} for v in value]
+        return value
+
+    @staticmethod
+    def data_lock_key(pk):
+        """
+        The advisory lock which serializes bulk updates of a field's stored data against one another
+        and against its deletion, keyed by primary key so that work on one field never waits on
+        another.
+        """
+        return ADVISORY_LOCK_KEYS['custom-field-data'], pk
+
+    @classmethod
+    def _try_lock_data(cls, pk, using):
+        """
+        Take the field's data lock at transaction scope, returning False if it is held elsewhere.
+        Never waits: a job holds this lock for the duration of its bulk update, which may run for
+        hours (see CUSTOMFIELD_JOB_TIMEOUT).
+        """
+        with connections[using].cursor() as cursor:
+            cursor.execute('SELECT pg_try_advisory_xact_lock(%s, %s)', cls.data_lock_key(pk))
+            return cursor.fetchone()[0]
+
+    def _lock_status(self, using):
+        """
+        Re-read the field's status under a row lock, returning None where the row no longer exists.
+
+        The status is not taken from this instance, which a job or a concurrent request may have
+        changed since it was fetched, and which must not change between being checked by the caller
+        and the field being marked below.
+        """
+        return self.__class__.objects.using(using).select_for_update().filter(
+            pk=self.pk
+        ).values_list('status', flat=True).first()
+
+    @staticmethod
+    def _update_object_data(model, filters=None, commit_per_batch=False, **update_kwargs):
+        """
+        Apply an UPDATE to the custom_field_data of every instance of the given model, in batches
+        of at most BULK_UPDATE_CHUNK_SIZE rows. Bounding the number of rows touched by each statement
+        keeps a very large table from exceeding the database statement timeout, as a JSONB update
+        rewrites each affected row in full.
+
+        :param filters: Optional Q object restricting which rows are updated. Negate it to address
+            the rows which do not match instead.
+        :param commit_per_batch: Commit each batch independently rather than wrapping them all in a
+            single transaction, so that a long-running job does not hold row locks for its whole
+            duration. Only for updates which can safely be resumed.
+        """
+        return chunked_update(
+            model.objects.filter(filters or Q()),
+            commit_per_batch=commit_per_batch,
+            **update_kwargs,
+        )
+
+    @staticmethod
+    def _exceeds_inline_limit(content_types):
+        """
+        Return True if a bulk update of custom field data across the given object types is too large
+        to perform within the request which triggered it, and must be handed to a background job
+        instead. The limit is BULK_UPDATE_CHUNK_SIZE objects across all of the given types: an
+        update which fits within a single statement is comfortably within any request timeout.
+
+        The rows are probed rather than counted: `COUNT(*)` reads the whole table, whereas counting
+        one primary key more than the limit costs the same on a table of ten million rows as on one
+        of ten thousand. Only the primary key is selected, and the model's default ordering cleared,
+        to keep the probe to an index-only scan.
+
+        On the deletion path this over-estimates, as every row of the type is counted where
+        remove_stale_data() would rewrite only those holding the field's key. Probing the key
+        instead would match the work exactly, but custom_field_data carries no index, so the LIMIT
+        could not bound the scan.
+        """
+        # Setting BULK_UPDATE_CHUNK_SIZE to None disables chunking, so the update would be issued
+        # as a single unbounded statement -- precisely what must not run inside a request. Treat any
+        # affected object as exceeding the limit, handing the work to the job, which issues that one
+        # statement under a timeout generous enough to survive it (see CUSTOMFIELD_JOB_TIMEOUT). A
+        # limit of zero leaves the probe below testing for a single row, so a field affecting no
+        # objects still needs no job.
+        limit = settings.BULK_UPDATE_CHUNK_SIZE
+        remaining = 0 if limit is None else limit
+
+        for ct in content_types:
+            if model := ct.model_class():
+                remaining -= model.objects.order_by().values_list('pk', flat=True)[:remaining + 1].count()
+                if remaining < 0:
+                    return True
+        return False
+
+    def provision_data(self, object_types):
+        """
+        Populate the field's default value across the existing objects of the given object types.
+
+        Where too many objects are affected to handle within the request, the field is taken offline
+        and the backfill handed to a background job: it does not go live until the job has finished
+        (see CustomFieldStatusChoices).
+
+        Assignment to a field which is not live is refused, as CustomField.clean() refuses every
+        other change to one: its configuration must not move under the job which is acting on it.
+        Were a second backfill deferred here, it would carry only the object types passed to it, and
+        whichever of the two jobs ran first would bring the field live -- leaving the other to find
+        a field it no longer matched, and its own object types silently unprovisioned.
+        """
+        from extras.jobs import CustomFieldProvisioningJob
+
+        using = router.db_for_write(self.__class__, instance=self)
+
+        with transaction.atomic(using=using):
+
+            # The status is re-read under a row lock rather than taken from this instance
+            self.status = self._lock_status(using)
+            if self.status is None:
+                # Deleted by a concurrent request since this instance was fetched; there is no field
+                # left to assign. Reported rather than ignored, as the assignment has not been applied.
+                raise AbortRequest(
+                    _("Custom field '{name}' no longer exists.").format(name=self.name)
+                )
+
+            if self.status != CustomFieldStatusChoices.STATUS_ACTIVE:
+                raise AbortRequest(
+                    _("Custom field '{name}' cannot be assigned to additional object types while its "
+                      "stored data is being updated (status: {status}).").format(
+                        name=self.name, status=self.get_status_display().lower()
+                    )
+                )
+
+            if self.default is None:
+                return
+
+            object_types = list(object_types)
+            if not self._exceeds_inline_limit(object_types):
+                self.populate_initial_data(object_types)
+                return
+
+            self.status = CustomFieldStatusChoices.STATUS_PROVISIONING
+            # Applied via the queryset so that taking the field offline does not itself record a change.
+            self.__class__.objects.using(using).filter(pk=self.pk).update(status=self.status)
+            self.__class__.objects.clear_cache()
+
+            # Deferred until commit so that the worker cannot observe the field before it is marked.
+            # The types are carried to the job, which cannot otherwise know which of the field's
+            # assignments are the new ones.
+            transaction.on_commit(
+                lambda: CustomFieldProvisioningJob.enqueue_for(
+                    self, object_type_pks=[ct.pk for ct in object_types]
+                ),
+                using=using
+            )
+
+    def remove_data(self, object_types):
+        """
+        Remove the field's stored data from the existing objects of the given object types, as the
+        field is unassigned from them.
+
+        Unassignment from a field which is not live is refused, as provision_data() refuses an
+        assignment to one. The job acting on the field's data carries the object types it was given
+        and would not observe an unassignment made under it: it would write its defaults into objects
+        the removal had already swept, then bring the field live with values left on objects it no
+        longer applies to.
+
+        Unlike provisioning and deletion, this is never deferred to a job. Only the objects which
+        actually hold a value for the field are rewritten, which on an unassignment is typically a
+        small fraction of the table (see the note in the custom fields documentation).
+        """
+        using = router.db_for_write(self.__class__, instance=self)
+
+        with transaction.atomic(using=using):
+
+            # The status is re-read under a row lock rather than taken from this instance, which a
+            # job may have taken offline since it was fetched, and which must not change between the
+            # check below and the data being removed.
+            self.status = self._lock_status(using)
+
+            if self.status is None:
+                # Deleted by a concurrent request since this instance was fetched; whatever data
+                # remains belongs to the deletion, which removes it in full.
+                raise AbortRequest(
+                    _("Custom field '{name}' no longer exists.").format(name=self.name)
+                )
+
+            if self.status != CustomFieldStatusChoices.STATUS_ACTIVE:
+                raise AbortRequest(
+                    _("Custom field '{name}' cannot be unassigned from object types while its "
+                      "stored data is being updated (status: {status}).").format(
+                        name=self.name, status=self.get_status_display().lower()
+                    )
+                )
+
+            self.remove_stale_data(object_types)
+
+    def populate_initial_data(self, content_types, commit_per_batch=False):
         """
         Populate initial custom field data upon either a) the creation of a new CustomField, or
         b) the assignment of an existing CustomField to new object types.
+
+        Objects which already hold a key for the field are left alone, making this idempotent -- as
+        a retried job requires, and as committing the backfill in batches relies on. (Note that a
+        cleared value is a JSON null rather than an absent key, and so is likewise preserved.)
         """
         if self.default is None:
-            # We have to convert None to a JSON null for jsonb_set()
-            value = RawSQL("'null'::jsonb", [])
-        else:
-            value = Value(self.default, models.JSONField())
-        for ct in content_types:
-            ct.model_class().objects.update(
-                custom_field_data=Func(
-                    F('custom_field_data'),
-                    Value([self.name]),
-                    value,
-                    function='jsonb_set'
-                )
-            )
+            return
 
-    def remove_stale_data(self, content_types):
+        value = Value(self.default, models.JSONField())
+        for ct in content_types:
+            if model := ct.model_class():
+                self._update_object_data(
+                    model,
+                    filters=~Q(custom_field_data__has_key=self.name),
+                    commit_per_batch=commit_per_batch,
+                    custom_field_data=Func(
+                        F('custom_field_data'),
+                        Value([self.name]),
+                        value,
+                        function='jsonb_set'
+                    )
+                )
+
+    def remove_stale_data(self, content_types, commit_per_batch=False):
         """
         Delete custom field data which is no longer relevant (either because the CustomField is
         no longer assigned to a model, or because it has been deleted).
+
+        Only objects which actually hold a value for the field are rewritten. That typically excludes
+        the bulk of the table, and makes this idempotent -- as committing the removal in batches
+        relies on -- since a row is dropped from the queryset by the update which removes its key.
         """
         for ct in content_types:
             if model := ct.model_class():
-                model.objects.update(
+                self._update_object_data(
+                    model,
+                    filters=Q(custom_field_data__has_key=self.name),
+                    commit_per_batch=commit_per_batch,
                     custom_field_data=F('custom_field_data') - self.name
                 )
 
@@ -333,20 +636,110 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         one, copying the value of the old key.
         """
         for ct in self.object_types.all():
-            ct.model_class().objects.update(
-                custom_field_data=Func(
-                    F('custom_field_data') - old_name,
-                    Value([new_name]),
-                    Func(
-                        F('custom_field_data'),
-                        function='jsonb_extract_path_text',
-                        template=f"to_jsonb(%(expressions)s -> '{old_name}')"
-                    ),
-                    function='jsonb_set')
-            )
+            if model := ct.model_class():
+                self._update_object_data(
+                    model,
+                    filters=Q(custom_field_data__has_key=old_name),
+                    custom_field_data=Func(
+                        F('custom_field_data') - old_name,
+                        Value([new_name]),
+                        Func(
+                            F('custom_field_data'),
+                            Value(old_name),
+                            function='jsonb_extract_path',
+                            output_field=models.JSONField()
+                        ),
+                        function='jsonb_set')
+                )
+
+    def delete(self, using=None, *args, **kwargs):
+        """
+        Delete the field, deferring the removal of its stored data to a background job where too
+        many objects are affected to handle within the request (see #22996).
+
+        Where the work is deferred, the row is retained until the job completes: `name` is unique, so
+        for as long as the row exists no other field can take this name and inherit the data still
+        awaiting removal.
+
+        The deletion signals are dispatched here rather than when the row is finally removed, so that
+        protection rules, the change log, event rules and the search index observe the deletion where
+        the user performed it. They run again in the worker, where every effect beyond the protection
+        rules is gated on there being a current request, making the replay a no-op.
+
+        The deletion is refused outright if a background job holds the field's data lock, rather than
+        queueing behind that job. This applies equally to a field already pending deletion: reporting
+        a deletion which did not happen would be worse than refusing it. A field stranded in a pending
+        state by a job which never ran holds no lock, and stays deletable; retrying the deletion of
+        one already pending enqueues a fresh purge job for it.
+
+        Deleting a field already marked for deletion -- by an earlier request of the user's own, or by
+        a concurrent one -- removes nothing further and dispatches no second set of deletion signals.
+        """
+        from extras.jobs import CustomFieldPurgeJob
+
+        using = using or router.db_for_write(self.__class__, instance=self)
+
+        with transaction.atomic(using=using):
+            if not self._try_lock_data(self.pk, using):
+                raise AbortRequest(
+                    _("Custom field '{name}' is being updated by a background job and cannot be "
+                      "deleted until that job has completed.").format(name=self.name)
+                )
+
+            # The status is re-read under a row lock rather than taken from this instance
+            self.status = self._lock_status(using)
+            if self.status is None:
+                # Already deleted outright by a concurrent request; nothing remains to delete.
+                return 0, {}
+
+            if self.status == CustomFieldStatusChoices.STATUS_DELETING:
+                # Already pending deletion; the purge job will remove the row once its data is gone.
+                # The lock being free, no job is *running*, so the one enqueued when the field was
+                # marked may never have run: enqueue another, delete() being the only route to one.
+                # Left as it is, a field whose job never ran could never be removed, and would hold
+                # its name against a replacement indefinitely. Where that job is merely queued (a
+                # concurrent deletion having just marked the field), the second job is harmless:
+                # purge_custom_field() rechecks the status under the lock and no-ops.
+                transaction.on_commit(lambda: CustomFieldPurgeJob.enqueue_for(self), using=using)
+                return 0, {}
+
+            if not self._exceeds_inline_limit(self.object_types.all()):
+                # Few enough objects to purge within the request: delete the row outright, its
+                # stored data being removed by handle_cf_deleted().
+                return super().delete(using, *args, **kwargs)
+
+            # Update the custom field's status before the signals are dispatched. Applied via the
+            # queryset to avoid emitting a spurious "updated" change record.
+            self.status = CustomFieldStatusChoices.STATUS_DELETING
+            self.__class__.objects.using(using).filter(pk=self.pk).update(status=self.status)
+            self.__class__.objects.clear_cache()
+
+            models.signals.pre_delete.send(sender=self.__class__, instance=self, using=using, origin=self)
+            models.signals.post_delete.send(sender=self.__class__, instance=self, using=using, origin=self)
+
+            # Deferred until commit so that the worker cannot observe the field before it is marked,
+            # and is not enqueued at all if the deletion is aborted.
+            transaction.on_commit(lambda: CustomFieldPurgeJob.enqueue_for(self), using=using)
+
+        return 1, {self._meta.label: 1}
+
+    def _delete_row(self):
+        """
+        Remove the row itself. Called by CustomFieldPurgeJob once the field's stored data has been
+        purged; nothing else should bypass delete().
+        """
+        return super().delete()
 
     def clean(self):
         super().clean()
+
+        # A field awaiting a bulk update of its stored data is not live, and its configuration must
+        # not change under the job which is acting on it.
+        if self.pk and self.status != CustomFieldStatusChoices.STATUS_ACTIVE:
+            raise ValidationError(
+                _("Custom field '{name}' cannot be modified while its stored data is being updated "
+                  "(status: {status}).").format(name=self.name, status=self.get_status_display().lower())
+            )
 
         # Validate the field's default value (if any)
         if self.default is not None:
@@ -379,6 +772,12 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         if self.validation_regex and self.type not in regex_types:
             raise ValidationError({
                 'validation_regex': _("Regular expression validation is supported only for text and URL fields")
+            })
+
+        # Schema validation can be set only for JSON fields
+        if self.validation_schema and self.type != CustomFieldTypeChoices.TYPE_JSON:
+            raise ValidationError({
+                'validation_schema': _("JSON schema validation is supported only for JSON fields")
             })
 
         # Uniqueness can not be enforced for boolean fields
@@ -429,6 +828,8 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         """
         if value is None:
             return value
+        if self.type == CustomFieldTypeChoices.TYPE_DECIMAL:
+            return float(value)
         if self.type == CustomFieldTypeChoices.TYPE_DATE and type(value) is date:
             return value.isoformat()
         if self.type == CustomFieldTypeChoices.TYPE_DATETIME and type(value) is datetime:
@@ -574,7 +975,12 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         # Object
         elif self.type == CustomFieldTypeChoices.TYPE_OBJECT:
             model = self.related_object_type.model_class()
-            field_class = CSVModelChoiceField if for_csv_import else DynamicModelChoiceField
+            if for_csv_import:
+                field_class = CSVModelChoiceField
+            elif for_filterset_form:
+                field_class = DynamicModelMultipleChoiceField
+            else:
+                field_class = DynamicModelChoiceField
             kwargs = {
                 'queryset': model.objects.all(),
                 'required': required,
@@ -632,6 +1038,9 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
 
         :param lookup_expr: Custom lookup expression (optional)
         """
+        # Imported locally as extras.filters imports extras.models
+        from extras.filters import missing_key_aware_filter_factory
+
         kwargs = {
             'field_name': f'custom_field_data__{self.name}'
         }
@@ -682,6 +1091,7 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
 
         # Multiselect
         elif self.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
+            # Do not pin lookup_expr: FILTER_ARRAY_BASED_LOOKUP_MAP preserves the class default under negation
             filter_class = filters.MultiValueArrayFilter
 
         # Object
@@ -696,6 +1106,11 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
         # Unsupported custom field type
         else:
             return None
+
+        # A negated lookup must match objects which carry no key for this field at all; see
+        # MissingKeyAwareFilterMixin. BooleanFilter is never negated, so it is left alone.
+        if not issubclass(filter_class, django_filters.BooleanFilter):
+            filter_class = missing_key_aware_filter_factory(filter_class)
 
         filter_instance = filter_class(**kwargs)
         filter_instance.custom_field = self
@@ -719,6 +1134,12 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
             elif self.type == CustomFieldTypeChoices.TYPE_URL:
                 if type(value) is not str:
                     raise ValidationError(_("Value must be a string."))
+                # Enforce ALLOWED_URL_SCHEMES to guard against dangerous schemes (e.g. javascript:). A
+                # schemeless value is permitted and treated as relative.
+                if not url_scheme_is_allowed(value):
+                    raise ValidationError(
+                        _("URLs must use a scheme permitted by ALLOWED_URL_SCHEMES.")
+                    )
                 if self.validation_regex and not re.match(self.validation_regex, value):
                     raise ValidationError(_("Value must match regex '{regex}'").format(regex=self.validation_regex))
 
@@ -784,7 +1205,11 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
 
             # Validate all selected choices
             elif self.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
-                if not set(value).issubset(self.choice_set.values):
+                # Require a list of valid string choices. The isinstance() check short-circuits the membership
+                # test so that non-string members (e.g. a client echoing back the {value, label} read
+                # representation) raise a ValidationError rather than an unhashable-type TypeError.
+                valid_values = set(self.choice_set.values)
+                if type(value) is not list or not all(isinstance(v, str) and v in valid_values for v in value):
                     raise ValidationError(
                         _("Invalid choice(s) ({value}) for choice set {choiceset}.").format(
                             value=value,
@@ -806,6 +1231,16 @@ class CustomField(CloningMixin, ExportTemplatesMixin, OwnerMixin, ChangeLoggedMo
                 for id in value:
                     if type(id) is not int:
                         raise ValidationError(_("Found invalid object ID: {id}").format(id=id))
+
+            # Validate JSON against schema (if defined)
+            elif self.type == CustomFieldTypeChoices.TYPE_JSON:
+                if self.validation_schema:
+                    try:
+                        jsonschema.validate(value, schema=self.validation_schema)
+                    except JSONValidationError as e:
+                        raise ValidationError(
+                            _("Value does not conform to the assigned schema: {error}").format(error=e.message)
+                        )
 
         elif self.required:
             raise ValidationError(_("Required field cannot be empty."))
@@ -830,20 +1265,20 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         null=True,
         help_text=_('Base set of predefined choices (optional)')
     )
-    extra_choices = ArrayField(
-        ArrayField(
-            base_field=models.CharField(max_length=100),
-            size=2
-        ),
+    extra_choices = ChoiceSetField(
         blank=True,
         null=True
+    )
+    choice_colors = models.JSONField(
+        default=dict,
+        blank=True,
     )
     order_alphabetically = models.BooleanField(
         default=False,
         help_text=_('Choices are automatically ordered alphabetically')
     )
 
-    clone_fields = ('extra_choices', 'order_alphabetically')
+    clone_fields = ('extra_choices', 'choice_colors', 'order_alphabetically')
 
     class Meta:
         ordering = ('name',)
@@ -878,6 +1313,24 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         return self._choices
 
     @property
+    def colors(self):
+        """
+        Return merged color mappings from the selected base choice set (if it defines colors)
+        and any custom color overrides defined on this choice set.
+        """
+        if not hasattr(self, '_colors'):
+            self._colors = {}
+            if self.base_choices:
+                base_choice_set = CHOICE_SETS.get(self.base_choices)
+                self._colors.update(getattr(base_choice_set, 'colors', {}))
+            if self.choice_colors:
+                self._colors.update(self.choice_colors)
+        return self._colors
+
+    def get_choice_color(self, value):
+        return self.colors.get(value)
+
+    @property
     def choices_count(self):
         return len(self.choices)
 
@@ -892,25 +1345,56 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
         if not self.base_choices and not self.extra_choices:
             raise ValidationError(_("Must define base or extra choices."))
 
-        # Check for duplicate values in extra_choices
-        choice_values = [c[0] for c in self.extra_choices] if self.extra_choices else []
-        if len(set(choice_values)) != len(choice_values):
-            # At least one duplicate value is present. Find the first one and raise an error.
-            _seen = []
-            for value in choice_values:
-                if value in _seen:
+        if self.choice_colors is None:
+            self.choice_colors = {}
+        elif not isinstance(self.choice_colors, dict):
+            raise ValidationError({
+                'choice_colors': _('Color mappings must be defined as a JSON object.')
+            })
+
+        valid_choice_values = set()
+        extra_choice_values = set()
+
+        if self.base_choices:
+            valid_choice_values.update(value for value, _ in CHOICE_SETS.get(self.base_choices))
+
+        if self.extra_choices:
+            for value, _label in self.extra_choices:
+                if value in extra_choice_values:
                     raise ValidationError(_("Duplicate value '{value}' found in extra choices.").format(value=value))
-                _seen.append(value)
+                extra_choice_values.add(value)
+            valid_choice_values.update(extra_choice_values)
+
+        invalid_choice_values = set()
+        invalid_colors = set()
+        valid_colors = set(CustomFieldChoiceColorChoices.values())
+
+        for value, color in self.choice_colors.items():
+            if value not in valid_choice_values:
+                invalid_choice_values.add(value)
+            if color not in valid_colors:
+                invalid_colors.add(color)
+
+        if invalid_choice_values:
+            raise ValidationError({
+                'choice_colors': _(
+                    'Color mappings must reference an existing choice value. Invalid value(s): {values}.'
+                ).format(values=', '.join(sorted(invalid_choice_values)))
+            })
+
+        if invalid_colors:
+            raise ValidationError({
+                'choice_colors': _(
+                    'Invalid color value(s): {colors}. Use a supported named color.'
+                ).format(colors=', '.join(sorted(invalid_colors)))
+            })
 
         # Check whether any choices have been removed. If so, check whether any of the removed
         # choices are still set in custom field data for any object.
         original_choices = set([
             c[0] for c in self._original_extra_choices
         ]) if self._original_extra_choices else set()
-        current_choices = set([
-            c[0] for c in self.extra_choices
-        ]) if self.extra_choices else set()
-        if removed_choices := original_choices - current_choices:
+        if removed_choices := original_choices - valid_choice_values:
             for custom_field in self.choices_for.all():
                 for object_type in custom_field.object_types.all():
                     model = object_type.model_class()
@@ -931,7 +1415,7 @@ class CustomFieldChoiceSet(CloningMixin, ExportTemplatesMixin, OwnerMixin, Chang
     def save(self, *args, **kwargs):
 
         # Sort choices if alphabetical ordering is enforced
-        if self.order_alphabetically:
+        if self.order_alphabetically and self.extra_choices:
             self.extra_choices = sorted(self.extra_choices, key=lambda x: x[0])
 
         return super().save(*args, **kwargs)

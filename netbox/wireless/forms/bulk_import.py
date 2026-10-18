@@ -12,8 +12,8 @@ from wireless.choices import *
 from wireless.models import *
 
 __all__ = (
-    'WirelessLANImportForm',
     'WirelessLANGroupImportForm',
+    'WirelessLANImportForm',
     'WirelessLinkImportForm',
 )
 
@@ -76,7 +76,7 @@ class WirelessLANImportForm(ScopedImportForm, PrimaryModelImportForm):
         model = WirelessLAN
         fields = (
             'ssid', 'group', 'status', 'vlan', 'tenant', 'auth_type', 'auth_cipher', 'auth_psk', 'scope_type',
-            'scope_id', 'description', 'owner', 'comments', 'tags',
+            'scope_name', 'scope_id', 'description', 'owner', 'comments', 'tags',
         )
         labels = {
             'scope_id': _('Scope ID'),

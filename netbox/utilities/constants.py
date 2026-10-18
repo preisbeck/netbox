@@ -17,6 +17,12 @@ FILTER_CHAR_BASED_LOOKUP_MAP = dict(
     iregex='iregex',
 )
 
+# A member is a scalar inside a stored array, so negation cannot fall back to equality
+FILTER_ARRAY_BASED_LOOKUP_MAP = {
+    **FILTER_CHAR_BASED_LOOKUP_MAP,
+    'n': 'contains',
+}
+
 FILTER_NUMERIC_BASED_LOOKUP_MAP = dict(
     n='exact',
     lte='lte',
@@ -30,6 +36,11 @@ FILTER_NEGATION_LOOKUP_MAP = dict(
     n='exact'
 )
 
+FILTER_TAG_LOOKUP_MAP = dict(
+    n='exact',
+    any='exact',
+)
+
 FILTER_TREENODE_NEGATION_LOOKUP_MAP = dict(
     n='in'
 )
@@ -38,6 +49,7 @@ FILTER_TREENODE_NEGATION_LOOKUP_MAP = dict(
 # HTTP Request META safe copy
 #
 
+# Non-HTTP_ META keys to include when copying a request (whitelist)
 HTTP_REQUEST_META_SAFE_COPY = [
     'CONTENT_LENGTH',
     'CONTENT_TYPE',
@@ -60,6 +72,13 @@ HTTP_REQUEST_META_SAFE_COPY = [
     'SERVER_NAME',
     'SERVER_PORT',
 ]
+
+# HTTP_ META keys known to carry sensitive data; excluded when copying a request (denylist)
+HTTP_REQUEST_META_SENSITIVE = {
+    'HTTP_AUTHORIZATION',
+    'HTTP_COOKIE',
+    'HTTP_PROXY_AUTHORIZATION',
+}
 
 
 #
@@ -96,6 +115,9 @@ HTML_ALLOWED_ATTRIBUTES = {
     "td": {"align"},
     "th": {"align"},
 }
+
+# Allowed URL schemes for image sources (img[src]); applied in addition to ALLOWED_URL_SCHEMES
+IMAGE_URL_SCHEMES = {'http', 'https'}
 
 HTTP_PROXY_SUPPORTED_SOCK_SCHEMAS = ['socks4', 'socks4a', 'socks4h', 'socks5', 'socks5a', 'socks5h']
 HTTP_PROXY_SOCK_RDNS_SCHEMAS = ['socks4h', 'socks4a', 'socks5h', 'socks5a']

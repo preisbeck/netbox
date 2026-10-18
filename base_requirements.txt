@@ -4,7 +4,7 @@ colorama
 
 # The Python web framework on which NetBox is built
 # https://docs.djangoproject.com/en/stable/releases/
-Django==5.2.*
+Django==6.1.*
 
 # Django middleware which permits cross-domain API requests
 # https://github.com/adamchainz/django-cors-headers/blob/main/CHANGELOG.rst
@@ -18,26 +18,26 @@ django-debug-toolbar
 # https://github.com/carltongibson/django-filter/blob/main/CHANGES.rst
 django-filter
 
-# Django Debug Toolbar extension for GraphiQL
-# https://github.com/flavors/django-graphiql-debug-toolbar/blob/main/CHANGES.rst
-django-graphiql-debug-toolbar
-
 # HTMX utilities for Django
 # https://django-htmx.readthedocs.io/en/latest/changelog.html
 django-htmx
 
 # Modified Preorder Tree Traversal (recursive nesting of objects)
-# https://github.com/django-mptt/django-mptt/blob/main/CHANGELOG.rst
-# v0.18.0 introduces errant migrations which need to be resolved
-django-mptt==0.17.0
+# Retained primarily for plugin backward compatibility: the deprecated
+# NestedGroupModel base remains MPTT-backed for plugins still using it. Also
+# required by historical migrations that pre-date the switch to PostgreSQL ltree.
+# NetBox core runtime uses netbox.models.ltree.LtreeModel instead.
+django-mptt
 
-# Context managers for PostgreSQL advisory locks
-# https://github.com/Xof/django-pglocks/blob/master/CHANGES.txt
-django-pglocks
+# Context managers for PostgreSQL advisory locks (successor to django-pglocks)
+# https://github.com/Xof/django-pgware
+django-pgware
 
 # Prometheus metrics library for Django
 # https://github.com/korfuri/django-prometheus/blob/master/CHANGELOG.md
-django-prometheus
+# TODO: 2.4.1 is incompatible with Django>=6.0, but a fixed release is expected
+# https://github.com/django-commons/django-prometheus/issues/494
+django-prometheus>=2.4.0,<2.5.0,!=2.4.1
 
 # Django caching backend using Redis
 # https://github.com/jazzband/django-redis/blob/master/CHANGELOG.rst
@@ -70,7 +70,7 @@ django-timezone-field
 # A REST API framework for Django projects
 # https://www.django-rest-framework.org/community/release-notes/
 # TODO: Re-evaluate the monkey-patch of get_unique_validators() before upgrading
-djangorestframework==3.16.1
+djangorestframework==3.18.0
 
 # Sane and flexible OpenAPI 3 schema generation for Django REST framework.
 # https://github.com/tfranzel/drf-spectacular/blob/master/CHANGELOG.rst
@@ -99,6 +99,10 @@ jsonschema
 # Simple markup language for rendering HTML
 # https://python-markdown.github.io/changelog/
 Markdown
+
+# Retain MkDocs 1.x for mkdocstrings
+# https://github.com/mkdocs/mkdocs
+mkdocs<2.0
 
 # MkDocs Material theme (for documentation build)
 # https://squidfunk.github.io/mkdocs-material/changelog/
@@ -129,9 +133,18 @@ Pillow
 # https://github.com/psycopg/psycopg/blob/master/docs/news.rst
 psycopg[c,pool]
 
+# Markdown extensions (for documentation build)
+# Pinned below v12.2 pending mkdocstrings compatibility (see #23385)
+# https://github.com/facelessuser/pymdown-extensions/releases
+pymdown-extensions<12.2
+
 # YAML rendering library
 # https://github.com/yaml/pyyaml/blob/master/CHANGES
 PyYAML
+
+# redis-py
+# https://github.com/redis/redis-py
+redis
 
 # Requests
 # https://github.com/psf/requests/blob/main/HISTORY.md
@@ -143,23 +156,25 @@ rq
 
 # Django app for social-auth-core
 # https://github.com/python-social-auth/social-app-django/blob/master/CHANGELOG.md
-social-auth-app-django
+social-auth-app-django<7.0.0
 
 # Social authentication framework
 # https://github.com/python-social-auth/social-core/blob/master/CHANGELOG.md
-social-auth-core
+social-auth-core<6.0.0
 
 # Image thumbnail generation
 # https://github.com/jazzband/sorl-thumbnail/blob/master/CHANGES.rst
 sorl-thumbnail
 
 # Strawberry GraphQL
+# Pinned below v0.333.0, which is incompatible with strawberry-graphql-django <v0.93.0 (see #23383)
 # https://github.com/strawberry-graphql/strawberry/blob/main/CHANGELOG.md
-strawberry-graphql
+strawberry-graphql<0.333.0
 
 # Strawberry GraphQL Django extension
+# Pinned below v0.92.3, which breaks pagination of prefetched list fields (see #23383)
 # https://github.com/strawberry-graphql/strawberry-django/releases
-strawberry-graphql-django
+strawberry-graphql-django<0.92.3
 
 # SVG image rendering (used for rack elevations)
 # https://github.com/mozman/svgwrite/blob/master/NEWS.rst
@@ -173,3 +188,7 @@ tablib
 # Timezone data (required by django-timezone-field on Python 3.9+)
 # https://github.com/python/tzdata/blob/master/NEWS.md
 tzdata
+
+# Documentation builder (succeeds mkdocs)
+# https://github.com/zensical/zensical
+zensical

@@ -1,29 +1,44 @@
 from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.postgres.indexes import GistIndex
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.translation import gettext_lazy as _
-from mptt.models import MPTTModel, TreeForeignKey
 
 from dcim.choices import *
 from dcim.constants import *
 from dcim.models.base import PortMappingBase
-from dcim.models.mixins import InterfaceValidationMixin
+from dcim.models.mixins import DiameterMixin, InterfaceChannelRenameMixin, InterfaceValidationMixin, MaxFlowMixin
+from dcim.utils import get_module_bay_positions, resolve_module_placeholder
 from netbox.models import ChangeLoggedModel
+from netbox.models.features import ChangeLoggingMixin
+from netbox.models.ltree import LtreeManager, LtreeModel
+from utilities.exceptions import AbortRequest
 from utilities.fields import ColorField, NaturalOrderingField
-from utilities.mptt import TreeManager
 from utilities.ordering import naturalize_interface
 from utilities.tracking import TrackingModelMixin
 from wireless.choices import WirelessRoleChoices
+
 from .device_components import (
-    ConsolePort, ConsoleServerPort, DeviceBay, FrontPort, Interface, InventoryItem, ModuleBay, PowerOutlet, PowerPort,
+    ConsolePort,
+    ConsoleServerPort,
+    CoolingIntake,
+    CoolingOutflow,
+    DeviceBay,
+    FrontPort,
+    Interface,
+    InventoryItem,
+    ModuleBay,
+    PowerOutlet,
+    PowerPort,
     RearPort,
 )
-
 
 __all__ = (
     'ConsolePortTemplate',
     'ConsoleServerPortTemplate',
+    'CoolingIntakeTemplate',
+    'CoolingOutflowTemplate',
     'DeviceBayTemplate',
     'FrontPortTemplate',
     'InterfaceTemplate',
@@ -135,6 +150,9 @@ class ModularComponentTemplateModel(ComponentTemplateModel):
                 name='%(app_label)s_%(class)s_unique_module_type_name'
             ),
         )
+        indexes = (
+            models.Index(fields=('device_type', 'module_type', 'name')),  # Default ordering
+        )
 
     def to_objectchange(self, action):
         objectchange = super().to_objectchange(action)
@@ -157,41 +175,51 @@ class ModularComponentTemplateModel(ComponentTemplateModel):
                 _("A component template must be associated with either a device type or a module type.")
             )
 
-    def _get_module_tree(self, module):
-        modules = []
-        while module:
-            modules.append(module)
-            if module.module_bay:
-                module = module.module_bay.module
-            else:
-                module = None
+    @staticmethod
+    def _resolve_vc_position(value: str, device) -> str:
+        """
+        Resolves {vc_position} and {vc_position:X} tokens.
 
-        modules.reverse()
-        return modules
+        If the device has a vc_position, replaces the token with that value.
+        Otherwise uses the explicit fallback X if given, else '0'.
+        """
+        def replacer(match):
+            explicit_fallback = match.group(1)
+            if (
+                device is not None
+                and device.virtual_chassis is not None
+                and device.vc_position is not None
+            ):
+                return str(device.vc_position)
+            return explicit_fallback if explicit_fallback is not None else '0'
 
-    def resolve_name(self, module):
-        if MODULE_TOKEN not in self.name:
-            return self.name
+        return VC_POSITION_RE.sub(replacer, value)
 
-        if module:
-            modules = self._get_module_tree(module)
-            name = self.name
-            for module in modules:
-                name = name.replace(MODULE_TOKEN, module.module_bay.position, 1)
-            return name
-        return self.name
+    def _resolve_all_placeholders(self, value, module=None, device=None):
+        has_module = MODULE_TOKEN in value
+        has_vc = VC_POSITION_RE.search(value) is not None
+        if not has_module and not has_vc:
+            return value
+        if has_module and module:
+            # Reached only from Module._save_new(); AbortRequest is what the view/viewset catches.
+            try:
+                positions = get_module_bay_positions(module.module_bay)
+            except ValueError as e:
+                raise AbortRequest(str(e)) from e
+            value = resolve_module_placeholder(value, positions)
+        if has_vc:
+            resolved_device = (module.device if module else None) or device
+            value = self._resolve_vc_position(value, resolved_device)
+        return value
 
-    def resolve_label(self, module):
-        if MODULE_TOKEN not in self.label:
-            return self.label
+    def resolve_name(self, module=None, device=None):
+        return self._resolve_all_placeholders(self.name, module, device)
 
-        if module:
-            modules = self._get_module_tree(module)
-            label = self.label
-            for module in modules:
-                label = label.replace(MODULE_TOKEN, module.module_bay.position, 1)
-            return label
-        return self.label
+    def resolve_label(self, module=None, device=None):
+        return self._resolve_all_placeholders(self.label, module, device)
+
+    def resolve_position(self, module=None, device=None):
+        return self._resolve_all_placeholders(self.position, module, device)
 
 
 class ConsolePortTemplate(ModularComponentTemplateModel):
@@ -214,8 +242,8 @@ class ConsolePortTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             **kwargs
         )
@@ -249,8 +277,8 @@ class ConsoleServerPortTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             **kwargs
         )
@@ -299,8 +327,8 @@ class PowerPortTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             maximum_draw=self.maximum_draw,
             allocated_draw=self.allocated_draw,
@@ -387,13 +415,13 @@ class PowerOutletTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         if self.power_port:
-            power_port_name = self.power_port.resolve_name(kwargs.get('module'))
+            power_port_name = self.power_port.resolve_name(kwargs.get('module'), kwargs.get('device'))
             power_port = PowerPort.objects.get(name=power_port_name, **kwargs)
         else:
             power_port = None
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             color=self.color,
             power_port=power_port,
@@ -414,7 +442,133 @@ class PowerOutletTemplate(ModularComponentTemplateModel):
         }
 
 
-class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel):
+class CoolingIntakeTemplate(DiameterMixin, MaxFlowMixin, ModularComponentTemplateModel):
+    """
+    A template for a CoolingIntake to be created for a new Device.
+    """
+    type = models.CharField(
+        verbose_name=_('type'),
+        max_length=50,
+        choices=CoolingConnectorTypeChoices,
+        blank=True,
+        null=True
+    )
+    # diameter, diameter_unit, _abs_diameter provided by DiameterMixin
+    # max_flow, max_flow_unit, _abs_max_flow provided by MaxFlowMixin
+
+    component_model = CoolingIntake
+
+    class Meta(ModularComponentTemplateModel.Meta):
+        verbose_name = _('cooling intake template')
+        verbose_name_plural = _('cooling intake templates')
+
+    def instantiate(self, **kwargs):
+        component = self.component_model(
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
+            type=self.type,
+            diameter=self.diameter,
+            diameter_unit=self.diameter_unit,
+            max_flow=self.max_flow,
+            max_flow_unit=self.max_flow_unit,
+            **kwargs
+        )
+        # bulk_create bypasses save(), so populate the normalized _abs_* fields here
+        component.normalize_diameter()
+        component.normalize_max_flow()
+        return component
+    instantiate.do_not_call_in_templates = True
+
+    def to_yaml(self):
+        return {
+            'name': self.name,
+            'type': self.type,
+            'diameter': float(self.diameter) if self.diameter is not None else None,
+            'diameter_unit': self.diameter_unit,
+            'max_flow': float(self.max_flow) if self.max_flow is not None else None,
+            'max_flow_unit': self.max_flow_unit,
+            'label': self.label,
+            'description': self.description,
+        }
+
+
+class CoolingOutflowTemplate(DiameterMixin, ModularComponentTemplateModel):
+    """
+    A template for a CoolingOutflow to be created for a new Device.
+    """
+    type = models.CharField(
+        verbose_name=_('type'),
+        max_length=50,
+        choices=CoolingConnectorTypeChoices,
+        blank=True,
+        null=True
+    )
+    # diameter, diameter_unit, _abs_diameter provided by DiameterMixin
+    cooling_intake = models.ForeignKey(
+        to='dcim.CoolingIntakeTemplate',
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+        related_name='coolingoutflow_templates'
+    )
+
+    component_model = CoolingOutflow
+
+    class Meta(ModularComponentTemplateModel.Meta):
+        verbose_name = _('cooling outflow template')
+        verbose_name_plural = _('cooling outflow templates')
+
+    def clean(self):
+        super().clean()
+
+        # Validate cooling intake assignment
+        if self.cooling_intake:
+            if self.device_type and self.cooling_intake.device_type != self.device_type:
+                raise ValidationError(
+                    _("Parent cooling intake ({cooling_intake}) must belong to the same device type").format(
+                        cooling_intake=self.cooling_intake
+                    )
+                )
+            if self.module_type and self.cooling_intake.module_type != self.module_type:
+                raise ValidationError(
+                    _("Parent cooling intake ({cooling_intake}) must belong to the same module type").format(
+                        cooling_intake=self.cooling_intake
+                    )
+                )
+
+    def instantiate(self, **kwargs):
+        if self.cooling_intake:
+            cooling_intake_name = self.cooling_intake.resolve_name(kwargs.get('module'), kwargs.get('device'))
+            cooling_intake = CoolingIntake.objects.get(name=cooling_intake_name, **kwargs)
+        else:
+            cooling_intake = None
+        component = self.component_model(
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
+            type=self.type,
+            diameter=self.diameter,
+            diameter_unit=self.diameter_unit,
+            cooling_intake=cooling_intake,
+            **kwargs
+        )
+        # bulk_create bypasses save(), so populate the normalized _abs_diameter here
+        component.normalize_diameter()
+        return component
+    instantiate.do_not_call_in_templates = True
+
+    def to_yaml(self):
+        return {
+            'name': self.name,
+            'type': self.type,
+            'diameter': float(self.diameter) if self.diameter is not None else None,
+            'diameter_unit': self.diameter_unit,
+            'cooling_intake': self.cooling_intake.name if self.cooling_intake else None,
+            'label': self.label,
+            'description': self.description,
+        }
+
+
+class InterfaceTemplate(InterfaceChannelRenameMixin, InterfaceValidationMixin, ModularComponentTemplateModel):
     """
     A template for a physical data interface on a new Device.
     """
@@ -430,6 +584,26 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
         max_length=50,
         choices=InterfaceTypeChoices
     )
+    channels = models.PositiveSmallIntegerField(
+        verbose_name=_('channels'),
+        blank=True,
+        null=True,
+        validators=(
+            MinValueValidator(INTERFACE_CHANNELS_MIN),
+            MaxValueValidator(INTERFACE_CHANNELS_MAX)
+        ),
+        help_text=_('The number of channels into which this interface is channelized')
+    )
+    channel_id = models.PositiveSmallIntegerField(
+        verbose_name=_('channel ID'),
+        blank=True,
+        null=True,
+        validators=(
+            MinValueValidator(INTERFACE_CHANNELS_MIN),
+            MaxValueValidator(INTERFACE_CHANNELS_MAX)
+        ),
+        help_text=_('The channel on the parent interface to which this subinterface is bound')
+    )
     enabled = models.BooleanField(
         verbose_name=_('enabled'),
         default=True
@@ -437,6 +611,14 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
     mgmt_only = models.BooleanField(
         default=False,
         verbose_name=_('management only')
+    )
+    parent = models.ForeignKey(
+        to='self',
+        on_delete=models.RESTRICT,
+        related_name='child_interfaces',
+        null=True,
+        blank=True,
+        verbose_name=_('parent interface')
     )
     bridge = models.ForeignKey(
         to='self',
@@ -471,11 +653,33 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
     component_model = Interface
 
     class Meta(ModularComponentTemplateModel.Meta):
+        constraints = (
+            *ModularComponentTemplateModel.Meta.constraints,
+            models.UniqueConstraint(
+                fields=('parent', 'channel_id'),
+                name='%(app_label)s_%(class)s_unique_parent_channel_id'
+            ),
+        )
         verbose_name = _('interface template')
         verbose_name_plural = _('interface templates')
 
     def clean(self):
         super().clean()
+
+        # Self-reference and interface-type restrictions are enforced by InterfaceValidationMixin
+        if self.parent:
+            if self.device_type and self.device_type != self.parent.device_type:
+                raise ValidationError({
+                    'parent': _(
+                        "Parent interface ({parent}) must belong to the same device type"
+                    ).format(parent=self.parent)
+                })
+            if self.module_type and self.module_type != self.parent.module_type:
+                raise ValidationError({
+                    'parent': _(
+                        "Parent interface ({parent}) must belong to the same module type"
+                    ).format(parent=self.parent)
+                })
 
         if self.bridge:
             if self.device_type and self.device_type != self.bridge.device_type:
@@ -493,9 +697,11 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
+            channels=self.channels,
+            channel_id=self.channel_id,
             enabled=self.enabled,
             mgmt_only=self.mgmt_only,
             poe_mode=self.poe_mode,
@@ -509,10 +715,13 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
         return {
             'name': self.name,
             'type': self.type,
+            'channels': self.channels,
+            'channel_id': self.channel_id,
             'enabled': self.enabled,
             'mgmt_only': self.mgmt_only,
             'label': self.label,
             'description': self.description,
+            'parent': self.parent.name if self.parent else None,
             'bridge': self.bridge.name if self.bridge else None,
             'poe_mode': self.poe_mode,
             'poe_type': self.poe_type,
@@ -520,7 +729,7 @@ class InterfaceTemplate(InterfaceValidationMixin, ModularComponentTemplateModel)
         }
 
 
-class PortTemplateMapping(PortMappingBase):
+class PortTemplateMapping(ChangeLoggingMixin, PortMappingBase):
     """
     Maps a FrontPortTemplate & position to a RearPortTemplate & position.
     """
@@ -549,6 +758,10 @@ class PortTemplateMapping(PortMappingBase):
         related_name='mappings',
     )
 
+    class Meta(PortMappingBase.Meta):
+        # Inherit the unique constraints from PortMappingBase.Meta.
+        pass
+
     def clean(self):
         super().clean()
 
@@ -565,6 +778,14 @@ class PortTemplateMapping(PortMappingBase):
         self.device_type = self.front_port.device_type
         self.module_type = self.front_port.module_type
         super().save(*args, **kwargs)
+
+    def to_yaml(self):
+        return {
+            'front_port': self.front_port.name,
+            'front_port_position': self.front_port_position,
+            'rear_port': self.rear_port.name,
+            'rear_port_position': self.rear_port_position,
+        }
 
 
 class FrontPortTemplate(ModularComponentTemplateModel):
@@ -620,8 +841,8 @@ class FrontPortTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             color=self.color,
             positions=self.positions,
@@ -684,8 +905,8 @@ class RearPortTemplate(ModularComponentTemplateModel):
 
     def instantiate(self, **kwargs):
         return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
+            name=self.resolve_name(kwargs.get('module'), kwargs.get('device')),
+            label=self.resolve_label(kwargs.get('module'), kwargs.get('device')),
             type=self.type,
             color=self.color,
             positions=self.positions,
@@ -714,6 +935,17 @@ class ModuleBayTemplate(ModularComponentTemplateModel):
         blank=True,
         help_text=_('Identifier to reference when renaming installed components')
     )
+    enabled = models.BooleanField(
+        verbose_name=_('enabled'),
+        default=True,
+    )
+    module_bay_types = models.ManyToManyField(
+        to='dcim.ModuleBayType',
+        related_name='module_bay_templates',
+        blank=True,
+        verbose_name=_('module bay types'),
+        help_text=_('Types of modules that can be installed in this bay (empty = unconstrained)'),
+    )
 
     component_model = ModuleBay
 
@@ -722,12 +954,24 @@ class ModuleBayTemplate(ModularComponentTemplateModel):
         verbose_name_plural = _('module bay templates')
 
     def instantiate(self, **kwargs):
-        return self.component_model(
-            name=self.resolve_name(kwargs.get('module')),
-            label=self.resolve_label(kwargs.get('module')),
-            position=self.position,
+        module = kwargs.get('module')
+        instance = self.component_model(
+            name=self.resolve_name(module, kwargs.get('device')),
+            label=self.resolve_label(module, kwargs.get('device')),
+            position=self.resolve_position(module, kwargs.get('device')),
+            enabled=self.enabled,
+            # A module bay created for an installed module nests under that module's
+            # bay. bulk_create() bypasses ModuleBay.save() (which would otherwise set
+            # this), so the parent must be assigned here for the path trigger to nest
+            # it correctly. Device-level bays are instantiated without a module and
+            # remain roots (parent=None).
+            parent=module.module_bay if module else None,
             **kwargs
         )
+        # Stash reference so callers (Module.save, Device._instantiate_components) can
+        # copy M2M fields (e.g. module_bay_types) that bulk_create cannot handle.
+        instance._source_template = self
+        return instance
     instantiate.do_not_call_in_templates = True
 
     def to_yaml(self):
@@ -735,7 +979,9 @@ class ModuleBayTemplate(ModularComponentTemplateModel):
             'name': self.name,
             'label': self.label,
             'position': self.position,
+            'enabled': self.enabled,
             'description': self.description,
+            'module_bay_types': [t.name for t in self.module_bay_types.all()],
         }
 
 
@@ -743,6 +989,11 @@ class DeviceBayTemplate(ComponentTemplateModel):
     """
     A template for a DeviceBay to be created for a new parent Device.
     """
+    enabled = models.BooleanField(
+        verbose_name=_('enabled'),
+        default=True,
+    )
+
     component_model = DeviceBay
 
     class Meta(ComponentTemplateModel.Meta):
@@ -753,7 +1004,8 @@ class DeviceBayTemplate(ComponentTemplateModel):
         return self.component_model(
             device=device,
             name=self.name,
-            label=self.label
+            label=self.label,
+            enabled=self.enabled,
         )
     instantiate.do_not_call_in_templates = True
 
@@ -769,15 +1021,16 @@ class DeviceBayTemplate(ComponentTemplateModel):
         return {
             'name': self.name,
             'label': self.label,
+            'enabled': self.enabled,
             'description': self.description,
         }
 
 
-class InventoryItemTemplate(MPTTModel, ComponentTemplateModel):
+class InventoryItemTemplate(LtreeModel, ComponentTemplateModel):
     """
     A template for an InventoryItem to be created for a new parent Device.
     """
-    parent = TreeForeignKey(
+    parent = models.ForeignKey(
         to='self',
         on_delete=models.CASCADE,
         related_name='child_items',
@@ -821,13 +1074,14 @@ class InventoryItemTemplate(MPTTModel, ComponentTemplateModel):
         help_text=_('Manufacturer-assigned part identifier')
     )
 
-    objects = TreeManager()
+    objects = LtreeManager()
     component_model = InventoryItem
 
     class Meta:
         ordering = ('device_type__id', 'parent__id', 'name')
         indexes = (
             models.Index(fields=('component_type', 'component_id')),
+            GistIndex(fields=['path'], name='dcim_inv_item_tmpl_path_gist'),
         )
         constraints = (
             models.UniqueConstraint(

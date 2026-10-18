@@ -2,19 +2,25 @@ import re
 
 from django import forms
 from django.contrib.postgres.forms import SimpleArrayField
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import NON_FIELD_ERRORS, ObjectDoesNotExist, ValidationError
 from django.utils.translation import gettext_lazy as _
 
 from core.models import DataFile, DataSource, ObjectType
 from extras.choices import *
 from extras.models import *
+from netbox.event_rules import get_event_rule_action
 from netbox.events import get_event_type_choices
 from netbox.forms import NetBoxModelImportForm, OwnerCSVMixin, PrimaryModelImportForm
 from users.models import Group, User
 from utilities.forms import CSVModelForm
 from utilities.forms.fields import (
-    CSVChoiceField, CSVContentTypeField, CSVModelChoiceField, CSVModelMultipleChoiceField, CSVMultipleChoiceField,
-    CSVMultipleContentTypeField, SlugField,
+    CSVChoiceField,
+    CSVContentTypeField,
+    CSVModelChoiceField,
+    CSVModelMultipleChoiceField,
+    CSVMultipleChoiceField,
+    CSVMultipleContentTypeField,
+    SlugField,
 )
 
 __all__ = (
@@ -75,7 +81,8 @@ class CustomFieldImportForm(OwnerCSVMixin, CSVModelForm):
         fields = (
             'name', 'label', 'group_name', 'type', 'object_types', 'related_object_type', 'required', 'unique',
             'description', 'search_weight', 'filter_logic', 'default', 'choice_set', 'weight', 'validation_minimum',
-            'validation_maximum', 'validation_regex', 'ui_visible', 'ui_editable', 'is_cloneable', 'owner', 'comments',
+            'validation_maximum', 'validation_regex', 'validation_schema', 'ui_visible', 'ui_editable',
+            'is_cloneable', 'nulls_first', 'owner', 'comments',
         )
 
 
@@ -93,11 +100,19 @@ class CustomFieldChoiceSetImportForm(OwnerCSVMixin, CSVModelForm):
             '"choice1:First Choice,choice2:Second Choice"'
         )
     )
+    choice_colors = SimpleArrayField(
+        base_field=forms.CharField(),
+        required=False,
+        help_text=_(
+            'Quoted string of comma-separated color mappings in the format '
+            '"choice1:red,choice2:green". Supported colors: {colors}'
+        ).format(colors=', '.join(CustomFieldChoiceColorChoices.values())),
+    )
 
     class Meta:
         model = CustomFieldChoiceSet
         fields = (
-            'name', 'description', 'base_choices', 'extra_choices', 'order_alphabetically', 'owner',
+            'name', 'description', 'base_choices', 'extra_choices', 'choice_colors', 'order_alphabetically', 'owner',
         )
 
     def clean_extra_choices(self):
@@ -112,6 +127,29 @@ class CustomFieldChoiceSetImportForm(OwnerCSVMixin, CSVModelForm):
                     value, label = line, line
                 data.append((value, label))
             return data
+        return None
+
+    def clean_choice_colors(self):
+        if isinstance(self.cleaned_data['choice_colors'], list):
+            data = {}
+            for line in self.cleaned_data['choice_colors']:
+                try:
+                    value, color = re.split(r'(?<!\\):', line, maxsplit=1)
+                    value = value.replace('\\:', ':')
+                except ValueError as e:
+                    raise forms.ValidationError(
+                        _("Invalid color mapping '{line}'. Use the format value:color.").format(line=line)
+                    ) from e
+
+                value = value.strip()
+                color = color.strip()
+                if value in data:
+                    raise forms.ValidationError(
+                        _("Duplicate color mapping defined for choice '{value}'.").format(value=value)
+                    )
+                data[value] = color
+            return data
+        return {}
 
 
 class CustomLinkImportForm(OwnerCSVMixin, CSVModelForm):
@@ -141,13 +179,56 @@ class ExportTemplateImportForm(OwnerCSVMixin, CSVModelForm):
         queryset=ObjectType.objects.with_feature('export_templates'),
         help_text=_("One or more assigned object types")
     )
+    template_code = forms.CharField(
+        label=_('Template code'),
+        required=False,
+        help_text=_('Jinja2 template code, if not sourced from a data file')
+    )
+    data_source = CSVModelChoiceField(
+        label=_('Data source'),
+        queryset=DataSource.objects.all(),
+        required=False,
+        to_field_name='name',
+        help_text=_('Data source which provides the data file')
+    )
+    data_file = CSVModelChoiceField(
+        label=_('Data file'),
+        queryset=DataFile.objects.all(),
+        required=False,
+        to_field_name='path',
+        help_text=_('Data file containing the template code')
+    )
+    auto_sync_enabled = forms.BooleanField(
+        required=False,
+        label=_('Auto sync enabled'),
+        help_text=_("Enable automatic synchronization of template content when the data file is updated")
+    )
 
     class Meta:
         model = ExportTemplate
         fields = (
             'name', 'object_types', 'description', 'environment_params', 'mime_type', 'file_name', 'file_extension',
-            'as_attachment', 'template_code', 'owner',
+            'as_attachment', 'template_code', 'data_source', 'data_file', 'auto_sync_enabled', 'owner',
         )
+
+    def clean_data_source(self):
+        # Paths are unique only within a source, and Meta.fields cleans data_source before data_file
+        data_source = self.cleaned_data.get('data_source')
+        if data_source and 'data_file' in self.fields:
+            self.fields['data_file'].queryset = self.fields['data_file'].queryset.filter(source=data_source)
+
+        return data_source
+
+    def clean(self):
+        super().clean()
+
+        # An update record carries only the fields being changed, so fall back to the stored values
+        template_code = self.cleaned_data.get('template_code', self.instance.template_code)
+        data_file = self.cleaned_data.get('data_file', self.instance.data_file)
+        if not template_code and not data_file:
+            raise forms.ValidationError(_("Must specify either local content or a data file"))
+
+        return self.cleaned_data
 
 
 class ConfigContextProfileImportForm(PrimaryModelImportForm):
@@ -184,8 +265,17 @@ class ConfigTemplateImportForm(OwnerCSVMixin, CSVModelForm):
         model = ConfigTemplate
         fields = (
             'name', 'description', 'template_code', 'data_source', 'data_file', 'auto_sync_enabled',
-            'environment_params', 'mime_type', 'file_name', 'file_extension', 'as_attachment', 'owner', 'tags',
+            'environment_params', 'mime_type', 'file_name', 'file_extension', 'as_attachment', 'debug', 'owner',
+            'tags',
         )
+
+    def clean_data_source(self):
+        # Paths are unique only within a source, and Meta.fields cleans data_source before data_file
+        data_source = self.cleaned_data.get('data_source')
+        if data_source and 'data_file' in self.fields:
+            self.fields['data_file'].queryset = self.fields['data_file'].queryset.filter(source=data_source)
+
+        return data_source
 
     def clean(self):
         super().clean()
@@ -193,7 +283,7 @@ class ConfigTemplateImportForm(OwnerCSVMixin, CSVModelForm):
         # Make sure template_code is None when it's not included in the uploaded data
         if not self.data.get('template_code') and not self.data.get('data_file'):
             raise forms.ValidationError(_("Must specify either local content or a data file"))
-        return self.cleaned_data['template_code']
+        return self.cleaned_data
 
 
 class SavedFilterImportForm(OwnerCSVMixin, CSVModelForm):
@@ -216,7 +306,7 @@ class WebhookImportForm(OwnerCSVMixin, NetBoxModelImportForm):
         model = Webhook
         fields = (
             'name', 'payload_url', 'http_method', 'http_content_type', 'additional_headers', 'body_template',
-            'secret', 'ssl_verification', 'ca_file_path', 'description', 'owner', 'tags'
+            'secret', 'ssl_verification', 'ca_file_path', 'timeout', 'description', 'owner', 'tags'
         )
 
 
@@ -233,8 +323,11 @@ class EventRuleImportForm(OwnerCSVMixin, NetBoxModelImportForm):
     )
     action_object = forms.CharField(
         label=_('Action object'),
-        required=True,
-        help_text=_('Webhook name or script as dotted path module.Class')
+        required=False,
+        help_text=_(
+            'The target object for the action, if it requires one. The expected format depends on the action type '
+            '(e.g. a webhook or notification group name, or a script as dotted path module.Class).'
+        )
     )
 
     class Meta:
@@ -249,24 +342,58 @@ class EventRuleImportForm(OwnerCSVMixin, NetBoxModelImportForm):
 
         action_object = self.cleaned_data.get('action_object')
         action_type = self.cleaned_data.get('action_type')
-        if action_object and action_type:
-            # Webhook
-            if action_type == EventRuleActionChoices.WEBHOOK:
-                try:
-                    webhook = Webhook.objects.get(name=action_object)
-                except Webhook.DoesNotExist:
-                    raise forms.ValidationError(_("Webhook {name} not found").format(name=action_object))
-                self.instance.action_object = webhook
-            # Script
-            elif action_type == EventRuleActionChoices.SCRIPT:
-                from extras.scripts import get_module_and_script
-                module_name, script_name = action_object.split('.', 1)
-                try:
-                    script = get_module_and_script(module_name, script_name)[1]
-                except ObjectDoesNotExist:
-                    raise forms.ValidationError(_("Script {name} not found").format(name=action_object))
-                self.instance.action_object = script
-                self.instance.action_object_type = ObjectType.objects.get_for_model(script, for_concrete_model=False)
+        if not action_type:
+            return
+
+        action = get_event_rule_action(action_type)
+        if action is None:
+            raise forms.ValidationError({
+                'action_type': _('"{action_type}" is not a registered action type.').format(action_type=action_type)
+            })
+
+        if not action_object:
+            if action.object_required:
+                raise forms.ValidationError({
+                    'action_object': _("This action type requires a target object."),
+                })
+            # Clear any action_object this instance previously had (relevant for a CSV row that
+            # updates an existing rule, matched by id, to a now-object-less action_type).
+            self.instance.action_object_type = None
+            self.instance.action_object_id = None
+            return
+
+        if action.object_model is None:
+            raise forms.ValidationError({
+                'action_object': _("This action type does not operate against a target object."),
+            })
+
+        try:
+            obj = action.resolve_import_object(action_object)
+        except ObjectDoesNotExist:
+            raise forms.ValidationError({
+                'action_object': _("{name} not found").format(name=action_object)
+            })
+        if obj is None:
+            raise forms.ValidationError({
+                'action_object': _("This action type does not support bulk import.")
+            })
+
+        # Assign the GFK itself (not just action_object_type/id) so EventRule.clean()'s later
+        # access to self.action_object hits the descriptor cache instead of a fresh SELECT --
+        # for a non-proxy object_model, where the concrete and non-concrete content types match.
+        self.instance.action_object = obj
+        self.instance.action_object_type = ObjectType.objects.get_for_model(obj, for_concrete_model=False)
+
+    def _update_errors(self, errors):
+        # Remap errors keyed by fields this form doesn't expose (e.g. action_object_id) to
+        # NON_FIELD_ERRORS; otherwise Django's add_error() raises ValueError instead of failing validation normally.
+        if hasattr(errors, 'error_dict'):
+            remapped = {}
+            for field, messages in errors.error_dict.items():
+                key = field if field == NON_FIELD_ERRORS or field in self.fields else NON_FIELD_ERRORS
+                remapped.setdefault(key, []).extend(messages)
+            errors = ValidationError(remapped)
+        super()._update_errors(errors)
 
 
 class TagImportForm(OwnerCSVMixin, CSVModelForm):
@@ -305,6 +432,12 @@ class JournalEntryImportForm(NetBoxModelImportForm):
         fields = (
             'assigned_object_type', 'assigned_object_id', 'created_by', 'kind', 'comments', 'tags'
         )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # If not creating a new JournalEntry, disable the created_by field
+        if self.instance and not self.instance._state.adding:
+            self.fields['created_by'].disabled = True
 
 
 class NotificationGroupImportForm(CSVModelForm):

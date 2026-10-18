@@ -1,3 +1,5 @@
+from functools import cached_property
+
 from django.contrib.contenttypes.models import ContentType
 from rest_framework import serializers
 
@@ -9,18 +11,20 @@ from netbox.api.fields import ChoiceField, ContentTypeField
 from netbox.api.gfk_fields import GFKSerializerField
 from netbox.api.serializers import PrimaryModelSerializer
 from tenancy.api.serializers_.tenants import TenantSerializer
+
+from ..field_serializers import IPAddressField, IPNetworkField
 from .asns import RIRSerializer
 from .nested import NestedIPAddressSerializer
 from .roles import RoleSerializer
 from .vlans import VLANSerializer
 from .vrfs import VRFSerializer
-from ..field_serializers import IPAddressField, IPNetworkField
 
 __all__ = (
     'AggregateSerializer',
-    'AvailableIPSerializer',
     'AvailableIPRequestSerializer',
+    'AvailableIPSerializer',
     'AvailablePrefixSerializer',
+    'CreateAvailablePrefixSerializer',
     'IPAddressSerializer',
     'IPRangeSerializer',
     'PrefixLengthSerializer',
@@ -94,10 +98,30 @@ class PrefixLengthSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'prefix_length': 'Invalid prefix length ({}) for IPv4'.format(requested_prefix)
             })
-        elif prefix.family == 6 and requested_prefix > 128:
+        if prefix.family == 6 and requested_prefix > 128:
             raise serializers.ValidationError({
                 'prefix_length': 'Invalid prefix length ({}) for IPv6'.format(requested_prefix)
             })
+        return data
+
+
+class CreateAvailablePrefixSerializer(PrefixSerializer):
+    """
+    Request payload for creating prefixes from the available-prefixes endpoint. The parent prefix supplies both
+    the `prefix` value (via a requested `prefix_length`) and the `vrf`, so neither is accepted here. Field
+    definitions are inherited from PrefixSerializer; only the request-specific `prefix_length` and `Meta.fields`
+    differ.
+    """
+    prefix_length = serializers.IntegerField()
+
+    class Meta(PrefixSerializer.Meta):
+        fields = [
+            'prefix_length', 'scope_type', 'scope_id', 'tenant', 'vlan', 'status', 'role', 'is_pool',
+            'mark_utilized', 'description', 'owner', 'comments', 'tags', 'custom_fields',
+        ]
+
+    def validate(self, data):
+        # Bypass model validation since we don't have an allocated prefix yet
         return data
 
 
@@ -109,9 +133,13 @@ class AvailablePrefixSerializer(serializers.Serializer):
     prefix = serializers.CharField(read_only=True)
     vrf = VRFSerializer(nested=True, read_only=True, allow_null=True)
 
+    @cached_property
+    def _vrf_serializer(self):
+        return VRFSerializer(nested=True, context={'request': self.context['request']})
+
     def to_representation(self, instance):
         if self.context.get('vrf'):
-            vrf = VRFSerializer(self.context['vrf'], nested=True, context={'request': self.context['request']}).data
+            vrf = self._vrf_serializer.to_representation(self.context['vrf'])
         else:
             vrf = None
         return {
@@ -173,11 +201,11 @@ class AvailableIPRequestSerializer(serializers.Serializer):
                     parent.mask_length
                 )
             })
-        elif parent.family == 4 and prefix_length > 32:
+        if parent.family == 4 and prefix_length > 32:
             raise serializers.ValidationError({
                 'prefix_length': 'Invalid prefix length ({}) for IPv6'.format(prefix_length)
             })
-        elif parent.family == 6 and prefix_length > 128:
+        if parent.family == 6 and prefix_length > 128:
             raise serializers.ValidationError({
                 'prefix_length': 'Invalid prefix length ({}) for IPv4'.format(prefix_length)
             })
@@ -220,9 +248,13 @@ class AvailableIPSerializer(serializers.Serializer):
     vrf = VRFSerializer(nested=True, read_only=True, allow_null=True)
     description = serializers.CharField(required=False)
 
+    @cached_property
+    def _vrf_serializer(self):
+        return VRFSerializer(nested=True, context={'request': self.context['request']})
+
     def to_representation(self, instance):
         if self.context.get('vrf'):
-            vrf = VRFSerializer(self.context['vrf'], nested=True, context={'request': self.context['request']}).data
+            vrf = self._vrf_serializer.to_representation(self.context['vrf'])
         else:
             vrf = None
         return {

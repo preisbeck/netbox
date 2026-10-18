@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django import forms
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
@@ -8,28 +10,45 @@ from dcim.constants import *
 from dcim.models import *
 from extras.models import ConfigTemplate
 from ipam.choices import VLANQinQRoleChoices
-from ipam.models import ASN, VLAN, VLANGroup, VRF
+from ipam.models import ASN, VLAN, VRF, VLANGroup
 from netbox.choices import *
 from netbox.forms import (
-    NestedGroupModelBulkEditForm, NetBoxModelBulkEditForm, OrganizationalModelBulkEditForm, PrimaryModelBulkEditForm,
+    NestedGroupModelBulkEditForm,
+    NetBoxModelBulkEditForm,
+    OrganizationalModelBulkEditForm,
+    PrimaryModelBulkEditForm,
 )
 from netbox.forms.mixins import ChangelogMessageMixin, OwnerMixin
 from tenancy.models import Tenant
 from users.models import User
 from utilities.forms import BulkEditForm, add_blank_choice, form_from_model
-from utilities.forms.fields import ColorField, DynamicModelChoiceField, DynamicModelMultipleChoiceField, JSONField
+from utilities.forms.fields import (
+    ChoiceField,
+    ColorField,
+    DynamicModelChoiceField,
+    DynamicModelMultipleChoiceField,
+    JSONField,
+    PositiveBigIntegerField,
+)
 from utilities.forms.rendering import FieldSet, InlineFields, TabbedGroups
-from utilities.forms.widgets import BulkEditNullBooleanSelect, NumberWithOptions
+from utilities.forms.widgets import BulkEditNullBooleanSelect, DatePicker, NumberWithOptions
 from virtualization.models import Cluster
 from wireless.choices import WirelessRoleChoices
 from wireless.models import WirelessLAN, WirelessLANGroup
 
 __all__ = (
     'CableBulkEditForm',
+    'CableBundleBulkEditForm',
     'ConsolePortBulkEditForm',
     'ConsolePortTemplateBulkEditForm',
     'ConsoleServerPortBulkEditForm',
     'ConsoleServerPortTemplateBulkEditForm',
+    'CoolingFeedBulkEditForm',
+    'CoolingIntakeBulkEditForm',
+    'CoolingIntakeTemplateBulkEditForm',
+    'CoolingOutflowBulkEditForm',
+    'CoolingOutflowTemplateBulkEditForm',
+    'CoolingSourceBulkEditForm',
     'DeviceBayBulkEditForm',
     'DeviceBayTemplateBulkEditForm',
     'DeviceBulkEditForm',
@@ -45,9 +64,10 @@ __all__ = (
     'LocationBulkEditForm',
     'MACAddressBulkEditForm',
     'ManufacturerBulkEditForm',
-    'ModuleBulkEditForm',
     'ModuleBayBulkEditForm',
     'ModuleBayTemplateBulkEditForm',
+    'ModuleBayTypeBulkEditForm',
+    'ModuleBulkEditForm',
     'ModuleTypeBulkEditForm',
     'ModuleTypeProfileBulkEditForm',
     'PlatformBulkEditForm',
@@ -58,6 +78,7 @@ __all__ = (
     'PowerPortBulkEditForm',
     'PowerPortTemplateBulkEditForm',
     'RackBulkEditForm',
+    'RackGroupBulkEditForm',
     'RackReservationBulkEditForm',
     'RackRoleBulkEditForm',
     'RackTypeBulkEditForm',
@@ -100,7 +121,7 @@ class SiteGroupBulkEditForm(NestedGroupModelBulkEditForm):
 
 
 class SiteBulkEditForm(PrimaryModelBulkEditForm):
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(SiteStatusChoices),
         required=False,
@@ -174,7 +195,7 @@ class LocationBulkEditForm(NestedGroupModelBulkEditForm):
             'site_id': '$site'
         }
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(LocationStatusChoices),
         required=False,
@@ -198,6 +219,14 @@ class LocationBulkEditForm(NestedGroupModelBulkEditForm):
     nullable_fields = ('parent', 'tenant', 'facility', 'description', 'comments')
 
 
+class RackGroupBulkEditForm(OrganizationalModelBulkEditForm):
+    model = RackGroup
+    fieldsets = (
+        FieldSet('description'),
+    )
+    nullable_fields = ('description', 'comments')
+
+
 class RackRoleBulkEditForm(OrganizationalModelBulkEditForm):
     color = ColorField(
         label=_('Color'),
@@ -217,12 +246,12 @@ class RackTypeBulkEditForm(PrimaryModelBulkEditForm):
         queryset=Manufacturer.objects.all(),
         required=False
     )
-    form_factor = forms.ChoiceField(
+    form_factor = ChoiceField(
         label=_('Form factor'),
         choices=add_blank_choice(RackFormFactorChoices),
         required=False
     )
-    width = forms.ChoiceField(
+    width = ChoiceField(
         label=_('Width'),
         choices=add_blank_choice(RackWidthChoices),
         required=False
@@ -255,7 +284,7 @@ class RackTypeBulkEditForm(PrimaryModelBulkEditForm):
         required=False,
         min_value=1
     )
-    outer_unit = forms.ChoiceField(
+    outer_unit = ChoiceField(
         label=_('Outer unit'),
         choices=add_blank_choice(RackDimensionUnitChoices),
         required=False
@@ -275,11 +304,21 @@ class RackTypeBulkEditForm(PrimaryModelBulkEditForm):
         min_value=0,
         required=False
     )
-    weight_unit = forms.ChoiceField(
+    weight_unit = ChoiceField(
         label=_('Weight unit'),
         choices=add_blank_choice(WeightUnitChoices),
         required=False,
         initial=''
+    )
+    cooling_capability = forms.ChoiceField(
+        label=_('Cooling capability'),
+        choices=add_blank_choice(RackCoolingCapabilityChoices),
+        required=False
+    )
+    cooling_capacity = forms.DecimalField(
+        label=_('Cooling capacity'),
+        min_value=0,
+        required=False
     )
 
     model = RackType
@@ -292,10 +331,11 @@ class RackTypeBulkEditForm(PrimaryModelBulkEditForm):
             name=_('Dimensions')
         ),
         FieldSet('starting_unit', 'desc_units', name=_('Numbering')),
+        FieldSet('cooling_capability', 'cooling_capacity', name=_('Cooling')),
     )
     nullable_fields = (
         'outer_width', 'outer_height', 'outer_depth', 'outer_unit', 'weight',
-        'max_weight', 'weight_unit', 'description', 'comments',
+        'max_weight', 'weight_unit', 'cooling_capability', 'cooling_capacity', 'description', 'comments',
     )
 
 
@@ -333,12 +373,17 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
             'site_id': '$site'
         }
     )
+    group = DynamicModelChoiceField(
+        label=_('Group'),
+        queryset=RackGroup.objects.all(),
+        required=False
+    )
     tenant = DynamicModelChoiceField(
         label=_('Tenant'),
         queryset=Tenant.objects.all(),
         required=False
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(RackStatusChoices),
         required=False,
@@ -364,12 +409,12 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
         max_length=50,
         required=False
     )
-    form_factor = forms.ChoiceField(
+    form_factor = ChoiceField(
         label=_('Form factor'),
         choices=add_blank_choice(RackFormFactorChoices),
         required=False
     )
-    width = forms.ChoiceField(
+    width = ChoiceField(
         label=_('Width'),
         choices=add_blank_choice(RackWidthChoices),
         required=False
@@ -398,7 +443,7 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
         required=False,
         min_value=1
     )
-    outer_unit = forms.ChoiceField(
+    outer_unit = ChoiceField(
         label=_('Outer unit'),
         choices=add_blank_choice(RackDimensionUnitChoices),
         required=False
@@ -408,9 +453,19 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
         required=False,
         min_value=1
     )
-    airflow = forms.ChoiceField(
+    airflow = ChoiceField(
         label=_('Airflow'),
         choices=add_blank_choice(RackAirflowChoices),
+        required=False
+    )
+    cooling_capability = forms.ChoiceField(
+        label=_('Cooling capability'),
+        choices=add_blank_choice(RackCoolingCapabilityChoices),
+        required=False
+    )
+    cooling_capacity = forms.DecimalField(
+        label=_('Cooling capacity'),
+        min_value=0,
         required=False
     )
     weight = forms.DecimalField(
@@ -423,7 +478,7 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
         min_value=0,
         required=False
     )
-    weight_unit = forms.ChoiceField(
+    weight_unit = ChoiceField(
         label=_('Weight unit'),
         choices=add_blank_choice(WeightUnitChoices),
         required=False,
@@ -432,20 +487,24 @@ class RackBulkEditForm(PrimaryModelBulkEditForm):
 
     model = Rack
     fieldsets = (
-        FieldSet('status', 'role', 'tenant', 'serial', 'asset_tag', 'rack_type', 'description', name=_('Rack')),
+        FieldSet(
+            'status', 'group', 'role', 'tenant', 'serial', 'asset_tag', 'rack_type', 'description', name=_('Rack')
+        ),
         FieldSet('region', 'site_group', 'site', 'location', name=_('Location')),
         FieldSet('outer_width', 'outer_height', 'outer_depth', 'outer_unit', name=_('Outer Dimensions')),
         FieldSet('form_factor', 'width', 'u_height', 'desc_units', 'airflow', 'mounting_depth', name=_('Hardware')),
+        FieldSet('cooling_capability', 'cooling_capacity', name=_('Cooling')),
         FieldSet('weight', 'max_weight', 'weight_unit', name=_('Weight')),
     )
     nullable_fields = (
-        'location', 'tenant', 'role', 'serial', 'asset_tag', 'outer_width', 'outer_height', 'outer_depth',
-        'outer_unit', 'weight', 'max_weight', 'weight_unit', 'description', 'comments',
+        'location', 'group', 'tenant', 'role', 'serial', 'asset_tag', 'outer_width', 'outer_height', 'outer_depth',
+        'outer_unit', 'cooling_capability', 'cooling_capacity', 'weight', 'max_weight', 'weight_unit', 'description',
+        'comments',
     )
 
 
 class RackReservationBulkEditForm(PrimaryModelBulkEditForm):
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(RackReservationStatusChoices),
         required=False,
@@ -507,9 +566,14 @@ class DeviceTypeBulkEditForm(PrimaryModelBulkEditForm):
         widget=BulkEditNullBooleanSelect(),
         label=_('Exclude from utilization')
     )
-    airflow = forms.ChoiceField(
+    airflow = ChoiceField(
         label=_('Airflow'),
         choices=add_blank_choice(DeviceAirflowChoices),
+        required=False
+    )
+    cooling_method = forms.ChoiceField(
+        label=_('Cooling method'),
+        choices=add_blank_choice(CoolingMethodChoices),
         required=False
     )
     weight = forms.DecimalField(
@@ -517,22 +581,48 @@ class DeviceTypeBulkEditForm(PrimaryModelBulkEditForm):
         min_value=0,
         required=False
     )
-    weight_unit = forms.ChoiceField(
+    weight_unit = ChoiceField(
         label=_('Weight unit'),
         choices=add_blank_choice(WeightUnitChoices),
         required=False,
         initial=''
+    )
+    end_of_life = forms.DateField(
+        label=_('End of life'),
+        required=False,
+        widget=DatePicker()
     )
 
     model = DeviceType
     fieldsets = (
         FieldSet(
             'manufacturer', 'default_platform', 'part_number', 'u_height', 'exclude_from_utilization', 'is_full_depth',
-            'airflow', 'description', name=_('Device Type')
+            'airflow', 'cooling_method', 'description', name=_('Device Type')
         ),
         FieldSet('weight', 'weight_unit', name=_('Weight')),
+        FieldSet('end_of_life', name=_('Lifecycle')),
     )
-    nullable_fields = ('part_number', 'airflow', 'weight', 'weight_unit', 'description', 'comments')
+    nullable_fields = (
+        'part_number', 'airflow', 'cooling_method', 'weight', 'weight_unit', 'end_of_life', 'description', 'comments',
+    )
+
+
+class ModuleBayTypeBulkEditForm(PrimaryModelBulkEditForm):
+    manufacturer = DynamicModelChoiceField(
+        label=_('Manufacturer'),
+        queryset=Manufacturer.objects.all(),
+        required=False,
+    )
+    color = ColorField(
+        label=_('Color'),
+        required=False,
+    )
+
+    model = ModuleBayType
+    fieldsets = (
+        FieldSet('manufacturer', 'color', 'description', name=_('Module Bay Type')),
+    )
+    nullable_fields = ('manufacturer', 'color', 'description', 'comments')
 
 
 class ModuleTypeProfileBulkEditForm(PrimaryModelBulkEditForm):
@@ -563,9 +653,14 @@ class ModuleTypeBulkEditForm(PrimaryModelBulkEditForm):
         label=_('Part number'),
         required=False
     )
-    airflow = forms.ChoiceField(
+    airflow = ChoiceField(
         label=_('Airflow'),
         choices=add_blank_choice(ModuleAirflowChoices),
+        required=False
+    )
+    cooling_method = forms.ChoiceField(
+        label=_('Cooling method'),
+        choices=add_blank_choice(CoolingMethodChoices),
         required=False
     )
     weight = forms.DecimalField(
@@ -573,23 +668,43 @@ class ModuleTypeBulkEditForm(PrimaryModelBulkEditForm):
         min_value=0,
         required=False
     )
-    weight_unit = forms.ChoiceField(
+    weight_unit = ChoiceField(
         label=_('Weight unit'),
         choices=add_blank_choice(WeightUnitChoices),
         required=False,
         initial=''
+    )
+    end_of_life = forms.DateField(
+        label=_('End of life'),
+        required=False,
+        widget=DatePicker()
+    )
+
+    add_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Add bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
+    )
+    remove_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Remove bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
     )
 
     model = ModuleType
     fieldsets = (
         FieldSet('profile', 'manufacturer', 'part_number', 'description', name=_('Module Type')),
         FieldSet(
-            'airflow',
             InlineFields('weight', 'max_weight', 'weight_unit', label=_('Weight')),
             name=_('Chassis')
         ),
+        FieldSet('cooling_method', 'airflow', name=_('Cooling')),
+        FieldSet('add_module_bay_types', 'remove_module_bay_types', name=_('Bay Types')),
+        FieldSet('end_of_life', name=_('Lifecycle')),
     )
-    nullable_fields = ('part_number', 'weight', 'weight_unit', 'profile', 'description', 'comments')
+    nullable_fields = (
+        'part_number', 'weight', 'weight_unit', 'profile', 'end_of_life', 'description', 'comments', 'cooling_method',
+    )
 
 
 class DeviceRoleBulkEditForm(NestedGroupModelBulkEditForm):
@@ -689,14 +804,19 @@ class DeviceBulkEditForm(PrimaryModelBulkEditForm):
         queryset=Platform.objects.all(),
         required=False
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(DeviceStatusChoices),
         required=False
     )
-    airflow = forms.ChoiceField(
+    airflow = ChoiceField(
         label=_('Airflow'),
         choices=add_blank_choice(DeviceAirflowChoices),
+        required=False
+    )
+    cooling_method = forms.ChoiceField(
+        label=_('Cooling method'),
+        choices=add_blank_choice(CoolingMethodChoices),
         required=False
     )
     serial = forms.CharField(
@@ -722,12 +842,12 @@ class DeviceBulkEditForm(PrimaryModelBulkEditForm):
     fieldsets = (
         FieldSet('role', 'status', 'tenant', 'platform', 'description', name=_('Device')),
         FieldSet('site', 'location', name=_('Location')),
-        FieldSet('manufacturer', 'device_type', 'airflow', 'serial', name=_('Hardware')),
+        FieldSet('manufacturer', 'device_type', 'airflow', 'cooling_method', 'serial', name=_('Hardware')),
         FieldSet('config_template', name=_('Configuration')),
         FieldSet('cluster', name=_('Virtualization')),
     )
     nullable_fields = (
-        'location', 'tenant', 'platform', 'serial', 'airflow', 'description', 'cluster', 'comments',
+        'location', 'tenant', 'platform', 'serial', 'airflow', 'cooling_method', 'description', 'cluster', 'comments',
     )
 
 
@@ -748,7 +868,7 @@ class ModuleBulkEditForm(PrimaryModelBulkEditForm):
             'parent': 'manufacturer',
         }
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(ModuleStatusChoices),
         required=False,
@@ -767,20 +887,38 @@ class ModuleBulkEditForm(PrimaryModelBulkEditForm):
     nullable_fields = ('serial', 'description', 'comments')
 
 
+class CableBundleBulkEditForm(PrimaryModelBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=CableBundle.objects.all(),
+        widget=forms.MultipleHiddenInput
+    )
+    description = forms.CharField(
+        label=_('Description'),
+        max_length=200,
+        required=False,
+    )
+
+    model = CableBundle
+    fieldsets = (
+        FieldSet('description',),
+    )
+    nullable_fields = ('description', 'comments')
+
+
 class CableBulkEditForm(PrimaryModelBulkEditForm):
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(CableTypeChoices),
         required=False,
         initial=''
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(LinkStatusChoices),
         required=False,
         initial=''
     )
-    profile = forms.ChoiceField(
+    profile = ChoiceField(
         label=_('Profile'),
         choices=add_blank_choice(CableProfileChoices),
         required=False,
@@ -790,6 +928,11 @@ class CableBulkEditForm(PrimaryModelBulkEditForm):
         label=_('Tenant'),
         queryset=Tenant.objects.all(),
         required=False
+    )
+    bundle = DynamicModelChoiceField(
+        label=_('Bundle'),
+        queryset=CableBundle.objects.all(),
+        required=False,
     )
     label = forms.CharField(
         label=_('Label'),
@@ -805,7 +948,7 @@ class CableBulkEditForm(PrimaryModelBulkEditForm):
         min_value=0,
         required=False
     )
-    length_unit = forms.ChoiceField(
+    length_unit = ChoiceField(
         label=_('Length unit'),
         choices=add_blank_choice(CableLengthUnitChoices),
         required=False,
@@ -814,11 +957,11 @@ class CableBulkEditForm(PrimaryModelBulkEditForm):
 
     model = Cable
     fieldsets = (
-        FieldSet('type', 'status', 'profile', 'tenant', 'label', 'description'),
+        FieldSet('type', 'status', 'profile', 'tenant', 'bundle', 'label', 'description'),
         FieldSet('color', 'length', 'length_unit', name=_('Attributes')),
     )
     nullable_fields = (
-        'type', 'status', 'profile', 'tenant', 'label', 'color', 'length', 'description', 'comments',
+        'type', 'status', 'profile', 'tenant', 'bundle', 'label', 'color', 'length', 'description', 'comments',
     )
 
 
@@ -889,25 +1032,25 @@ class PowerFeedBulkEditForm(PrimaryModelBulkEditForm):
         queryset=Rack.objects.all(),
         required=False,
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(PowerFeedStatusChoices),
         required=False,
         initial=''
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(PowerFeedTypeChoices),
         required=False,
         initial=''
     )
-    supply = forms.ChoiceField(
+    supply = ChoiceField(
         label=_('Supply'),
         choices=add_blank_choice(PowerFeedSupplyChoices),
         required=False,
         initial=''
     )
-    phase = forms.ChoiceField(
+    phase = ChoiceField(
         label=_('Phase'),
         choices=add_blank_choice(PowerFeedPhaseChoices),
         required=False,
@@ -940,7 +1083,131 @@ class PowerFeedBulkEditForm(PrimaryModelBulkEditForm):
         FieldSet('power_panel', 'rack', 'status', 'type', 'mark_connected', 'description', 'tenant'),
         FieldSet('supply', 'phase', 'voltage', 'amperage', 'max_utilization', name=_('Power'))
     )
-    nullable_fields = ('location', 'tenant', 'description', 'comments')
+    nullable_fields = ('rack', 'tenant', 'description', 'comments')
+
+
+#
+# Cooling
+#
+
+class CoolingSourceBulkEditForm(PrimaryModelBulkEditForm):
+    region = DynamicModelChoiceField(
+        label=_('Region'),
+        queryset=Region.objects.all(),
+        required=False,
+        initial_params={
+            'sites': '$site'
+        }
+    )
+    site_group = DynamicModelChoiceField(
+        label=_('Site group'),
+        queryset=SiteGroup.objects.all(),
+        required=False,
+        initial_params={
+            'sites': '$site'
+        }
+    )
+    site = DynamicModelChoiceField(
+        label=_('Site'),
+        queryset=Site.objects.all(),
+        required=False,
+        query_params={
+            'region_id': '$region',
+            'group_id': '$site_group',
+        }
+    )
+    location = DynamicModelChoiceField(
+        label=_('Location'),
+        queryset=Location.objects.all(),
+        required=False,
+        query_params={
+            'site_id': '$site'
+        }
+    )
+    type = forms.ChoiceField(
+        label=_('Type'),
+        choices=add_blank_choice(CoolingSourceTypeChoices),
+        required=False,
+        initial=''
+    )
+    status = forms.ChoiceField(
+        label=_('Status'),
+        choices=add_blank_choice(CoolingSourceStatusChoices),
+        required=False,
+        initial=''
+    )
+    fluid_type = forms.ChoiceField(
+        label=_('Fluid type'),
+        choices=add_blank_choice(FluidTypeChoices),
+        required=False,
+        initial=''
+    )
+    cooling_capacity = forms.DecimalField(
+        label=_('Cooling capacity'),
+        min_value=0,
+        required=False
+    )
+
+    model = CoolingSource
+    fieldsets = (
+        FieldSet('region', 'site_group', 'site', 'location', 'type', 'status', 'description'),
+        FieldSet('fluid_type', 'cooling_capacity', name=_('Characteristics')),
+    )
+    nullable_fields = (
+        'location', 'fluid_type', 'cooling_capacity', 'description', 'comments',
+    )
+
+
+class CoolingFeedBulkEditForm(PrimaryModelBulkEditForm):
+    cooling_source = DynamicModelChoiceField(
+        label=_('Cooling source'),
+        queryset=CoolingSource.objects.all(),
+        required=False
+    )
+    rack = DynamicModelChoiceField(
+        label=_('Rack'),
+        queryset=Rack.objects.all(),
+        required=False,
+    )
+    status = forms.ChoiceField(
+        label=_('Status'),
+        choices=add_blank_choice(CoolingFeedStatusChoices),
+        required=False,
+        initial=''
+    )
+    cooling_capacity = forms.DecimalField(
+        label=_('Cooling capacity'),
+        min_value=0,
+        required=False
+    )
+    max_flow = forms.DecimalField(
+        label=_('Max flow'),
+        min_value=Decimal('0.01'),
+        required=False
+    )
+    max_flow_unit = forms.ChoiceField(
+        label=_('Max flow unit'),
+        choices=add_blank_choice(FlowRateUnitChoices),
+        required=False,
+        initial=''
+    )
+    tenant = DynamicModelChoiceField(
+        queryset=Tenant.objects.all(),
+        required=False
+    )
+
+    model = CoolingFeed
+    fieldsets = (
+        FieldSet('cooling_source', 'rack', 'status', 'description', 'tenant'),
+        FieldSet(
+            'cooling_capacity', 'max_flow', 'max_flow_unit',
+            name=_('Characteristics')
+        ),
+    )
+    nullable_fields = (
+        'rack', 'cooling_capacity', 'max_flow', 'max_flow_unit',
+        'tenant', 'description', 'comments',
+    )
 
 
 #
@@ -961,9 +1228,13 @@ class ConsolePortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(ConsolePortTypeChoices),
+        required=False
+    )
+    description = forms.CharField(
+        label=_('Description'),
         required=False
     )
 
@@ -980,7 +1251,7 @@ class ConsoleServerPortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(ConsolePortTypeChoices),
         required=False
@@ -1003,7 +1274,7 @@ class PowerPortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(PowerPortTypeChoices),
         required=False
@@ -1045,7 +1316,7 @@ class PowerOutletTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(PowerOutletTypeChoices),
         required=False
@@ -1059,7 +1330,7 @@ class PowerOutletTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         queryset=PowerPortTemplate.objects.all(),
         required=False
     )
-    feed_leg = forms.ChoiceField(
+    feed_leg = ChoiceField(
         label=_('Feed leg'),
         choices=add_blank_choice(PowerOutletFeedLegChoices),
         required=False
@@ -1083,6 +1354,125 @@ class PowerOutletTemplateBulkEditForm(ComponentTemplateBulkEditForm):
             self.fields['power_port'].widget.attrs['disabled'] = True
 
 
+class CoolingIntakeTemplateBulkEditForm(ComponentTemplateBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=CoolingIntakeTemplate.objects.all(),
+        widget=forms.MultipleHiddenInput()
+    )
+    label = forms.CharField(
+        label=_('Label'),
+        max_length=64,
+        required=False
+    )
+    type = forms.ChoiceField(
+        label=_('Type'),
+        choices=add_blank_choice(CoolingConnectorTypeChoices),
+        required=False
+    )
+    diameter = forms.DecimalField(
+        label=_('Diameter'),
+        min_value=Decimal('0.01'),
+        required=False
+    )
+    diameter_unit = forms.ChoiceField(
+        label=_('Diameter unit'),
+        choices=add_blank_choice(DiameterUnitChoices),
+        required=False
+    )
+    max_flow = forms.DecimalField(
+        label=_('Max flow'),
+        min_value=Decimal('0.01'),
+        required=False
+    )
+    max_flow_unit = forms.ChoiceField(
+        label=_('Max flow unit'),
+        choices=add_blank_choice(FlowRateUnitChoices),
+        required=False
+    )
+    description = forms.CharField(
+        label=_('Description'),
+        required=False
+    )
+
+    fieldsets = (
+        FieldSet(
+            'label', 'type',
+            InlineFields('diameter', 'diameter_unit', label=_('Diameter')),
+            InlineFields('max_flow', 'max_flow_unit', label=_('Max flow')),
+            'description',
+        ),
+    )
+    nullable_fields = (
+        'label', 'type', 'diameter', 'diameter_unit', 'max_flow', 'max_flow_unit',
+        'description',
+    )
+
+
+class CoolingOutflowTemplateBulkEditForm(ComponentTemplateBulkEditForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=CoolingOutflowTemplate.objects.all(),
+        widget=forms.MultipleHiddenInput()
+    )
+    device_type = forms.ModelChoiceField(
+        label=_('Device type'),
+        queryset=DeviceType.objects.all(),
+        required=False,
+        disabled=True,
+        widget=forms.HiddenInput()
+    )
+    label = forms.CharField(
+        label=_('Label'),
+        max_length=64,
+        required=False
+    )
+    type = forms.ChoiceField(
+        label=_('Type'),
+        choices=add_blank_choice(CoolingConnectorTypeChoices),
+        required=False
+    )
+    diameter = forms.DecimalField(
+        label=_('Diameter'),
+        min_value=Decimal('0.01'),
+        required=False
+    )
+    diameter_unit = forms.ChoiceField(
+        label=_('Diameter unit'),
+        choices=add_blank_choice(DiameterUnitChoices),
+        required=False
+    )
+    cooling_intake = forms.ModelChoiceField(
+        label=_('Cooling intake'),
+        queryset=CoolingIntakeTemplate.objects.all(),
+        required=False
+    )
+    description = forms.CharField(
+        label=_('Description'),
+        required=False
+    )
+
+    fieldsets = (
+        FieldSet(
+            'label', 'type',
+            InlineFields('diameter', 'diameter_unit', label=_('Diameter')),
+            'cooling_intake', 'description',
+        ),
+    )
+    nullable_fields = (
+        'label', 'type', 'diameter', 'diameter_unit', 'cooling_intake', 'description',
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Limit cooling_intake queryset to CoolingIntakeTemplates which belong to the parent DeviceType
+        if 'device_type' in self.initial:
+            device_type = DeviceType.objects.filter(pk=self.initial['device_type']).first()
+            self.fields['cooling_intake'].queryset = CoolingIntakeTemplate.objects.filter(device_type=device_type)
+        else:
+            self.fields['cooling_intake'].choices = ()
+            self.fields['cooling_intake'].widget.attrs['disabled'] = True
+
+
 class InterfaceTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     pk = forms.ModelMultipleChoiceField(
         queryset=InterfaceTemplate.objects.all(),
@@ -1093,9 +1483,17 @@ class InterfaceTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(InterfaceTypeChoices),
+        required=False
+    )
+    channels = forms.IntegerField(
+        label=_('Channels'),
+        required=False
+    )
+    channel_id = forms.IntegerField(
+        label=_('Channel ID'),
         required=False
     )
     enabled = forms.NullBooleanField(
@@ -1112,26 +1510,26 @@ class InterfaceTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         label=_('Description'),
         required=False
     )
-    poe_mode = forms.ChoiceField(
+    poe_mode = ChoiceField(
         choices=add_blank_choice(InterfacePoEModeChoices),
         required=False,
         initial='',
         label=_('PoE mode')
     )
-    poe_type = forms.ChoiceField(
+    poe_type = ChoiceField(
         choices=add_blank_choice(InterfacePoETypeChoices),
         required=False,
         initial='',
         label=_('PoE type')
     )
-    rf_role = forms.ChoiceField(
+    rf_role = ChoiceField(
         choices=add_blank_choice(WirelessRoleChoices),
         required=False,
         initial='',
         label=_('Wireless role')
     )
 
-    nullable_fields = ('label', 'description', 'poe_mode', 'poe_type', 'rf_role')
+    nullable_fields = ('label', 'channels', 'channel_id', 'description', 'poe_mode', 'poe_type', 'rf_role')
 
 
 class FrontPortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
@@ -1144,7 +1542,7 @@ class FrontPortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(PortTypeChoices),
         required=False
@@ -1171,7 +1569,7 @@ class RearPortTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
-    type = forms.ChoiceField(
+    type = ChoiceField(
         label=_('Type'),
         choices=add_blank_choice(PortTypeChoices),
         required=False
@@ -1198,11 +1596,35 @@ class ModuleBayTemplateBulkEditForm(ComponentTemplateBulkEditForm):
         max_length=64,
         required=False
     )
+    position = forms.CharField(
+        label=_('Position'),
+        max_length=30,
+        required=False
+    )
     description = forms.CharField(
         label=_('Description'),
         required=False
     )
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
+    )
+    add_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Add bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
+    )
+    remove_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Remove bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
+    )
 
+    fieldsets = (
+        FieldSet('label', 'enabled', 'description'),
+        FieldSet('add_module_bay_types', 'remove_module_bay_types', name=_('Bay Types')),
+    )
     nullable_fields = ('label', 'position', 'description')
 
 
@@ -1219,6 +1641,11 @@ class DeviceBayTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     description = forms.CharField(
         label=_('Description'),
         required=False
+    )
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
     )
 
     nullable_fields = ('label', 'description')
@@ -1246,6 +1673,11 @@ class InventoryItemTemplateBulkEditForm(ComponentTemplateBulkEditForm):
     manufacturer = DynamicModelChoiceField(
         label=_('Manufacturer'),
         queryset=Manufacturer.objects.all(),
+        required=False
+    )
+    part_id = forms.CharField(
+        label=_('Part ID'),
+        max_length=50,
         required=False
     )
 
@@ -1371,12 +1803,77 @@ class PowerOutletBulkEditForm(
             self.fields['power_port'].widget.attrs['disabled'] = True
 
 
+class CoolingIntakeBulkEditForm(
+    ComponentBulkEditForm,
+    form_from_model(CoolingIntake, [
+        'label', 'type', 'diameter', 'diameter_unit', 'max_flow', 'max_flow_unit',
+        'description'
+    ])
+):
+    cooling_outflow = DynamicModelChoiceField(
+        label=_('Cooling outflow'),
+        queryset=CoolingOutflow.objects.all(),
+        required=False
+    )
+
+    model = CoolingIntake
+    fieldsets = (
+        FieldSet(
+            'module', 'type',
+            InlineFields('diameter', 'diameter_unit', label=_('Diameter')),
+            'label', 'cooling_outflow', 'description',
+        ),
+        FieldSet(
+            InlineFields('max_flow', 'max_flow_unit', label=_('Max flow')),
+            name=_('Characteristics')
+        ),
+    )
+    nullable_fields = (
+        'module', 'label', 'type', 'diameter', 'diameter_unit', 'max_flow', 'max_flow_unit',
+        'cooling_outflow', 'description',
+    )
+
+
+class CoolingOutflowBulkEditForm(
+    ComponentBulkEditForm,
+    form_from_model(
+        CoolingOutflow,
+        [
+            'label', 'type', 'diameter', 'diameter_unit', 'cooling_intake',
+            'description'
+        ]
+    )
+):
+    model = CoolingOutflow
+    fieldsets = (
+        FieldSet(
+            'module', 'type',
+            InlineFields('diameter', 'diameter_unit', label=_('Diameter')),
+            'label', 'description', 'cooling_intake',
+        ),
+    )
+    nullable_fields = (
+        'module', 'label', 'type', 'diameter', 'diameter_unit', 'cooling_intake', 'description',
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Limit cooling_intake queryset to CoolingIntakes which belong to the parent Device
+        if self.device_id:
+            device = Device.objects.filter(pk=self.device_id).first()
+            self.fields['cooling_intake'].queryset = CoolingIntake.objects.filter(device=device)
+        else:
+            self.fields['cooling_intake'].choices = ()
+            self.fields['cooling_intake'].widget.attrs['disabled'] = True
+
+
 class InterfaceBulkEditForm(
     ComponentBulkEditForm,
     form_from_model(Interface, [
-        'label', 'type', 'parent', 'bridge', 'lag', 'speed', 'duplex', 'wwn', 'mtu', 'mgmt_only', 'mark_connected',
-        'description', 'mode', 'rf_role', 'rf_channel', 'rf_channel_frequency', 'rf_channel_width', 'tx_power',
-        'wireless_lans', 'vlan_translation_policy'
+        'label', 'type', 'channels', 'channel_id', 'parent', 'bridge', 'lag', 'speed', 'duplex', 'wwn', 'mtu',
+        'mgmt_only', 'mark_connected', 'description', 'mode', 'rf_role', 'rf_channel', 'rf_channel_frequency',
+        'rf_channel_width', 'tx_power', 'wireless_lans', 'vlan_translation_policy'
     ])
 ):
     enabled = forms.NullBooleanField(
@@ -1417,7 +1914,7 @@ class InterfaceBulkEditForm(
             'device_id': '$device',
         }
     )
-    speed = forms.IntegerField(
+    speed = PositiveBigIntegerField(
         label=_('Speed'),
         required=False,
         widget=NumberWithOptions(
@@ -1429,13 +1926,13 @@ class InterfaceBulkEditForm(
         widget=BulkEditNullBooleanSelect,
         label=_('Management only')
     )
-    poe_mode = forms.ChoiceField(
+    poe_mode = ChoiceField(
         choices=add_blank_choice(InterfacePoEModeChoices),
         required=False,
         initial='',
         label=_('PoE mode')
     )
-    poe_type = forms.ChoiceField(
+    poe_type = ChoiceField(
         choices=add_blank_choice(InterfacePoETypeChoices),
         required=False,
         initial='',
@@ -1446,7 +1943,7 @@ class InterfaceBulkEditForm(
         required=False,
         widget=BulkEditNullBooleanSelect
     )
-    mode = forms.ChoiceField(
+    mode = ChoiceField(
         label=_('Mode'),
         choices=add_blank_choice(InterfaceModeChoices),
         required=False,
@@ -1524,11 +2021,11 @@ class InterfaceBulkEditForm(
 
     model = Interface
     fieldsets = (
-        FieldSet('module', 'type', 'label', 'speed', 'duplex', 'description'),
+        FieldSet('module', 'type', 'channels', 'label', 'speed', 'duplex', 'description'),
         FieldSet('vrf', 'wwn', name=_('Addressing')),
         FieldSet('vdcs', 'mtu', 'tx_power', 'enabled', 'mgmt_only', 'mark_connected', name=_('Operation')),
         FieldSet('poe_mode', 'poe_type', name=_('PoE')),
-        FieldSet('parent', 'bridge', 'lag', name=_('Related Interfaces')),
+        FieldSet('parent', 'channel_id', 'bridge', 'lag', name=_('Related Interfaces')),
         FieldSet(
             'mode', 'vlan_group', 'untagged_vlan', 'qinq_svlan', 'vlan_translation_policy', name=_('802.1Q Switching')
         ),
@@ -1544,9 +2041,9 @@ class InterfaceBulkEditForm(
         ),
     )
     nullable_fields = (
-        'module', 'label', 'parent', 'bridge', 'lag', 'speed', 'duplex', 'wwn', 'vdcs', 'mtu', 'description',
-        'poe_mode', 'poe_type', 'mode', 'rf_channel', 'rf_channel_frequency', 'rf_channel_width', 'tx_power',
-        'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'vrf', 'wireless_lans', 'vlan_translation_policy',
+        'module', 'label', 'channels', 'channel_id', 'parent', 'bridge', 'lag', 'speed', 'duplex', 'wwn', 'vdcs',
+        'mtu', 'description', 'poe_mode', 'poe_type', 'mode', 'rf_channel', 'rf_channel_frequency', 'rf_channel_width',
+        'tx_power', 'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'vrf', 'wireless_lans', 'vlan_translation_policy',
     )
 
     def __init__(self, *args, **kwargs):
@@ -1595,7 +2092,7 @@ class InterfaceBulkEditForm(
         if not self.cleaned_data['mode']:
             if self.cleaned_data['untagged_vlan']:
                 raise forms.ValidationError({'untagged_vlan': _("Interface mode must be specified to assign VLANs")})
-            elif self.cleaned_data['tagged_vlans']:
+            if self.cleaned_data['tagged_vlans']:
                 raise forms.ValidationError({'tagged_vlans': _("Interface mode must be specified to assign VLANs")})
 
         # Untagged interfaces cannot be assigned tagged VLANs
@@ -1647,9 +2144,26 @@ class ModuleBayBulkEditForm(
     form_from_model(ModuleBay, ['label', 'position', 'description']),
     NetBoxModelBulkEditForm
 ):
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
+    )
+    add_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Add bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
+    )
+    remove_module_bay_types = DynamicModelMultipleChoiceField(
+        label=_('Remove bay types'),
+        queryset=ModuleBayType.objects.all(),
+        required=False,
+    )
+
     model = ModuleBay
     fieldsets = (
-        FieldSet('label', 'position', 'description'),
+        FieldSet('label', 'position', 'enabled', 'description'),
+        FieldSet('add_module_bay_types', 'remove_module_bay_types', name=_('Bay Types')),
     )
     nullable_fields = ('label', 'position', 'description')
 
@@ -1658,9 +2172,15 @@ class DeviceBayBulkEditForm(
     form_from_model(DeviceBay, ['label', 'description']),
     NetBoxModelBulkEditForm
 ):
+    enabled = forms.NullBooleanField(
+        label=_('Enabled'),
+        required=False,
+        widget=BulkEditNullBooleanSelect,
+    )
+
     model = DeviceBay
     fieldsets = (
-        FieldSet('label', 'description'),
+        FieldSet('label', 'enabled', 'description'),
     )
     nullable_fields = ('label', 'description')
 
@@ -1684,7 +2204,7 @@ class InventoryItemBulkEditForm(
         queryset=Manufacturer.objects.all(),
         required=False
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         choices=add_blank_choice(InventoryItemStatusChoices),
         required=False,
@@ -1728,7 +2248,7 @@ class VirtualDeviceContextBulkEditForm(PrimaryModelBulkEditForm):
         queryset=Device.objects.all(),
         required=False
     )
-    status = forms.ChoiceField(
+    status = ChoiceField(
         label=_('Status'),
         required=False,
         choices=add_blank_choice(VirtualDeviceContextStatusChoices)
@@ -1744,6 +2264,13 @@ class VirtualDeviceContextBulkEditForm(PrimaryModelBulkEditForm):
         FieldSet('device', 'status', 'tenant'),
     )
     nullable_fields = ('device', 'tenant', )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # The ?device=<id> GET param is navigation context (filter), not an intent to change the
+        # device field — drop it from initial so Django's changed_data doesn't treat it as an edit.
+        self.initial.pop('device', None)
 
 
 #

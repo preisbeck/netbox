@@ -1,10 +1,14 @@
 import random
+import re
 import string
 from functools import cached_property
+
+from django.conf import settings
 
 __all__ = (
     'FieldSet',
     'InlineFields',
+    'M2MAddRemoveFields',
     'ObjectAttribute',
     'TabbedGroups',
 )
@@ -24,10 +28,16 @@ class FieldSet:
     Parameters:
         items: An iterable of items to be rendered (one per row)
         name: The fieldset's name, displayed as a heading (optional)
+        html_id: An HTML id for the rendered fieldset div, enabling HTMX partial swaps (optional).
+            Must be a valid CSS identifier: start with a letter, use only letters, digits, hyphens, underscores.
     """
-    def __init__(self, *items, name=None):
+    def __init__(self, *items, name=None, html_id=None):
+        if html_id is not None and settings.DEBUG:
+            if not re.match(r'^[a-zA-Z][a-zA-Z0-9_-]*$', html_id):
+                raise ValueError(f"html_id {html_id!r} is not a valid CSS identifier")
         self.items = items
         self.name = name
+        self.html_id = html_id
 
 
 class InlineFields:
@@ -37,10 +47,12 @@ class InlineFields:
     Parameters:
         fields: An iterable of form field names
         label: The label text to render for the row (optional)
+        help_text: Explanatory text rendered beneath the entire set of fields (optional)
     """
-    def __init__(self, *fields, label=None):
+    def __init__(self, *fields, label=None, help_text=None):
         self.fields = fields
         self.label = label
+        self.help_text = help_text
 
 
 class TabbedGroups:
@@ -71,6 +83,27 @@ class TabbedGroups:
                 'fields': group.items,
             } for i, group in enumerate(self.groups, start=1)
         ]
+
+
+class M2MAddRemoveFields:
+    """
+    Represents a many-to-many relationship field on a form. It supports two rendering modes:
+
+    1. Simple mode: A single multi-select field pre-populated with current values. This is used
+       for new objects or existing objects with fewer than THRESHOLD current assignments.
+    2. Add/remove mode: Two separate fields for adding and removing relations. This avoids
+       crashing the browser when an object has a very large number of current assignments.
+
+    The form must define three fields: '{name}', 'add_{name}', and 'remove_{name}'. The form's
+    __init__() method determines the mode and removes the unused fields.
+
+    Parameters:
+        name: The name of the M2M field on the model (e.g. 'asns').
+    """
+    THRESHOLD = 100
+
+    def __init__(self, name):
+        self.name = name
 
 
 class ObjectAttribute:

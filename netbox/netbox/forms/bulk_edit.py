@@ -6,6 +6,7 @@ from extras.choices import *
 from extras.models import Tag
 from utilities.forms import BulkEditForm
 from utilities.forms.fields import CommentField, DynamicModelMultipleChoiceField
+
 from .mixins import ChangelogMessageMixin, CustomFieldsMixin, OwnerMixin
 
 __all__ = (
@@ -58,7 +59,11 @@ class NetBoxModelBulkEditForm(ChangelogMessageMixin, CustomFieldsMixin, BulkEdit
         return customfield.to_form_field(set_initial=False, enforce_required=False)
 
     def _extend_nullable_fields(self):
-        nullable_common_fields = ['owner']
+        # The bulk edit template always renders a Set Null control for these
+        nullable_common_fields = [
+            name for name in ('owner', 'comments')
+            if name in self.fields and name not in self.nullable_fields
+        ]
         nullable_custom_fields = [
             name for name, customfield in self.custom_fields.items()
             if (not customfield.required and customfield.ui_editable == CustomFieldUIEditableChoices.YES)

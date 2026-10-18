@@ -3,7 +3,7 @@ import re
 import nh3
 from django.utils.html import escape
 
-from .constants import HTML_ALLOWED_ATTRIBUTES, HTML_ALLOWED_TAGS
+from .constants import HTML_ALLOWED_ATTRIBUTES, HTML_ALLOWED_TAGS, IMAGE_URL_SCHEMES
 
 __all__ = (
     'clean_html',
@@ -11,17 +11,36 @@ __all__ = (
     'highlight',
 )
 
+SCHEME_RE = re.compile(r'^([a-zA-Z][a-zA-Z0-9+.-]*):')
+
+# Per the URL spec, browsers ignore leading/trailing C0 control characters & space, and strip any tab or
+# newline characters appearing within a URL. We must normalize accordingly before checking the scheme.
+URL_STRIP_CHARS = ''.join(chr(c) for c in range(0x21))
+URL_REMOVE_CHARS = str.maketrans('', '', '\t\r\n')
+
+
+def _attribute_filter(tag, attr, value):
+    """Returns str to keep/modify attribute, None to remove it."""
+    if tag == 'img' and attr == 'src':
+        match = SCHEME_RE.match(value.strip(URL_STRIP_CHARS).translate(URL_REMOVE_CHARS))
+        if match and match.group(1).lower() not in IMAGE_URL_SCHEMES:
+            return None
+    return value
+
 
 def clean_html(html, schemes):
     """
     Sanitizes HTML based on a whitelist of allowed tags and attributes.
     Also takes a list of allowed URI schemes.
     """
+    url_schemes = set(schemes)
+    attribute_filter = None if url_schemes <= IMAGE_URL_SCHEMES else _attribute_filter
     return nh3.clean(
         html,
         tags=HTML_ALLOWED_TAGS,
         attributes=HTML_ALLOWED_ATTRIBUTES,
-        url_schemes=set(schemes)
+        url_schemes=url_schemes,
+        attribute_filter=attribute_filter,
     )
 
 
@@ -37,8 +56,7 @@ def foreground_color(bg_color, dark='000000', light='ffffff'):
     r, g, b = [int(bg_color[c:c + 2], 16) for c in (0, 2, 4)]
     if r * 0.299 + g * 0.587 + b * 0.114 > THRESHOLD:
         return dark
-    else:
-        return light
+    return light
 
 
 def highlight(value, highlight, trim_pre=None, trim_post=None, trim_placeholder='...'):

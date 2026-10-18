@@ -1,5 +1,5 @@
 import json
-from typing import Dict, Any
+from typing import Any
 from urllib.parse import quote
 
 from django import template
@@ -8,26 +8,35 @@ from django.utils.html import conditional_escape
 from django.utils.translation import gettext_lazy as _
 
 from core.models import ObjectType
-from utilities.forms import get_selected_values, TableConfigForm
-from utilities.forms.mixins import FORM_FIELD_LOOKUPS
-from utilities.views import get_viewname, get_action_url
 from netbox.settings import DISK_BASE_UNIT, RAM_BASE_UNIT
+from netbox.ui.attrs import (
+    compute_diameter_display,
+    compute_distance_display,
+    compute_flow_rate_display,
+    compute_weight_display,
+)
+from utilities.forms import TableConfigForm, get_selected_values
+from utilities.forms.mixins import FORM_FIELD_LOOKUPS
+from utilities.views import get_action_url, get_viewname
 
 __all__ = (
     'action_url',
     'applied_filters',
     'as_range',
+    'display_diameter',
+    'display_distance',
+    'display_flow_rate',
+    'display_weight',
     'divide',
     'get_item',
     'get_key',
-    'humanize_disk_megabytes',
-    'humanize_ram_megabytes',
+    'humanize_disk_capacity',
+    'humanize_ram_capacity',
     'humanize_speed',
     'icon_from_status',
     'kg_to_pounds',
     'meters_to_feet',
     'percentage',
-    'querystring',
     'startswith',
     'status_from_tag',
     'table_config_form',
@@ -186,65 +195,100 @@ def action_url(parser, token):
     return ActionURLNode(model, action, kwargs, asvar)
 
 
+def _format_speed(speed, divisor, unit):
+    """
+    Format a speed value with a given divisor and unit.
+
+    Handles decimal values and strips trailing zeros for clean output.
+    """
+    whole, remainder = divmod(speed, divisor)
+    if remainder == 0:
+        return f'{whole} {unit}'
+
+    # Divisors are powers of 10, so len(str(divisor)) - 1 matches the decimal precision.
+    precision = len(str(divisor)) - 1
+    fraction = f'{remainder:0{precision}d}'.rstrip('0')
+    return f'{whole}.{fraction} {unit}'
+
+
 @register.filter()
 def humanize_speed(speed):
     """
-    Humanize speeds given in Kbps. Examples:
+    Humanize speeds given in Kbps, always using the largest appropriate unit.
 
-        1544 => "1.544 Mbps"
-        100000 => "100 Mbps"
-        10000000 => "10 Gbps"
+    Decimal values are displayed when the result is not a whole number;
+    trailing zeros after the decimal point are stripped for clean output.
+
+    Examples:
+
+        1_544 => "1.544 Mbps"
+        100_000 => "100 Mbps"
+        1_000_000 => "1 Gbps"
+        2_500_000 => "2.5 Gbps"
+        10_000_000 => "10 Gbps"
+        800_000_000 => "800 Gbps"
+        1_600_000_000 => "1.6 Tbps"
     """
     if not speed:
         return ''
-    if speed >= 1000000000 and speed % 1000000000 == 0:
-        return '{} Tbps'.format(int(speed / 1000000000))
-    elif speed >= 1000000 and speed % 1000000 == 0:
-        return '{} Gbps'.format(int(speed / 1000000))
-    elif speed >= 1000 and speed % 1000 == 0:
-        return '{} Mbps'.format(int(speed / 1000))
-    elif speed >= 1000:
-        return '{} Mbps'.format(float(speed) / 1000)
-    else:
-        return '{} Kbps'.format(speed)
+
+    speed = int(speed)
+
+    if speed >= 1_000_000_000:
+        return _format_speed(speed, 1_000_000_000, 'Tbps')
+    if speed >= 1_000_000:
+        return _format_speed(speed, 1_000_000, 'Gbps')
+    if speed >= 1_000:
+        return _format_speed(speed, 1_000, 'Mbps')
+    return f'{speed} Kbps'
 
 
-def _humanize_megabytes(mb, divisor=1000):
+def _humanize_capacity(value, divisor=1000):
     """
-    Express a number of megabytes in the most suitable unit (e.g. gigabytes, terabytes, etc.).
+    Express a capacity value in the most suitable unit (e.g. GB, TiB, etc.).
+
+    The value is treated as a unitless base-unit quantity; the divisor determines
+    both the scaling thresholds and the label convention:
+      - 1000: SI labels (MB, GB, TB, PB)
+      - 1024: IEC labels (MiB, GiB, TiB, PiB)
     """
-    if not mb:
+    if not value:
         return ""
+
+    if divisor == 1024:
+        labels = ('MiB', 'GiB', 'TiB', 'PiB')
+    else:
+        labels = ('MB', 'GB', 'TB', 'PB')
 
     PB_SIZE = divisor**3
     TB_SIZE = divisor**2
     GB_SIZE = divisor
 
-    if mb >= PB_SIZE:
-        return f"{mb / PB_SIZE:.2f} PB"
-    if mb >= TB_SIZE:
-        return f"{mb / TB_SIZE:.2f} TB"
-    if mb >= GB_SIZE:
-        return f"{mb / GB_SIZE:.2f} GB"
-    return f"{mb} MB"
+    if value >= PB_SIZE:
+        return f"{value / PB_SIZE:.2f} {labels[3]}"
+    if value >= TB_SIZE:
+        return f"{value / TB_SIZE:.2f} {labels[2]}"
+    if value >= GB_SIZE:
+        return f"{value / GB_SIZE:.2f} {labels[1]}"
+    return f"{value} {labels[0]}"
 
 
 @register.filter()
-def humanize_disk_megabytes(mb):
+def humanize_disk_capacity(value):
     """
-    Express a number of megabytes in the most suitable unit (e.g. gigabytes, terabytes, etc.).
-    Use the DISK_BASE_UNIT setting to determine the divisor. Default is 1000.
+    Express a disk capacity in the most suitable unit, using the DISK_BASE_UNIT
+    setting to select SI (MB/GB) or IEC (MiB/GiB) labels.
     """
-    return _humanize_megabytes(mb, DISK_BASE_UNIT)
+    return _humanize_capacity(value, DISK_BASE_UNIT)
 
 
 @register.filter()
-def humanize_ram_megabytes(mb):
+def humanize_ram_capacity(value):
     """
-    Express a number of megabytes in the most suitable unit (e.g. gigabytes, terabytes, etc.).
-    Use the RAM_BASE_UNIT setting to determine the divisor. Default is 1000.
+    Express a RAM capacity in the most suitable unit, using the RAM_BASE_UNIT
+    setting to select SI (MB/GB) or IEC (MiB/GiB) labels.
     """
-    return _humanize_megabytes(mb, RAM_BASE_UNIT)
+    return _humanize_capacity(value, RAM_BASE_UNIT)
 
 
 @register.filter()
@@ -296,6 +340,54 @@ def kg_to_pounds(n):
     return float(n) * 2.204623
 
 
+@register.simple_tag(takes_context=True)
+def display_weight(context, weight, weight_unit, abs_weight):
+    """
+    Render a weight value respecting the user's ui.measurement_system preference.
+    """
+    if weight is None:
+        return ''
+    system = (context.get('preferences') or {}).get('ui.measurement_system') or ''
+    value, unit = compute_weight_display(weight, weight_unit, abs_weight, system)
+    return f'{value:g} {unit}'
+
+
+@register.simple_tag(takes_context=True)
+def display_distance(context, distance, distance_unit, abs_distance):
+    """
+    Render a distance value respecting the user's ui.measurement_system preference.
+    """
+    if distance is None:
+        return ''
+    system = (context.get('preferences') or {}).get('ui.measurement_system') or ''
+    value, unit = compute_distance_display(distance, distance_unit, abs_distance, system)
+    return f'{value:g} {unit}'
+
+
+@register.simple_tag(takes_context=True)
+def display_diameter(context, diameter, diameter_unit, abs_diameter):
+    """
+    Render a diameter value respecting the user's ui.measurement_system preference.
+    """
+    if diameter is None:
+        return ''
+    system = (context.get('preferences') or {}).get('ui.measurement_system') or ''
+    value, unit = compute_diameter_display(diameter, diameter_unit, abs_diameter, system)
+    return f'{value:g} {unit}'
+
+
+@register.simple_tag(takes_context=True)
+def display_flow_rate(context, flow_rate, flow_rate_unit, abs_flow_rate):
+    """
+    Render a flow rate value respecting the user's ui.measurement_system preference.
+    """
+    if flow_rate is None:
+        return ''
+    system = (context.get('preferences') or {}).get('ui.measurement_system') or ''
+    value, unit = compute_flow_rate_display(flow_rate, flow_rate_unit, abs_flow_rate, system)
+    return f'{value:g} {unit}'
+
+
 @register.filter("startswith")
 def startswith(text: str, starts: str) -> bool:
     """
@@ -307,7 +399,7 @@ def startswith(text: str, starts: str) -> bool:
 
 
 @register.filter
-def get_key(value: Dict, arg: str) -> Any:
+def get_key(value: dict, arg: str) -> Any:
     """
     Template implementation of `dict.get()`, for accessing dict values
     by key when the key is not able to be used in a template. For
@@ -358,24 +450,6 @@ def icon_from_status(status: str = "info") -> str:
 #
 # Tags
 #
-
-@register.simple_tag()
-def querystring(request, **kwargs):
-    """
-    Append or update the page number in a querystring.
-    """
-    querydict = request.GET.copy()
-    for k, v in kwargs.items():
-        if v is not None:
-            querydict[k] = str(v)
-        elif k in querydict:
-            querydict.pop(k)
-    querystring = querydict.urlencode(safe='/')
-    if querystring:
-        return '?' + querystring
-    else:
-        return ''
-
 
 @register.inclusion_tag('helpers/utilization_graph.html')
 def utilization_graph(utilization, warning_threshold=75, danger_threshold=90):
@@ -479,6 +553,35 @@ def applied_filters(context, model, form, query_params):
         applied_filters.append({
             'name': param_name,  # Use actual param name for removal link
             'value': form.cleaned_data.get(filter_name),
+            'link_url': f'?{querydict.urlencode()}',
+            'link_text': link_text,
+        })
+
+    # Handle empty modifier pills separately. `FilterModifierWidget.value_from_datadict()`
+    # returns None for fields with a `field__empty` query parameter so that the underlying
+    # form field does not attempt to validate 'true'/'false' as a real field value (which
+    # would raise a ValidationError for ModelChoiceField). Because the value is None, these
+    # fields never appear in `form.changed_data`, so we build their pills directly from the
+    # query parameters here.
+    for param_name, param_value in query_params.items():
+        if not param_name.endswith('__empty'):
+            continue
+        field_name = param_name[:-len('__empty')]
+        if field_name not in form.fields or field_name == 'filter_id':
+            continue
+
+        querydict = query_params.copy()
+        querydict.pop(param_name)
+        label = form.fields[field_name].label or field_name
+
+        if param_value.lower() in ('true', '1'):
+            link_text = f'{label} {_("is empty")}'
+        else:
+            link_text = f'{label} {_("is not empty")}'
+
+        applied_filters.append({
+            'name': param_name,
+            'value': param_value,
             'link_url': f'?{querydict.urlencode()}',
             'link_text': link_text,
         })

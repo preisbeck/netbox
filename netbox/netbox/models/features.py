@@ -5,25 +5,26 @@ from functools import cached_property
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import ValidationError
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
-from taggit.managers import TaggableManager
 
 from core.choices import JobStatusChoices, ObjectChangeActionChoices
 from core.models import ObjectType
 from extras.choices import *
 from extras.constants import CUSTOMFIELD_EMPTY_VALUES
+from extras.managers import NetBoxTaggableManager, NetBoxTaggableManagerField
 from extras.utils import is_taggable
 from netbox.config import get_config
-from netbox.constants import CORE_APPS
+from netbox.constants import CORE_APPS, JOB_DELETE_BATCH_SIZE
 from netbox.models.deletion import DeleteMixin
 from netbox.plugins import PluginConfig
 from netbox.registry import registry
 from netbox.signals import post_clean
 from netbox.utils import register_model_feature
 from utilities.json import CustomFieldJSONEncoder
+from utilities.permissions import ModelAction, register_model_actions
 from utilities.serialization import serialize_object
 
 __all__ = (
@@ -42,6 +43,7 @@ __all__ = (
     'NotificationsMixin',
     'SyncedDataMixin',
     'TagsMixin',
+    'batch_delete_jobs',
     'get_model_features',
     'has_feature',
     'model_is_public',
@@ -153,20 +155,27 @@ class CloningMixin(models.Model):
 
         for field_name in getattr(self, 'clone_fields', []):
             field = self._meta.get_field(field_name)
+
+            # A GenericForeignKey is cloned under the subwidget names the creation form's
+            # GenericObjectChoiceField expects (e.g. scope_content_type / scope_object_id).
+            if isinstance(field, GenericForeignKey):
+                content_type_id = getattr(self, f'{field.ct_field}_id', None)
+                object_id = getattr(self, field.fk_field, None)
+
+                if content_type_id not in (None, '') and object_id not in (None, ''):
+                    attrs[f'{field.name}_content_type'] = content_type_id
+                    attrs[f'{field.name}_object_id'] = object_id
+
+                continue
+
             field_value = field.value_from_object(self)
+
             if field_value and isinstance(field, models.ManyToManyField):
                 attrs[field_name] = [v.pk for v in field_value]
             elif field_value and isinstance(field, models.JSONField):
                 attrs[field_name] = json.dumps(field_value)
             elif field_value not in (None, ''):
                 attrs[field_name] = field_value
-
-        # Handle GenericForeignKeys. If the CT and ID fields are being cloned, also
-        # include the name of the GFK attribute itself, as this is what forms expect.
-        for field in self._meta.private_fields:
-            if isinstance(field, GenericForeignKey):
-                if field.ct_field in attrs and field.fk_field in attrs:
-                    attrs[field.name] = attrs[field.fk_field]
 
         # Include tags (if applicable)
         if is_taggable(self):
@@ -213,12 +222,12 @@ class CustomFieldsMixin(models.Model):
     @cached_property
     def custom_fields(self):
         """
-        Return the QuerySet of CustomFields assigned to this model.
+        Return the list of CustomFields assigned to this model.
 
         ```python
         >>> tenant = Tenant.objects.first()
         >>> tenant.custom_fields
-        <RestrictedQuerySet [<CustomField: Primary site>, <CustomField: Customer ID>, <CustomField: Is active>]>
+        [<CustomField: Primary site>, <CustomField: Customer ID>, <CustomField: Is active>]
         ```
         """
         from extras.models import CustomField
@@ -246,7 +255,7 @@ class CustomFieldsMixin(models.Model):
             # Skip hidden fields if 'omit_hidden' is True
             if omit_hidden and field.ui_visible == CustomFieldUIVisibleChoices.HIDDEN:
                 continue
-            elif omit_hidden and field.ui_visible == CustomFieldUIVisibleChoices.IF_SET and not value:
+            if omit_hidden and field.ui_visible == CustomFieldUIVisibleChoices.IF_SET and not value:
                 continue
 
             data[field] = field.deserialize(value)
@@ -268,9 +277,10 @@ class CustomFieldsMixin(models.Model):
         """
         from extras.models import CustomField
         groups = defaultdict(dict)
-        visible_custom_fields = CustomField.objects.get_for_model(self).exclude(
-            ui_visible=CustomFieldUIVisibleChoices.HIDDEN
-        )
+        visible_custom_fields = [
+            cf for cf in CustomField.objects.get_for_model(self)
+            if cf.ui_visible != CustomFieldUIVisibleChoices.HIDDEN
+        ]
 
         for cf in visible_custom_fields:
             value = self.custom_field_data.get(cf.name)
@@ -281,38 +291,43 @@ class CustomFieldsMixin(models.Model):
 
         return dict(groups)
 
-    def populate_custom_field_defaults(self):
-        """
-        Apply the default value for each custom field
-        """
-        for cf in self.custom_fields:
-            self.custom_field_data[cf.name] = cf.default
-    populate_custom_field_defaults.alters_data = True
-
     def clean(self):
         super().clean()
         from extras.models import CustomField
 
+        # Fields still being provisioned are fetched alongside the active ones, but are not live:
+        # their stored data belongs to the job acting on it, so it is neither validated below nor
+        # pruned as stale -- while remaining subject to the defaults applied in save(), which draws
+        # on this same set of statuses. Only active fields are validated or enforced as required.
+        assigned_fields = CustomField.objects.get_for_model(
+            self, statuses=CustomFieldStatusChoices.DATA_STATUSES
+        )
         custom_fields = {
-            cf.name: cf for cf in CustomField.objects.get_for_model(self)
+            cf.name: cf for cf in assigned_fields
+            if cf.status == CustomFieldStatusChoices.STATUS_ACTIVE
         }
 
         # Remove any stale custom field data
+        assigned_names = {cf.name for cf in assigned_fields}
         self.custom_field_data = {
-            k: v for k, v in self.custom_field_data.items() if k in custom_fields.keys()
+            k: v for k, v in self.custom_field_data.items() if k in assigned_names
         }
 
         # Validate all field values
         for field_name, value in self.custom_field_data.items():
+            if (cf := custom_fields.get(field_name)) is None:
+                # The field is not live; its value is left to the job which is provisioning it
+                continue
+
             try:
-                custom_fields[field_name].validate(value)
+                cf.validate(value)
             except ValidationError as e:
                 raise ValidationError(_("Invalid value for custom field '{name}': {error}").format(
                     name=field_name, error=e.message
                 ))
 
             # Validate uniqueness if enforced
-            if custom_fields[field_name].unique and value not in CUSTOMFIELD_EMPTY_VALUES:
+            if cf.unique and value not in CUSTOMFIELD_EMPTY_VALUES:
                 if self._meta.model.objects.exclude(pk=self.pk).filter(**{
                     f'custom_field_data__{field_name}': value
                 }).exists():
@@ -328,10 +343,13 @@ class CustomFieldsMixin(models.Model):
     def save(self, *args, **kwargs):
         from extras.models import CustomField
 
-        # Populate default values for custom fields not already present in the object data
-        for cf in CustomField.objects.get_for_model(self):
-            if cf.name not in self.custom_field_data and cf.default is not None:
-                self.custom_field_data[cf.name] = cf.default
+        # Populate default values for custom fields not already present in the object data. This
+        # covers fields still being provisioned as well as active ones, so that an object created
+        # while a new field is being backfilled does not miss its default (see
+        # CustomFieldManager.get_defaults_for_model()).
+        for name, default in CustomField.objects.get_defaults_for_model(self).items():
+            if name not in self.custom_field_data:
+                self.custom_field_data[name] = default
 
         super().save(*args, **kwargs)
 
@@ -405,13 +423,14 @@ class ContactsMixin(models.Model):
             inherited: If `True`, inherited contacts from parent objects are included.
         """
         from tenancy.models import ContactAssignment
-        from . import NestedGroupModel
+
+        from . import NestedGroupModel, NestedLtreeGroupModel
 
         filter = Q(
             object_type=ObjectType.objects.get_for_model(self),
             object_id__in=(
                 self.get_ancestors(include_self=True)
-                if (isinstance(self, NestedGroupModel) and inherited)
+                if (isinstance(self, (NestedGroupModel, NestedLtreeGroupModel)) and inherited)
                 else [self.pk]
             ),
         )
@@ -447,9 +466,39 @@ class NotificationsMixin(models.Model):
         abstract = True
 
 
+def batch_delete_jobs(job_queryset):
+    """
+    Delete the Jobs in `job_queryset` in JOB_DELETE_BATCH_SIZE chunks. Job cannot be fast-deleted
+    (a global pre_delete receiver forces per-instance signals), so a single delete would build one
+    huge collection of Job instances and run one very long DELETE; batching bounds the per-cycle
+    work. Callers are responsible for wrapping this in a transaction. As with the prior cascade
+    behavior, this bulk delete does not invoke Job.delete() and therefore does not cancel the
+    backing RQ job. See #22812.
+    """
+    from core.models import Job
+
+    # Route writes to the same database the queryset reads from. In JobsMixin.delete the queryset
+    # is bound to the instance's DB while Job.objects would otherwise use the router default; if
+    # those diverge the deleted rows never leave the read side and the loop below never terminates.
+    jobs = Job.objects.using(job_queryset.db)
+
+    job_pks = job_queryset.order_by('pk').values_list('pk', flat=True)
+    # Re-slice the queryset each iteration: it re-queries after each batch delete, so the
+    # remaining set shrinks and the loop terminates (do not hoist this into a cursor).
+    while pks := list(job_pks[:JOB_DELETE_BATCH_SIZE]):
+        # only('pk'): the batch still can't fast-delete, so each Job in the batch is instantiated;
+        # loading just the PK avoids pulling the large data/log_entries payloads into memory.
+        jobs.filter(pk__in=pks).only('pk').delete()
+
+
 class JobsMixin(models.Model):
     """
     Enables support for job results.
+
+    Note: for the job-batching in delete() to run, JobsMixin must precede DeleteMixin in a
+    model's MRO. DeleteMixin.delete() drives its own collector and does not call super(), so a
+    model declared as e.g. `class Foo(NetBoxModel, JobsMixin)` would reach DeleteMixin first and
+    bypass the batching. Core models that combine both (e.g. DataSource) list JobsMixin first.
     """
     jobs = GenericRelation(
         to='core.Job',
@@ -461,11 +510,21 @@ class JobsMixin(models.Model):
     class Meta:
         abstract = True
 
+    def delete(self, using=None, *args, **kwargs):
+        # Delete associated jobs in batches so the cascade never has to load thousands of Job
+        # rows into memory at once. Wrapped in a transaction so that a failure in the parent
+        # delete rolls the job deletions back as well. See #22812.
+        using = using or router.db_for_write(self.__class__, instance=self)
+        with transaction.atomic(using=using):
+            batch_delete_jobs(self.jobs.using(using))
+            return super().delete(using, *args, **kwargs)
+    delete.alters_data = True
+
     def get_latest_jobs(self):
         """
         Return a list of the most recent jobs for this instance.
         """
-        return self.jobs.filter(status__in=JobStatusChoices.TERMINAL_STATE_CHOICES).order_by('-created').defer('data')
+        return self.jobs.filter(status__in=JobStatusChoices.TERMINAL_STATE_CHOICES).order_by('-started').defer('data')
 
 
 class JournalingMixin(models.Model):
@@ -486,11 +545,15 @@ class JournalingMixin(models.Model):
 class TagsMixin(models.Model):
     """
     Enables support for tag assignment. Assigned tags can be managed via the `tags` attribute,
-    which is a `TaggableManager` instance.
+    which is a `NetBoxTaggableManager` instance. The field is a `NetBoxTaggableManagerField`,
+    which performs `%(app_label)s` / `%(class)s` interpolation on `related_name` to avoid
+    reverse-accessor collisions between same-named models in different apps (e.g. plugins).
     """
-    tags = TaggableManager(
+    tags = NetBoxTaggableManagerField(
         through='extras.TaggedItem',
         ordering=('weight', 'name'),
+        manager=NetBoxTaggableManager,
+        related_name='%(app_label)s_%(class)s_tagged+',
     )
 
     class Meta:
@@ -610,6 +673,27 @@ class SyncedDataMixin(models.Model):
                 return DataFile.objects.get(source=self.data_source, path=self.data_path)
             except DataFile.DoesNotExist:
                 pass
+        return None
+
+    def validate_synced_value(self, field_name, value):
+        """
+        Validate content synchronized from the assigned DataFile. Model validation checks fields before clean()
+        runs, so synced values are otherwise never checked.
+        """
+        field = self._meta.get_field(field_name)
+        if value is None and not field.null:
+            raise ValidationError({
+                'data_file': _("The selected data file is empty or its content could not be read.")
+            })
+        try:
+            # Blank and null rules govern user input, so only non-empty content is put through the field
+            if value not in field.empty_values:
+                field.validate(value, self)
+            field.run_validators(value)
+        except ValidationError as e:
+            raise ValidationError({'data_file': e.messages}) from e
+
+        return value
 
     def sync(self, save=False):
         """
@@ -718,11 +802,6 @@ def register_models(*models):
     for model in models:
         app_label, model_name = model._meta.label_lower.split('.')
 
-        # TODO: Remove in NetBox v4.5
-        # Register public models
-        if not getattr(model, '_netbox_private', False):
-            registry['models'][app_label].add(model_name)
-
         # Register applicable feature views for the model
         if issubclass(model, ContactsMixin):
             register_model_view(model, 'contacts', kwargs={'model': model})(
@@ -748,3 +827,12 @@ def register_models(*models):
             register_model_view(model, 'sync', kwargs={'model': model})(
                 'netbox.views.generic.ObjectSyncDataView'
             )
+
+        # Auto-register custom permission actions declared in Meta.permissions
+        if meta_permissions := getattr(model._meta, 'permissions', None):
+            actions = [
+                ModelAction(codename, help_text=_(name))
+                for codename, name in meta_permissions
+            ]
+            if actions:
+                register_model_actions(model, actions)

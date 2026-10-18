@@ -51,7 +51,6 @@ class ObjectTypeManager(models.Manager):
         """
         return self.get(app_label=app_label, model=model)
 
-    # TODO: Remove in NetBox v4.5
     def get_for_id(self, id):
         """
         Retrieve an ObjectType by its primary key (numeric ID).
@@ -218,19 +217,22 @@ class ObjectType(ContentType):
     def app_verbose_name(self):
         if model := self.model_class():
             return model._meta.app_config.verbose_name
+        return None
 
     @property
     def model_verbose_name(self):
         if model := self.model_class():
             return model._meta.verbose_name
+        return None
 
     @property
     def model_verbose_name_plural(self):
         if model := self.model_class():
             return model._meta.verbose_name_plural
+        return None
 
     @property
     def is_plugin_model(self):
         if not (model := self.model_class()):
-            return  # Return null if model class is invalid
+            return None  # Return null if model class is invalid
         return isinstance(model._meta.app_config, PluginConfig)

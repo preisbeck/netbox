@@ -1,18 +1,24 @@
 import logging
 from collections import defaultdict
 
+from django.apps import apps
 from django.conf import settings
-from django.contrib.auth.backends import ModelBackend, RemoteUserBackend as _RemoteUserBackend
+from django.contrib.auth.backends import ModelBackend
+from django.contrib.auth.backends import RemoteUserBackend as _RemoteUserBackend
 from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models import Q
-from django.utils.translation import gettext_lazy as _
 
+from netbox.settings_utils import load_ldap_config
 from users.constants import CONSTRAINT_TOKEN_USER
 from users.models import Group, ObjectPermission, User
 from utilities.permissions import (
-    permission_is_exempt, qs_filter_from_constraints, resolve_permission, resolve_permission_type,
+    permission_is_exempt,
+    qs_filter_from_constraints,
+    resolve_permission,
+    resolve_permission_type,
 )
+
 from .misc import _mirror_groups
 
 AUTH_BACKEND_ATTRS = {
@@ -132,12 +138,18 @@ class ObjectPermissionMixin:
         if obj is None:
             return True
 
-        # Sanity check: Ensure that the requested permission applies to the specified object
-        model = obj._meta.concrete_model
-        if model._meta.label_lower != '.'.join((app_label, model_name)):
-            raise ValueError(_("Invalid permission {permission} for model {model}").format(
-                permission=perm, model=model
-            ))
+        # Sanity check: the permission must apply to the object's model. Permissions may name proxy
+        # models, so compare concrete models and evaluate constraints via the permission model's manager.
+        try:
+            permission_model = apps.get_model(app_label, model_name)
+        except LookupError:
+            logger = logging.getLogger('netbox.auth.ObjectPermissionBackend')
+            logger.warning(f"Permission {perm} does not reference a valid model")
+            return False
+        if permission_model._meta.concrete_model is not obj._meta.concrete_model:
+            logger = logging.getLogger('netbox.auth.ObjectPermissionBackend')
+            logger.debug(f"Permission {perm} is not valid for {obj._meta.label_lower} objects")
+            return False
 
         # Compile a QuerySet filter that matches all instances of the specified model
         tokens = {
@@ -148,7 +160,7 @@ class ObjectPermissionMixin:
         # Permission to perform the requested action on the object depends on whether the specified object matches
         # the specified constraints. Note that this check is made against the *database* record representing the object,
         # not the instance itself.
-        return model.objects.filter(qs_filter, pk=obj.pk).exists()
+        return permission_model.objects.filter(qs_filter, pk=obj.pk).exists()
 
 
 class ObjectPermissionBackend(ObjectPermissionMixin, ModelBackend):
@@ -206,7 +218,7 @@ class RemoteUserBackend(_RemoteUserBackend):
         logger.debug(
             f"trying to authenticate {remote_user} with groups {remote_groups}")
         if not remote_user:
-            return
+            return None
         user = None
         username = self.clean_username(remote_user)
 
@@ -230,8 +242,7 @@ class RemoteUserBackend(_RemoteUserBackend):
                     return self.configure_groups(user, remote_groups)
             else:
                 return user
-        else:
-            return None
+        return None
 
     def _is_superuser(self, user):
         logger = logging.getLogger('netbox.auth.RemoteUserBackend')
@@ -302,7 +313,8 @@ class RemoteUserBackend(_RemoteUserBackend):
 
 # Create a new instance of django-auth-ldap's LDAPBackend with our own ObjectPermissions
 try:
-    from django_auth_ldap.backend import _LDAPUser, LDAPBackend as LDAPBackend_
+    from django_auth_ldap.backend import LDAPBackend as LDAPBackend_
+    from django_auth_ldap.backend import _LDAPUser
 
     class NBLDAPBackend(ObjectPermissionMixin, LDAPBackend_):
         def get_permission_filter(self, user_obj):
@@ -324,8 +336,8 @@ class LDAPBackend:
 
     def __new__(cls, *args, **kwargs):
         try:
-            from django_auth_ldap.backend import LDAPSettings
             import ldap
+            from django_auth_ldap.backend import LDAPSettings
         except ModuleNotFoundError as e:
             if getattr(e, 'name') == 'django_auth_ldap':
                 raise ImproperlyConfigured(
@@ -333,15 +345,10 @@ class LDAPBackend:
                 )
             raise e
 
-        try:
-            from netbox import ldap_config
-        except ModuleNotFoundError as e:
-            if getattr(e, 'name') == 'ldap_config':
-                raise ImproperlyConfigured(
-                    "LDAP configuration file not found: Check that ldap_config.py has been created alongside "
-                    "configuration.py."
-                )
-            raise e
+        ldap_config = load_ldap_config(
+            settings.CONFIGURATION_DIR,
+            allow_legacy_fallback=settings.NETBOX_INSTALL_MODE == 'checkout',
+        )
 
         try:
             getattr(ldap_config, 'AUTH_LDAP_SERVER_URI')
@@ -353,11 +360,11 @@ class LDAPBackend:
         obj = NBLDAPBackend()
 
         # Read LDAP configuration parameters from ldap_config.py instead of settings.py
-        settings = LDAPSettings()
+        ldap_settings = LDAPSettings()
         for param in dir(ldap_config):
-            if param.startswith(settings._prefix):
-                setattr(settings, param[10:], getattr(ldap_config, param))
-        obj.settings = settings
+            if param.startswith(ldap_settings._prefix):
+                setattr(ldap_settings, param[10:], getattr(ldap_config, param))
+        obj.settings = ldap_settings
 
         # Optionally disable strict certificate checking
         if getattr(ldap_config, 'LDAP_IGNORE_CERT_ERRORS', False):

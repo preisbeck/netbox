@@ -2,7 +2,7 @@ from django.contrib.contenttypes.prefetch import GenericPrefetch
 from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.routers import APIRootView
@@ -16,11 +16,12 @@ from extras.api.mixins import ConfigContextQuerySetMixin, RenderConfigMixin
 from netbox.api.authentication import IsAuthenticatedOrLoginNotRequired
 from netbox.api.metadata import ContentTypeMetadata
 from netbox.api.pagination import StripCountAnnotationsPaginator
-from netbox.api.viewsets import NetBoxModelViewSet, MPTTLockedMixin, NetBoxReadOnlyModelViewSet
-from netbox.api.viewsets.mixins import SequentialBulkCreatesMixin
+from netbox.api.viewsets import NetBoxModelViewSet, NetBoxReadOnlyModelViewSet
 from utilities.api import get_serializer_for_model
+from utilities.query import count_related
 from utilities.query_functions import CollateAsChar
 from virtualization.models import VirtualMachine
+
 from . import serializers
 from .exceptions import MissingFilterException
 
@@ -35,14 +36,16 @@ class DCIMRootView(APIRootView):
 
 # Mixins
 
-class PathEndpointMixin(object):
+class PathEndpointMixin:
 
     @action(detail=True, url_path='trace')
     def trace(self, request, pk):
         """
         Trace a complete cable path and return each segment as a three-tuple of (termination, cable, termination).
         """
-        obj = get_object_or_404(self.queryset, pk=pk)
+        # Path nodes load as they do for the connected endpoint fields
+        queryset = self.queryset.prefetch_related(*self.get_field_prefetches({'connected_endpoints'}))
+        obj = get_object_or_404(queryset, pk=pk)
 
         # Initialize the path array
         path = []
@@ -75,7 +78,7 @@ class PathEndpointMixin(object):
         return Response(path)
 
 
-class PassThroughPortMixin(object):
+class PassThroughPortMixin:
 
     @action(detail=True, url_path='paths')
     def paths(self, request, pk):
@@ -93,7 +96,7 @@ class PassThroughPortMixin(object):
 # Regions
 #
 
-class RegionViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class RegionViewSet(NetBoxModelViewSet):
     queryset = Region.objects.add_related_count(
         Region.objects.all(),
         Site,
@@ -109,7 +112,7 @@ class RegionViewSet(MPTTLockedMixin, NetBoxModelViewSet):
 # Site groups
 #
 
-class SiteGroupViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class SiteGroupViewSet(NetBoxModelViewSet):
     queryset = SiteGroup.objects.add_related_count(
         SiteGroup.objects.all(),
         Site,
@@ -135,7 +138,7 @@ class SiteViewSet(NetBoxModelViewSet):
 # Locations
 #
 
-class LocationViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class LocationViewSet(NetBoxModelViewSet):
     queryset = Location.objects.add_related_count(
         Location.objects.add_related_count(
             Location.objects.all(),
@@ -151,6 +154,17 @@ class LocationViewSet(MPTTLockedMixin, NetBoxModelViewSet):
     )
     serializer_class = serializers.LocationSerializer
     filterset_class = filtersets.LocationFilterSet
+
+
+#
+# Rack groups
+#
+
+
+class RackGroupViewSet(NetBoxModelViewSet):
+    queryset = RackGroup.objects.all()
+    serializer_class = serializers.RackGroupSerializer
+    filterset_class = filtersets.RackGroupFilterSet
 
 
 #
@@ -203,10 +217,8 @@ class RackViewSet(NetBoxModelViewSet):
             # Determine attributes for highlighting devices (if any)
             highlight_params = []
             for param in request.GET.getlist('highlight'):
-                try:
+                if ':' in param:
                     highlight_params.append(param.split(':', 1))
-                except ValueError:
-                    pass
 
             # Render and return the elevation as an SVG drawing with the correct content type
             drawing = rack.get_elevation_svg(
@@ -221,24 +233,26 @@ class RackViewSet(NetBoxModelViewSet):
             )
             return HttpResponse(drawing.tostring(), content_type='image/svg+xml')
 
-        else:
-            # Return a JSON representation of the rack units in the elevation
-            elevation = rack.get_rack_units(
-                face=data['face'],
-                user=request.user,
-                exclude=data['exclude'],
-                expand_devices=data['expand_devices']
-            )
+        # Return a JSON representation of the rack units in the elevation
+        elevation = rack.get_rack_units(
+            face=data['face'],
+            user=request.user,
+            exclude=data['exclude'],
+            expand_devices=data['expand_devices']
+        )
 
-            # Enable filtering rack units by ID
-            if q := data['q']:
-                q = q.lower()
-                elevation = [u for u in elevation if q in str(u['id']) or q in str(u['name']).lower()]
+        # Enable filtering rack units by ID
+        if q := data['q']:
+            q = q.lower()
+            elevation = [u for u in elevation if q in str(u['id']) or q in str(u['name']).lower()]
 
-            page = self.paginate_queryset(elevation)
-            if page is not None:
-                rack_units = serializers.RackUnitSerializer(page, many=True, context={'request': request})
-                return self.get_paginated_response(rack_units.data)
+        page = self.paginate_queryset(elevation)
+        if page is not None:
+            rack_units = serializers.RackUnitSerializer(page, many=True, context={'request': request})
+            return self.get_paginated_response(rack_units.data)
+
+        # TODO: This endpoint should always return an HttpResponse/DRF Response; `None` is not a meaningful result.
+        return None
 
 
 #
@@ -271,6 +285,12 @@ class DeviceTypeViewSet(NetBoxModelViewSet):
     filterset_class = filtersets.DeviceTypeFilterSet
 
 
+class ModuleBayTypeViewSet(NetBoxModelViewSet):
+    queryset = ModuleBayType.objects.all()
+    serializer_class = serializers.ModuleBayTypeSerializer
+    filterset_class = filtersets.ModuleBayTypeFilterSet
+
+
 class ModuleTypeProfileViewSet(NetBoxModelViewSet):
     queryset = ModuleTypeProfile.objects.all()
     serializer_class = serializers.ModuleTypeProfileSerializer
@@ -278,7 +298,7 @@ class ModuleTypeProfileViewSet(NetBoxModelViewSet):
 
 
 class ModuleTypeViewSet(NetBoxModelViewSet):
-    queryset = ModuleType.objects.all()
+    queryset = ModuleType.objects.prefetch_related('module_bay_types__manufacturer')
     serializer_class = serializers.ModuleTypeSerializer
     filterset_class = filtersets.ModuleTypeFilterSet
 
@@ -311,6 +331,18 @@ class PowerOutletTemplateViewSet(NetBoxModelViewSet):
     filterset_class = filtersets.PowerOutletTemplateFilterSet
 
 
+class CoolingIntakeTemplateViewSet(NetBoxModelViewSet):
+    queryset = CoolingIntakeTemplate.objects.all()
+    serializer_class = serializers.CoolingIntakeTemplateSerializer
+    filterset_class = filtersets.CoolingIntakeTemplateFilterSet
+
+
+class CoolingOutflowTemplateViewSet(NetBoxModelViewSet):
+    queryset = CoolingOutflowTemplate.objects.all()
+    serializer_class = serializers.CoolingOutflowTemplateSerializer
+    filterset_class = filtersets.CoolingOutflowTemplateFilterSet
+
+
 class InterfaceTemplateViewSet(NetBoxModelViewSet):
     queryset = InterfaceTemplate.objects.all()
     serializer_class = serializers.InterfaceTemplateSerializer
@@ -330,7 +362,7 @@ class RearPortTemplateViewSet(NetBoxModelViewSet):
 
 
 class ModuleBayTemplateViewSet(NetBoxModelViewSet):
-    queryset = ModuleBayTemplate.objects.all()
+    queryset = ModuleBayTemplate.objects.prefetch_related('module_bay_types__manufacturer')
     serializer_class = serializers.ModuleBayTemplateSerializer
     filterset_class = filtersets.ModuleBayTemplateFilterSet
 
@@ -341,7 +373,7 @@ class DeviceBayTemplateViewSet(NetBoxModelViewSet):
     filterset_class = filtersets.DeviceBayTemplateFilterSet
 
 
-class InventoryItemTemplateViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class InventoryItemTemplateViewSet(NetBoxModelViewSet):
     queryset = InventoryItemTemplate.objects.all()
     serializer_class = serializers.InventoryItemTemplateSerializer
     filterset_class = filtersets.InventoryItemTemplateFilterSet
@@ -373,7 +405,7 @@ class DeviceRoleViewSet(NetBoxModelViewSet):
 # Platforms
 #
 
-class PlatformViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class PlatformViewSet(NetBoxModelViewSet):
     queryset = Platform.objects.add_related_count(
         Platform.objects.add_related_count(
             Platform.objects.all(),
@@ -395,33 +427,16 @@ class PlatformViewSet(MPTTLockedMixin, NetBoxModelViewSet):
 # Devices/modules
 #
 
-class DeviceViewSet(
-    SequentialBulkCreatesMixin,
-    ConfigContextQuerySetMixin,
-    RenderConfigMixin,
-    NetBoxModelViewSet
-):
-    queryset = Device.objects.prefetch_related(
-        'parent_bay',  # Referenced by DeviceSerializer.get_parent_device()
-    )
+class DeviceViewSet(ConfigContextQuerySetMixin, RenderConfigMixin, NetBoxModelViewSet):
+    queryset = Device.objects.all()
+    serializer_class = serializers.DeviceSerializer
     filterset_class = filtersets.DeviceFilterSet
     pagination_class = StripCountAnnotationsPaginator
-
-    def get_serializer_class(self):
-        """
-        Select the specific serializer based on the request context.
-
-        If the `brief` query param equates to True, return the NestedDeviceSerializer
-
-        If the `exclude` query param includes `config_context` as a value, return the DeviceSerializer
-
-        Else, return the DeviceWithConfigContextSerializer
-        """
-        request = self.get_serializer_context()['request']
-        if self.brief or 'config_context' in request.query_params.get('exclude', []):
-            return serializers.DeviceSerializer
-
-        return serializers.DeviceWithConfigContextSerializer
+    field_prefetches = {
+        # Read by Device.__str__() for unnamed devices and by config context rendered without its annotation
+        ('display', 'config_context'): ('device_type__manufacturer',),
+        ('parent_device',): ('parent_bay',),
+    }
 
 
 class VirtualDeviceContextViewSet(NetBoxModelViewSet):
@@ -431,7 +446,10 @@ class VirtualDeviceContextViewSet(NetBoxModelViewSet):
 
 
 class ModuleViewSet(NetBoxModelViewSet):
-    queryset = Module.objects.all()
+    queryset = Module.objects.prefetch_related(
+        'module_bay__module_bay_types',
+        'module_type__module_bay_types',
+    )
     serializer_class = serializers.ModuleSerializer
     filterset_class = filtersets.ModuleFilterSet
 
@@ -472,27 +490,35 @@ class PowerOutletViewSet(PathEndpointMixin, NetBoxModelViewSet):
     filterset_class = filtersets.PowerOutletFilterSet
 
 
+class CoolingIntakeViewSet(NetBoxModelViewSet):
+    queryset = CoolingIntake.objects.all()
+    serializer_class = serializers.CoolingIntakeSerializer
+    filterset_class = filtersets.CoolingIntakeFilterSet
+
+
+class CoolingOutflowViewSet(NetBoxModelViewSet):
+    queryset = CoolingOutflow.objects.all()
+    serializer_class = serializers.CoolingOutflowSerializer
+    filterset_class = filtersets.CoolingOutflowFilterSet
+
+
 class InterfaceViewSet(PathEndpointMixin, NetBoxModelViewSet):
-    queryset = Interface.objects.prefetch_related(
-        GenericPrefetch(
-            "cable__terminations__termination",
-            [
-                Interface.objects.select_related("device", "cable"),
-            ],
-        ),
-        GenericPrefetch(
-            "_path__path_objects",
-            [
-                Interface.objects.select_related("device", "cable"),
-            ],
-        ),
-        'virtual_circuit_termination',
-        'l2vpn_terminations',  # Referenced by InterfaceSerializer.l2vpn_termination
-        'ip_addresses',  # Referenced by Interface.count_ipaddresses()
-        'fhrp_group_assignments',  # Referenced by Interface.count_fhrp_groups()
-    )
+    queryset = Interface.objects.all()
     serializer_class = serializers.InterfaceSerializer
     filterset_class = filtersets.InterfaceFilterSet
+    field_prefetches = {
+        ('link_peers', 'link_peers_type'): (
+            GenericPrefetch('cable__terminations__termination', [Interface.objects.select_related('device', 'cable')]),
+        ),
+        ('connected_endpoints', 'connected_endpoints_type'): (
+            GenericPrefetch('_path__path_objects', [Interface.objects.select_related('device', 'cable')]),
+            'virtual_circuit_termination',
+        ),
+        ('connected_endpoints_reachable',): ('_path',),
+        ('l2vpn_termination',): ('l2vpn_terminations',),
+        ('count_ipaddresses',): ('ip_addresses',),
+        ('count_fhrp_groups',): ('fhrp_group_assignments',),
+    }
 
     def get_bulk_destroy_queryset(self):
         # Ensure child interfaces are deleted prior to their parents
@@ -516,7 +542,10 @@ class RearPortViewSet(PassThroughPortMixin, NetBoxModelViewSet):
 
 
 class ModuleBayViewSet(NetBoxModelViewSet):
-    queryset = ModuleBay.objects.all()
+    queryset = ModuleBay.objects.prefetch_related(
+        'module_bay_types__manufacturer',
+        'installed_module__module_type__module_bay_types',
+    )
     serializer_class = serializers.ModuleBaySerializer
     filterset_class = filtersets.ModuleBayFilterSet
 
@@ -527,7 +556,7 @@ class DeviceBayViewSet(NetBoxModelViewSet):
     filterset_class = filtersets.DeviceBayFilterSet
 
 
-class InventoryItemViewSet(MPTTLockedMixin, NetBoxModelViewSet):
+class InventoryItemViewSet(NetBoxModelViewSet):
     queryset = InventoryItem.objects.all()
     serializer_class = serializers.InventoryItemSerializer
     filterset_class = filtersets.InventoryItemFilterSet
@@ -570,6 +599,14 @@ class CableTerminationViewSet(NetBoxReadOnlyModelViewSet):
     filterset_class = filtersets.CableTerminationFilterSet
 
 
+class CableBundleViewSet(NetBoxModelViewSet):
+    queryset = CableBundle.objects.annotate(
+        cable_count=count_related(Cable, 'bundle')
+    )
+    serializer_class = serializers.CableBundleSerializer
+    filterset_class = filtersets.CableBundleFilterSet
+
+
 #
 # Virtual chassis
 #
@@ -603,6 +640,26 @@ class PowerFeedViewSet(PathEndpointMixin, NetBoxModelViewSet):
     )
     serializer_class = serializers.PowerFeedSerializer
     filterset_class = filtersets.PowerFeedFilterSet
+
+
+#
+# Cooling sources
+#
+
+class CoolingSourceViewSet(NetBoxModelViewSet):
+    queryset = CoolingSource.objects.all()
+    serializer_class = serializers.CoolingSourceSerializer
+    filterset_class = filtersets.CoolingSourceFilterSet
+
+
+#
+# Cooling feeds
+#
+
+class CoolingFeedViewSet(NetBoxModelViewSet):
+    queryset = CoolingFeed.objects.all()
+    serializer_class = serializers.CoolingFeedSerializer
+    filterset_class = filtersets.CoolingFeedFilterSet
 
 
 #

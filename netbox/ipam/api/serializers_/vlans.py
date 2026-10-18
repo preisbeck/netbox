@@ -1,3 +1,5 @@
+from functools import cached_property
+
 from django.contrib.contenttypes.models import ContentType
 from rest_framework import serializers
 
@@ -10,6 +12,7 @@ from netbox.api.gfk_fields import GFKSerializerField
 from netbox.api.serializers import NetBoxModelSerializer, OrganizationalModelSerializer, PrimaryModelSerializer
 from tenancy.api.serializers_.tenants import TenantSerializer
 from vpn.api.serializers_.l2vpn import L2VPNTerminationSerializer
+
 from .nested import NestedVLANSerializer
 from .roles import RoleSerializer
 
@@ -35,6 +38,7 @@ class VLANGroupSerializer(OrganizationalModelSerializer):
     scope_id = serializers.IntegerField(allow_null=True, required=False, default=None)
     scope = GFKSerializerField(read_only=True)
     vid_ranges = IntegerRangeSerializer(many=True, required=False)
+    total_vlan_ids = serializers.IntegerField(read_only=True)
     utilization = serializers.CharField(read_only=True)
     tenant = TenantSerializer(nested=True, required=False, allow_null=True)
 
@@ -45,7 +49,8 @@ class VLANGroupSerializer(OrganizationalModelSerializer):
         model = VLANGroup
         fields = [
             'id', 'url', 'display_url', 'display', 'name', 'slug', 'scope_type', 'scope_id', 'scope', 'vid_ranges',
-            'tenant', 'description', 'owner', 'comments', 'tags', 'custom_fields', 'created', 'last_updated',
+            'total_vlan_ids', 'tenant', 'description', 'owner', 'comments', 'tags', 'custom_fields',
+            'created', 'last_updated',
             'vlan_count', 'utilization',
         ]
         brief_fields = ('id', 'url', 'display', 'name', 'slug', 'description', 'vlan_count')
@@ -82,14 +87,14 @@ class AvailableVLANSerializer(serializers.Serializer):
     vid = serializers.IntegerField(read_only=True)
     group = VLANGroupSerializer(nested=True, read_only=True, allow_null=True)
 
+    @cached_property
+    def _group_serializer(self):
+        return VLANGroupSerializer(nested=True, context={'request': self.context['request']})
+
     def to_representation(self, instance):
         return {
             'vid': instance,
-            'group': VLANGroupSerializer(
-                self.context['group'],
-                nested=True,
-                context={'request': self.context['request']}
-            ).data,
+            'group': self._group_serializer.to_representation(self.context['group']),
         }
 
 
@@ -114,13 +119,20 @@ class VLANTranslationRuleSerializer(NetBoxModelSerializer):
 
     class Meta:
         model = VLANTranslationRule
-        fields = ['id', 'url', 'display', 'policy', 'local_vid', 'remote_vid', 'description']
+        fields = [
+            'id', 'url', 'display_url', 'display', 'policy', 'local_vid', 'remote_vid', 'description', 'tags',
+            'custom_fields', 'created', 'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'policy', 'local_vid', 'remote_vid', 'description')
 
 
 class VLANTranslationPolicySerializer(PrimaryModelSerializer):
-    rules = VLANTranslationRuleSerializer(many=True, read_only=True)
+    rules = VLANTranslationRuleSerializer(nested=True, many=True, read_only=True)
 
     class Meta:
         model = VLANTranslationPolicy
-        fields = ['id', 'url', 'display', 'name', 'description', 'display', 'rules', 'owner', 'comments']
+        fields = [
+            'id', 'url', 'display_url', 'display', 'name', 'description', 'rules', 'owner', 'comments', 'tags',
+            'custom_fields', 'created', 'last_updated',
+        ]
         brief_fields = ('id', 'url', 'display', 'name', 'description')

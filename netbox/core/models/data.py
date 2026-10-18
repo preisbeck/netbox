@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 
 import yaml
 from django.conf import settings
-from django.contrib.contenttypes.fields import GenericForeignKey
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
@@ -18,7 +17,9 @@ from netbox.constants import CENSOR_TOKEN, CENSOR_TOKEN_CHANGED
 from netbox.models import PrimaryModel
 from netbox.models.features import JobsMixin
 from netbox.registry import registry
+from utilities.fields import RestrictedGenericForeignKey
 from utilities.querysets import RestrictedQuerySet
+
 from ..choices import *
 from ..exceptions import SyncError
 
@@ -68,7 +69,7 @@ class DataSource(JobsMixin, PrimaryModel):
     ignore_rules = models.TextField(
         verbose_name=_('ignore rules'),
         blank=True,
-        help_text=_("Patterns (one per line) matching files to ignore when syncing")
+        help_text=_("Patterns (one per line) matching files or paths to ignore when syncing")
     )
     parameters = models.JSONField(
         verbose_name=_('parameters'),
@@ -86,6 +87,9 @@ class DataSource(JobsMixin, PrimaryModel):
         ordering = ('name',)
         verbose_name = _('data source')
         verbose_name_plural = _('data sources')
+        permissions = [
+            ('sync', 'Synchronize data from remote source'),
+        ]
 
     def __str__(self):
         return f'{self.name}'
@@ -97,6 +101,7 @@ class DataSource(JobsMixin, PrimaryModel):
     def get_type_display(self):
         if backend := registry['data_backends'].get(self.type):
             return backend.label
+        return None
 
     def get_status_color(self):
         return DataSourceStatusChoices.colors.get(self.status)
@@ -215,7 +220,9 @@ class DataSource(JobsMixin, PrimaryModel):
                     continue
 
             # Bulk update modified files
-            updated_count = DataFile.objects.bulk_update(updated_files, ('last_updated', 'size', 'hash', 'data'))
+            updated_count = DataFile.objects.bulk_update(
+                updated_files, ('last_updated', 'size', 'hash', 'data'), batch_size=settings.BULK_UPDATE_CHUNK_SIZE
+            )
             logger.debug(f"Updated {updated_count} files")
 
             # Bulk delete deleted files
@@ -256,21 +263,22 @@ class DataSource(JobsMixin, PrimaryModel):
             if path.startswith('.'):
                 continue
             for file_name in file_names:
-                if not self._ignore(file_name):
-                    paths.add(os.path.join(path, file_name))
+                file_path = os.path.join(path, file_name)
+                if not self._ignore(file_path):
+                    paths.add(file_path)
 
         logger.debug(f"Found {len(paths)} files")
         return paths
 
-    def _ignore(self, filename):
+    def _ignore(self, file_path):
         """
         Returns a boolean indicating whether the file should be ignored per the DataSource's configured
-        ignore rules.
+        ignore rules. file_path is the full relative path (e.g. "subdir/file.txt").
         """
-        if filename.startswith('.'):
+        if os.path.basename(file_path).startswith('.'):
             return True
         for rule in self.ignore_rules.splitlines():
-            if fnmatchcase(filename, rule):
+            if fnmatchcase(file_path, rule) or fnmatchcase(os.path.basename(file_path), rule):
                 return True
         return False
 
@@ -345,10 +353,13 @@ class DataFile(models.Model):
 
     def get_data(self):
         """
-        Attempt to read the file data as JSON/YAML and return a native Python object.
+        Attempt to read the file data as JSON/YAML and return a native Python object. Returns None if the file
+        content cannot be decoded.
         """
         # TODO: Something more robust
-        return yaml.safe_load(self.data_as_string)
+        if (data := self.data_as_string) is None:
+            return None
+        return yaml.safe_load(data)
 
     def refresh_from_disk(self, source_root):
         """
@@ -385,7 +396,7 @@ class AutoSyncRecord(models.Model):
         related_name='+'
     )
     object_id = models.PositiveBigIntegerField()
-    object = GenericForeignKey(
+    object = RestrictedGenericForeignKey(
         ct_field='object_type',
         fk_field='object_id'
     )

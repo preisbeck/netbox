@@ -7,11 +7,12 @@ from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.core.exceptions import FieldDoesNotExist
 from django.db.models.fields.related import RelatedField
-from django.db.models.fields.reverse_related import ManyToOneRel
+from django.db.models.fields.reverse_related import ManyToManyRel, ManyToOneRel
 from django.urls.exceptions import NoReverseMatch
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django_tables2.data import TableQuerysetData
+from django_tables2.utils import OrderBy
 
 from core.models import ObjectType
 from extras.choices import *
@@ -23,6 +24,7 @@ from utilities.html import highlight
 from utilities.paginator import EnhancedPaginator, get_paginate_count
 from utilities.string import title
 from utilities.views import get_action_url
+
 from .template_code import *
 
 __all__ = (
@@ -52,42 +54,13 @@ class BaseTable(tables.Table):
             'class': 'table table-hover object-list',
         }
 
-    def __init__(self, *args, user=None, **kwargs):
-
+    # TODO: Remove user kwarg in NetBox v4.7
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # Set default empty_text if none was provided
         if self.empty_text is None:
             self.empty_text = _("No {model_name} found").format(model_name=self._meta.model._meta.verbose_name_plural)
-
-        # Dynamically update the table's QuerySet to ensure related fields are pre-fetched
-        if isinstance(self.data, TableQuerysetData):
-
-            prefetch_fields = []
-            for column in self.columns:
-                if column.visible:
-                    model = getattr(self.Meta, 'model')
-                    accessor = column.accessor
-                    if accessor.startswith('custom_field_data__'):
-                        # Ignore custom field references
-                        continue
-                    prefetch_path = []
-                    for field_name in accessor.split(accessor.SEPARATOR):
-                        try:
-                            field = model._meta.get_field(field_name)
-                        except FieldDoesNotExist:
-                            break
-                        if isinstance(field, (RelatedField, ManyToOneRel)):
-                            # Follow ForeignKeys to the related model
-                            prefetch_path.append(field_name)
-                            model = field.remote_field.model
-                        elif isinstance(field, GenericForeignKey):
-                            # Can't prefetch beyond a GenericForeignKey
-                            prefetch_path.append(field_name)
-                            break
-                    if prefetch_path:
-                        prefetch_fields.append('__'.join(prefetch_path))
-            self.data.data = self.data.data.prefetch_related(*prefetch_fields)
 
     def _get_columns(self, visible=True):
         columns = []
@@ -144,6 +117,110 @@ class BaseTable(tables.Table):
             self.sequence.remove('actions')
             self.sequence.append('actions')
 
+    def _apply_prefetching(self, columns=None):
+        """
+        Dynamically update the table's QuerySet to ensure related fields are pre-fetched.
+
+        Args:
+            columns: An optional iterable of column names for which to apply prefetching,
+                regardless of visibility. If None, only currently visible columns are used.
+        """
+        if not isinstance(self.data, TableQuerysetData):
+            return
+
+        prefetch_fields = []
+        for column in self.columns.iterall():
+            if columns is not None:
+                if column.name not in columns:
+                    continue
+            elif not column.visible:
+                # Skip hidden columns
+                continue
+            model = getattr(self.Meta, 'model')  # Must be called *after* resolving columns
+            accessor = column.accessor
+            if accessor.startswith('custom_field_data__'):
+                # Ignore custom field references
+                continue
+            prefetch_path = []
+            for field_name in accessor.split(accessor.SEPARATOR):
+                try:
+                    field = model._meta.get_field(field_name)
+                except FieldDoesNotExist:
+                    break
+                if isinstance(field, (RelatedField, ManyToOneRel, ManyToManyRel)):
+                    # Follow relations to the related model
+                    prefetch_path.append(field_name)
+                    model = field.remote_field.model
+                elif isinstance(field, GenericForeignKey):
+                    # Can't prefetch beyond a GenericForeignKey
+                    prefetch_path.append(field_name)
+                    break
+            if prefetch_path:
+                prefetch_fields.append('__'.join(prefetch_path))
+        self.data.data = self.data.data.prefetch_related(*prefetch_fields)
+
+    def _get_custom_field_ordering_columns(self, order_by):
+        """
+        Return the custom field columns among those named by the given ordering.
+
+        Args:
+            order_by: An iterable (or comma-separated string) of order by aliases.
+        """
+        order_by = order_by.split(',') if isinstance(order_by, str) else order_by or ()
+        ordering_columns = []
+        for alias in order_by:
+            name = OrderBy(alias).bare
+            # Ignore any aliases which django-tables2 will itself discard
+            if name not in self.columns or not self.columns[name].orderable:
+                continue
+            if isinstance(column := self.columns[name].column, columns.CustomFieldColumn):
+                ordering_columns.append(column)
+        return ordering_columns
+
+    def _apply_ordering_annotations(self, ordering_columns):
+        """
+        Dynamically annotate the table's QuerySet with the expressions needed to sort by the given
+        custom field columns. These are applied only for the columns actually being ordered by, to
+        avoid burdening every query with expressions it has no use for.
+        """
+        annotations = {}
+        for column in ordering_columns:
+            annotations.update(column.get_ordering_annotation())
+
+        # Skip any annotations already applied, as when the ordering is set more than once
+        if annotations := {
+            name: expr for name, expr in annotations.items()
+            if name not in self.data.data.query.annotations
+        }:
+            self.data.data = self.data.data.annotate(**annotations)
+
+    def _apply_ordering_tie_breaker(self):
+        """
+        Append the primary key to the table's ordering as a final sort key, so that the ordering is
+        total. Rows tying on every preceding key -- and every object holding no value for a custom
+        field ties on both of that column's keys -- are otherwise free to come back in a different
+        order for each query, which would cause paginated results to skip or repeat rows from one
+        page to the next.
+        """
+        ordering = self.data.data.query.order_by
+        if ordering and not any(OrderBy(o).bare in ('pk', 'id') for o in ordering):
+            self.data.data = self.data.data.order_by(*ordering, 'pk')
+
+    @tables.Table.order_by.setter
+    def order_by(self, value):
+        """
+        Extend the ordering of the table's data with the support needed by custom field columns.
+        """
+        if not isinstance(self.data, TableQuerysetData):
+            tables.Table.order_by.fset(self, value)
+            return
+
+        if ordering_columns := self._get_custom_field_ordering_columns(value):
+            self._apply_ordering_annotations(ordering_columns)
+        tables.Table.order_by.fset(self, value)
+        if ordering_columns:
+            self._apply_ordering_tie_breaker()
+
     def configure(self, request):
         """
         Configure the table for a specific request context. This performs pagination and records
@@ -152,7 +229,7 @@ class BaseTable(tables.Table):
         columns = None
         ordering = None
 
-        if self.prefixed_order_by_field in request.GET:
+        if request.user.is_authenticated and self.prefixed_order_by_field in request.GET:
             if request.GET[self.prefixed_order_by_field]:
                 # If an ordering has been specified as a query parameter, save it as the
                 # user's preferred ordering for this table.
@@ -178,6 +255,19 @@ class BaseTable(tables.Table):
             columns = getattr(self.Meta, 'default_columns', self.Meta.fields)
 
         self._set_columns(columns)
+
+        # Apply column inclusion/exclusion (overrides user preferences)
+        if columns_param := request.GET.get('include_columns'):
+            for column_name in columns_param.split(','):
+                if column_name in self.columns.names():
+                    self.columns.show(column_name)
+        if exclude_columns := request.GET.get('exclude_columns'):
+            exclude_columns = exclude_columns.split(',')
+            for column_name in exclude_columns:
+                if column_name in self.columns.names() and column_name not in self.exempt_columns:
+                    self.columns.hide(column_name)
+
+        self._apply_prefetching()
         if ordering is not None:
             self.order_by = ordering
 
@@ -260,6 +350,38 @@ class NetBoxTable(BaseTable):
 
         super().__init__(*args, extra_columns=extra_columns, **kwargs)
 
+    def configure(self, request):
+        # Remove custom link columns referencing CustomLinks the user cannot view (#22439).
+        # These columns are added for all enabled CustomLinks in __init__(), before the request
+        # (and thus the user) is known, so object-level permissions are enforced here instead.
+        self._restrict_customlink_columns(request.user)
+
+        super().configure(request)
+
+    def _restrict_customlink_columns(self, user):
+        """
+        Exclude any custom link columns which reference a CustomLink the user does not have
+        permission to view.
+        """
+        customlinks = {
+            name: column.column.customlink
+            for name, column in self.columns.iteritems()
+            if isinstance(column.column, columns.CustomLinkColumn)
+        }
+        if not customlinks:
+            return
+
+        permitted = set(
+            CustomLink.objects.restrict(user, 'view').filter(
+                pk__in=[cl.pk for cl in customlinks.values()]
+            ).values_list('pk', flat=True)
+        )
+        excluded = tuple(
+            name for name, customlink in customlinks.items() if customlink.pk not in permitted
+        )
+        if excluded:
+            self.exclude = (*self.exclude, *excluded)
+
     @cached_property
     def htmx_url(self):
         """
@@ -313,7 +435,7 @@ class NestedGroupModelTable(NetBoxTable):
         linkify=True,
         verbose_name=_('Owner'),
     )
-    name = columns.MPTTColumn(
+    name = columns.TreeColumn(
         verbose_name=_('Name'),
         linkify=True
     )

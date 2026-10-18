@@ -1,12 +1,17 @@
+import json
+import logging
+
+from django.test import tag
 from django.urls import reverse
+from rest_framework import status
 
 from dcim.models import Site
 from tenancy.choices import *
 from tenancy.models import *
-from utilities.testing import APITestCase, APIViewTestCases
+from utilities.testing import APITestCase, APIViewTestCases, disable_logging
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
 
@@ -16,12 +21,15 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class TenantGroupTest(APIViewTestCases.APIViewTestCase):
+class TenantGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = TenantGroup
     brief_fields = ['_depth', 'description', 'display', 'id', 'name', 'slug', 'tenant_count', 'url']
     bulk_update_data = {
         'description': 'New description',
         'comments': 'New Comment',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
     }
 
     @classmethod
@@ -60,13 +68,62 @@ class TenantGroupTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    @tag('regression')  # Ref: #22821
+    def test_delete_tenant_group_with_conflicting_tenants(self):
+        """
+        Attempt and fail to delete a tenant group whose tenants cannot be ungrouped.
+        """
+        group = TenantGroup.objects.create(name='Tenant Group 7', slug='tenant-group-7')
+        Tenant.objects.create(name='Tenant 1', slug='tenant-1a', group=group)
+        Tenant.objects.create(name='Tenant 1', slug='tenant-1b')
 
-class TenantTest(APIViewTestCases.APIViewTestCase):
+        self.add_permissions('tenancy.delete_tenantgroup')
+        url = reverse('tenancy-api:tenantgroup-detail', kwargs={'pk': group.pk})
+        with disable_logging(level=logging.WARNING):
+            response = self.client.delete(url, **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_409_CONFLICT)
+
+        content = json.loads(response.content.decode('utf-8'))
+        self.assertIn('detail', content)
+        self.assertTrue(content['detail'].startswith('Unable to delete object.'))
+        self.assertTrue(TenantGroup.objects.filter(pk=group.pk).exists())
+
+    @tag('regression')  # Ref: #22821
+    def test_bulk_delete_tenant_groups_with_conflicting_tenants(self):
+        """
+        Attempt and fail to bulk delete two tenant groups whose tenants conflict only once both are
+        ungrouped, leaving every group and assignment intact.
+        """
+        group1 = TenantGroup.objects.create(name='Tenant Group 8', slug='tenant-group-8')
+        group2 = TenantGroup.objects.create(name='Tenant Group 9', slug='tenant-group-9')
+        tenant1 = Tenant.objects.create(name='Tenant 2', slug='tenant-2a', group=group1)
+        tenant2 = Tenant.objects.create(name='Tenant 2', slug='tenant-2b', group=group2)
+
+        self.add_permissions('tenancy.delete_tenantgroup')
+        data = [{'id': group1.pk}, {'id': group2.pk}]
+        with disable_logging(level=logging.WARNING):
+            response = self.client.delete(self._get_list_url(), data, format='json', **self.header)
+
+        self.assertHttpStatus(response, status.HTTP_409_CONFLICT)
+
+        # The rolled back batch must not leave the first group deleted
+        self.assertEqual(TenantGroup.objects.filter(pk__in=(group1.pk, group2.pk)).count(), 2)
+        tenant1.refresh_from_db()
+        tenant2.refresh_from_db()
+        self.assertEqual(tenant1.group, group1)
+        self.assertEqual(tenant2.group, group2)
+
+
+class TenantTestCase(APIViewTestCases.APIViewTestCase):
     model = Tenant
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
     bulk_update_data = {
         'group': None,
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
     }
 
     @classmethod
@@ -103,11 +160,14 @@ class TenantTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ContactGroupTest(APIViewTestCases.APIViewTestCase):
+class ContactGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = ContactGroup
     brief_fields = ['_depth', 'contact_count', 'description', 'display', 'id', 'name', 'slug', 'url']
     bulk_update_data = {
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
     }
 
     @classmethod
@@ -148,7 +208,7 @@ class ContactGroupTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ContactRoleTest(APIViewTestCases.APIViewTestCase):
+class ContactRoleTestCase(APIViewTestCases.APIViewTestCase):
     model = ContactRole
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
     create_data = [
@@ -168,6 +228,9 @@ class ContactRoleTest(APIViewTestCases.APIViewTestCase):
     bulk_update_data = {
         'description': 'New description',
     }
+    bulk_update_invalid_data = {
+        'owner': 99999,
+    }
 
     @classmethod
     def setUpTestData(cls):
@@ -180,12 +243,15 @@ class ContactRoleTest(APIViewTestCases.APIViewTestCase):
         ContactRole.objects.bulk_create(contact_roles)
 
 
-class ContactTest(APIViewTestCases.APIViewTestCase):
+class ContactTestCase(APIViewTestCases.APIViewTestCase):
     model = Contact
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     bulk_update_data = {
         'groups': [],
         'comments': 'New comments',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
     }
 
     @classmethod
@@ -220,11 +286,14 @@ class ContactTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ContactAssignmentTest(APIViewTestCases.APIViewTestCase):
+class ContactAssignmentTestCase(APIViewTestCases.APIViewTestCase):
     model = ContactAssignment
     brief_fields = ['contact', 'display', 'id', 'priority', 'role', 'url']
     bulk_update_data = {
         'priority': ContactPriorityChoices.PRIORITY_INACTIVE,
+    }
+    bulk_update_invalid_data = {
+        'priority': 'not-a-valid-priority',
     }
     user_permissions = ('tenancy.view_contact', )
 

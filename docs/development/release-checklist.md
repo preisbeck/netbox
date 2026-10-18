@@ -47,7 +47,7 @@ If a new Django release is adopted or other major dependencies (Python, PostgreS
 Start the documentation server and navigate to the current version of the installation docs:
 
 ```no-highlight
-mkdocs serve
+zensical serve
 ```
 
 Follow these instructions to perform a new installation of NetBox in a temporary environment. This process must not be automated: The goal of this step is to catch any errors or omissions in the documentation and ensure that it is kept up to date for each release. Make any necessary changes to the documentation before proceeding with the release.
@@ -97,14 +97,23 @@ Notify the [`netbox-docker`](https://github.com/netbox-community/netbox-docker) 
 
 ### Update Python Dependencies
 
-Before each release, update each of NetBox's Python dependencies to its most recent stable version. These are defined in `requirements.txt`, which is updated from `base_requirements.txt` using `pip`. To do this:
+Before each release, update each of NetBox's Python dependencies to its most recent stable version. Loose runtime constraints (and per-package descriptions) live in `base_requirements.txt`; `requirements.txt` is the pinned, top-level dependency file consumed by the release archive, the git install flow (`upgrade.sh`), and the published wheel's dependency metadata. Optional dependency groups (for example `ldap`, `saml2`) are declared in `pyproject.toml`.
 
-1. Upgrade the installed version of all required packages in your environment (`pip install -U -r base_requirements.txt`).
-2. Run all tests and check that the UI and API function as expected.
-3. Review each requirement's release notes for any breaking or otherwise noteworthy changes.
-4. Update the package versions in `requirements.txt` as appropriate.
+To update the pinned requirements:
 
-In cases where upgrading a dependency to its most recent release is breaking, it should be constrained to its current minor version in `base_requirements.txt` with an explanatory comment and revisited for the next major NetBox release (see the [Address Constrained Dependencies](#address-constrained-dependencies) section above).
+1. Review each constraint in `base_requirements.txt`.
+2. Upgrade the installed version of all required packages in your environment (`pip install -U -r base_requirements.txt`).
+3. Run all tests and check that the UI and API function as expected.
+4. Review each requirement's release notes for any breaking or otherwise noteworthy changes.
+5. If upgrading a dependency is breaking, constrain it in `base_requirements.txt` with an explanatory comment and revisit it for the next major NetBox release (see the [Address Constrained Dependencies](#address-constrained-dependencies) section above).
+6. Update the pinned versions in `requirements.txt` to the versions you just tested. Keep `requirements.txt` in the existing bare `package==version` format (one top-level package per line, the same package set as `base_requirements.txt`).
+7. Verify there is no drift between the policy file and the pins:
+
+    ```no-highlight
+    python3 scripts/verify_dependencies.py
+    ```
+
+The published wheel's `Requires-Dist` is generated from `requirements.txt` at build time, so the package installs the same tested pins as the archive and git flows.
 
 ### Update UI Dependencies
 
@@ -143,8 +152,7 @@ Then, compile these portable (`.po`) files for use in the application:
 ### Update Version and Changelog
 
 * Update the version number and published date in `netbox/release.yaml`. Add or remove the designation (e.g. `beta1`) if applicable.
-* Copy the version number from `release.yaml` to `pyproject.toml` in the project root.
-* Update the example version numbers in the feature request, bug report, and performance templates under `.github/ISSUE_TEMPLATES/`.
+* No manual `pyproject.toml` version edit is needed: the package version is derived automatically from `release.yaml` (`version` plus any `designation`) by the build backend.
 * Add a section for this release at the top of the changelog page for the minor version (e.g. `docs/release-notes/version-4.2.md`) listing all relevant changes made in this release.
 
 !!! tip
@@ -162,11 +170,22 @@ This will automatically update the schema file at `contrib/generated_schema.json
 
 ### Update the OpenAPI Schema
 
+!!! warning "Disable all plugins first"
+    Before generating the OpenAPI schema, disable any installed plugins. This will prevent their schemas from being pulled into the generated snapshot.
+
 Update the static OpenAPI schema definition at `contrib/openapi.json` with the management command below. If the schema file is up-to-date, only the NetBox version will be changed.
 
 ```nohighlight
 ./manage.py spectacular --format openapi-json > ../contrib/openapi.json
 ```
+
+### Update Development Dependencies
+
+Keep development tooling versions consistent across the project. If you upgrade a dev-only dependency, update all places where it’s pinned so local tooling and CI run the same versions.
+
+* Ruff
+    * `.pre-commit-config.yaml`
+    * `.github/workflows/ci.yml`
 
 ### Submit a Pull Request
 
@@ -177,6 +196,16 @@ Once CI has completed and a colleague has reviewed the PR, merge it. This effect
 !!! warning
     To ensure a streamlined review process, the pull request for a release **must** be limited to the changes outlined in this document. A release PR must never include functional changes to the application: Any unrelated "cleanup" needs to be captured in a separate PR prior to the release being shipped.
 
+### Confirm Package Publishing Prerequisites
+
+Complete these checks before creating the release tag.
+
+Confirm that the existing PyPI trusted publisher still matches this repository, `.github/workflows/release.yml`, and the `pypi` environment name. If a Test PyPI rehearsal is planned, confirm the corresponding Test PyPI trusted publisher and `testpypi` environment as well. The trusted publisher's environment name must match the publish job's `environment.name`, otherwise the index rejects the upload before any file is transferred.
+
+Confirm that the `pypi` GitHub Actions environment has required reviewers configured so the production upload waits for approval after the package checks complete. Enable **Prevent self-review**, restrict deployments to `v*` tags, and leave administrator bypass disabled unless the maintainers deliberately require it. Referencing an environment from the workflow does not configure these protection rules; if the environment does not exist, GitHub creates it without an approval gate. The `testpypi` environment does not need an approval gate because a rehearsal run is dispatched deliberately.
+
+The published package version is derived from `netbox/release.yaml` (the `version` field plus any `designation`, e.g. `beta1` becomes `4.7.0b1`), not from the git tag. Confirm that the intended tag and `netbox/release.yaml` agree before creating the release. The publishing workflow verifies the match again against the built wheel.
+
 ### Create a New Release
 
 Create a [new release](https://github.com/netbox-community/netbox/releases/new) on GitHub with the following parameters.
@@ -186,4 +215,56 @@ Create a [new release](https://github.com/netbox-community/netbox/releases/new) 
 * **Title:** Version and date (e.g. `v4.2.1 - 2025-01-17`)
 * **Description:** Copy from the pull request body, then promote the `###` headers to `##` ones
 
-Once created, the release will become available for users to install.
+Once created, the release will become available for users to install from GitHub.
+
+### Publish to PyPI
+
+Creating the GitHub release pushes the new tag and starts the Python package publishing workflow. With the prerequisites above in place, the workflow builds and verifies the wheel and source distribution, then holds the production upload until the `pypi` deployment is approved. Approving the deployment publishes the verified artifacts to **PyPI**. Installing NetBox from the Python package is experimental in NetBox v4.7 and is not recommended for production use.
+
+A manual `workflow_dispatch` run from a `v*` release tag publishes to **Test PyPI** instead. This remains available as an optional rehearsal after packaging or publishing changes, but it is not required for every production release. Dispatching from a branch runs the build and verification jobs as a dry run without publishing anywhere.
+
+Dispatch a rehearsal from the release tag with GitHub CLI:
+
+```no-highlight
+gh workflow run release.yml --ref vX.Y.Z
+```
+
+When a Test PyPI rehearsal is useful for a release, keep the production deployment awaiting approval while you dispatch the workflow from the same tag and validate the rehearsal. The rehearsal is a separate workflow run and rebuilds the distributions, so it validates the packaging and publishing path rather than the exact files waiting for production. Approve the production deployment after the rehearsal completes.
+
+Test PyPI enforces the same filename immutability. Once it has accepted either distribution generated for a release tag, dispatching that tag again is expected to fail because the workflow rebuilds the same wheel and source distribution filenames. A further rehearsal requires a new package version and matching tag.
+
+Official pre-release tags, including beta and release-candidate versions, are published to PyPI as well. This is intentional. Pip does not select pre-release versions by default unless the user explicitly requests one or no compatible stable release is available.
+
+After a publish run completes:
+
+* Verify that the build, CLI smoke-test (`cli-smoke-test`), smoke-test, dependency-verification (`verify-dependencies`), and sdist-verification (`verify-sdist`) jobs succeeded. The dependency-verification job fails the release if `requirements.txt` has drifted from `base_requirements.txt` or if the built wheel's `Requires-Dist` does not match `requirements.txt`; the sdist-verification job fails it if the sdist ships unexpected configuration files or cannot rebuild a valid wheel.
+* Verify that the publish job used the expected trusted-publishing environment: `pypi` for a production release or `testpypi` for a rehearsal.
+* Confirm that the new version is visible on the corresponding package index.
+* Test the published wheel using the [wheel smoke-test procedure](./building-the-package.md#test-installing-the-wheel). For a production release, replace the local wheel installation command in that procedure with:
+
+    ```no-highlight
+    /tmp/netbox-build-test/bin/python -m pip install "netbox==<version>"
+    ```
+
+    For a Test PyPI rehearsal, install NetBox's pinned runtime dependencies from PyPI first and then install the candidate without resolving dependencies from the test index:
+
+    ```no-highlight
+    /tmp/netbox-build-test/bin/python -m pip install -r requirements.txt
+    /tmp/netbox-build-test/bin/python -m pip install \
+        --no-deps \
+        --index-url https://test.pypi.org/simple/ \
+        "netbox==<version>"
+    ```
+
+    Run `netbox check` with the configuration and environment variables shown in the linked procedure.
+
+!!! warning "Production PyPI uploads are final"
+    Distribution files uploaded to PyPI cannot be replaced. A release may be yanked, and a release or an individual file may be deleted, but an uploaded filename can never be reused. Correcting an accepted distribution file requires publishing a new NetBox version.
+
+    If the publish job fails, check PyPI and the job log to determine whether any distribution file was accepted before deciding how to recover.
+
+    If no file was accepted and the cause can be corrected without changing the built distributions, correct it and re-run only the failed `publish-pypi` job. That reuses the package artifacts already built and verified in the original workflow run. Do not use **Re-run all jobs**, because it rebuilds the distributions.
+
+    If correcting the failure requires changing package contents or metadata, prepare a new NetBox version and release tag instead.
+
+    If PyPI accepted either distribution file, do not retry the publish job. Production publishing fails on duplicate filenames by design, so the retry fails when it reaches the already accepted file. Yank the incomplete release, record the accepted filenames and hashes, and publish a new NetBox version rather than combining files from separate builds.

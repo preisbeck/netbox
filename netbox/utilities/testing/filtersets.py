@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from itertools import chain
 
 import django_filters
@@ -6,28 +6,26 @@ from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelatio
 from django.contrib.contenttypes.models import ContentType
 from django.db.models import ForeignKey, ManyToManyField, ManyToManyRel, ManyToOneRel, OneToOneRel
 from django.utils.module_loading import import_string
-from mptt.models import MPTTModel
 from taggit.managers import TaggableManager
 
 from extras.filters import TagFilter
+from netbox.models.ltree import LtreeModel
 from utilities.filters import MultiValueContentTypeFilter, TreeNodeMultipleChoiceFilter
 
 __all__ = (
-    'BaseFilterSetTests',
-    'ChangeLoggedFilterSetTests',
+    'BaseFilterSetTestMixin',
+    'ChangeLoggedFilterSetTestMixin',
 )
 
 EXEMPT_MODEL_FIELDS = (
     'comments',
     'custom_field_data',
-    'level',    # MPTT
-    'lft',      # MPTT
-    'rght',     # MPTT
-    'tree_id',  # MPTT
+    'path',      # ltree, trigger-maintained
+    'sort_path',  # ltree, trigger-maintained
 )
 
 
-class BaseFilterSetTests:
+class BaseFilterSetTestMixin:
     queryset = None
     filterset = None
     ignore_fields = tuple()
@@ -59,14 +57,14 @@ class BaseFilterSetTests:
             if field.related_model is ContentType:
                 return [(None, None)]
 
-            # ForeignKey to an MPTT-enabled model
-            if issubclass(field.related_model, MPTTModel) and field.model is not field.related_model:
+            # ForeignKey to an ltree-backed hierarchical model
+            if issubclass(field.related_model, LtreeModel) and field.model is not field.related_model:
                 return [(f'{filter_name}_id', TreeNodeMultipleChoiceFilter)]
 
             return [(f'{filter_name}_id', django_filters.ModelMultipleChoiceFilter)]
 
         # Many-to-many relationships (forward & backward)
-        elif type(field) in (ManyToManyField, ManyToManyRel):
+        if type(field) in (ManyToManyField, ManyToManyRel):
             filter_name = self.get_m2m_filter_name(field)
             filter_name = self.filter_name_map.get(filter_name, filter_name)
 
@@ -82,7 +80,7 @@ class BaseFilterSetTests:
             return [(f'{filter_name}_id', django_filters.ModelMultipleChoiceFilter)]
 
         # Tag manager
-        if type(field) is TaggableManager:
+        if isinstance(field, TaggableManager):
             return [('tag', TagFilter)]
 
         # Unable to determine the correct filter class
@@ -152,16 +150,16 @@ class BaseFilterSetTests:
                     )
 
 
-class ChangeLoggedFilterSetTests(BaseFilterSetTests):
+class ChangeLoggedFilterSetTestMixin(BaseFilterSetTestMixin):
 
     def test_created(self):
         pk_list = self.queryset.values_list('pk', flat=True)[:2]
-        self.queryset.filter(pk__in=pk_list).update(created=datetime(2021, 1, 1, 0, 0, 0, tzinfo=timezone.utc))
+        self.queryset.filter(pk__in=pk_list).update(created=datetime(2021, 1, 1, 0, 0, 0, tzinfo=UTC))
         params = {'created': ['2021-01-01T00:00:00']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
     def test_last_updated(self):
         pk_list = self.queryset.values_list('pk', flat=True)[:2]
-        self.queryset.filter(pk__in=pk_list).update(last_updated=datetime(2021, 1, 2, 0, 0, 0, tzinfo=timezone.utc))
+        self.queryset.filter(pk__in=pk_list).update(last_updated=datetime(2021, 1, 2, 0, 0, 0, tzinfo=UTC))
         params = {'last_updated': ['2021-01-02T00:00:00']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)

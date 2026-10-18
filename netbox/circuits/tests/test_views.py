@@ -1,7 +1,6 @@
 import datetime
 
 from django.contrib.contenttypes.models import ContentType
-from django.test import override_settings
 from django.urls import reverse
 
 from circuits.choices import *
@@ -196,8 +195,27 @@ class CircuitTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'comments': 'New comments',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
+    def test_circuit_type_display_colored(self):
+        circuit_type = CircuitType.objects.first()
+        circuit_type.color = '12ab34'
+        circuit_type.save()
+
+        circuit = Circuit.objects.first()
+
+        self.add_permissions('circuits.view_circuit')
+        response = self.client.get(circuit.get_absolute_url())
+
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, circuit_type.name)
+        self.assertContains(response, 'background-color: #12ab34')
+
     def test_bulk_import_objects_with_terminations(self):
+        self.add_permissions(
+            'circuits.view_circuit',
+            'circuits.view_provider',
+            'circuits.view_circuittype',
+            'dcim.view_site',
+        )
         site = Site.objects.first()
         json_data = f"""
             [
@@ -382,8 +400,8 @@ class CircuitTerminationTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         cls.form_data = {
             'circuit': circuits[2].pk,
             'term_side': 'A',
-            'termination_type': ContentType.objects.get_for_model(Site).pk,
-            'termination': sites[2].pk,
+            'termination_content_type': ContentType.objects.get_for_model(Site).pk,
+            'termination_object_id': sites[2].pk,
             'description': 'New description',
         }
 
@@ -406,8 +424,13 @@ class CircuitTerminationTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'description': 'New description',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'])
     def test_trace(self):
+        self.add_permissions(
+            'circuits.view_circuittermination',
+            'dcim.view_cable',
+            'dcim.view_interface',
+            'dcim.view_device',
+        )
         device = create_test_device('Device 1')
 
         circuittermination = CircuitTermination.objects.first()
@@ -518,8 +541,8 @@ class CircuitGroupAssignmentTestCase(
 
         cls.form_data = {
             'group': circuit_groups[3].pk,
-            'member_type': ContentType.objects.get_for_model(Circuit).pk,
-            'member': circuits[3].pk,
+            'member_content_type': ContentType.objects.get_for_model(Circuit).pk,
+            'member_object_id': circuits[3].pk,
             'priority': CircuitPriorityChoices.PRIORITY_INACTIVE,
             'tags': [t.pk for t in tags],
         }
@@ -697,8 +720,13 @@ class VirtualCircuitTestCase(ViewTestCases.PrimaryObjectViewTestCase):
             'comments': 'New comments',
         }
 
-    @override_settings(EXEMPT_VIEW_PERMISSIONS=['*'], EXEMPT_EXCLUDE_MODELS=[])
     def test_bulk_import_objects_with_terminations(self):
+        self.add_permissions(
+            'circuits.view_virtualcircuit',
+            'circuits.view_providernetwork',
+            'circuits.view_virtualcircuittype',
+            'dcim.view_interface',
+        )
         interfaces = Interface.objects.filter(type=InterfaceTypeChoices.TYPE_VIRTUAL)
         json_data = f"""
             [

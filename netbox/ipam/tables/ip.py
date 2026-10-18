@@ -6,6 +6,7 @@ from django_tables2.utils import Accessor
 from ipam.models import *
 from netbox.tables import NetBoxTable, OrganizationalModelTable, PrimaryModelTable, columns
 from tenancy.tables import ContactsColumnMixin, TenancyColumnsMixin, TenantColumn
+
 from .template_code import *
 
 __all__ = (
@@ -119,6 +120,11 @@ class RoleTable(OrganizationalModelTable):
         url_params={'role_id': 'pk'},
         verbose_name=_('VLANs')
     )
+    asn_count = columns.LinkedCountColumn(
+        viewname='ipam:asn_list',
+        url_params={'role_id': 'pk'},
+        verbose_name=_('ASNs')
+    )
     tags = columns.TagColumn(
         url_name='ipam:role_list'
     )
@@ -126,10 +132,10 @@ class RoleTable(OrganizationalModelTable):
     class Meta(OrganizationalModelTable.Meta):
         model = Role
         fields = (
-            'pk', 'id', 'name', 'slug', 'prefix_count', 'iprange_count', 'vlan_count', 'description', 'weight',
-            'comments', 'tags', 'created', 'last_updated', 'actions',
+            'pk', 'id', 'name', 'slug', 'prefix_count', 'iprange_count', 'vlan_count', 'asn_count', 'description',
+            'weight', 'comments', 'tags', 'created', 'last_updated', 'actions',
         )
-        default_columns = ('pk', 'name', 'prefix_count', 'iprange_count', 'vlan_count', 'description')
+        default_columns = ('pk', 'name', 'prefix_count', 'iprange_count', 'vlan_count', 'asn_count', 'description')
 
 
 #

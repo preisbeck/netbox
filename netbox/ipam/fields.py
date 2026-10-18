@@ -1,5 +1,5 @@
 from django.core.exceptions import ValidationError
-from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils.translation import gettext as _
 from netaddr import AddrFormatError, IPNetwork
@@ -42,7 +42,10 @@ class BaseIPField(models.Field):
             raise ValidationError(e)
 
     def get_prep_value(self, value):
-        if not value:
+        # Membership check; `not value` incorrectly treats the valid zero addresses
+        # 0.0.0.0 and :: as empty. netaddr objects compare unequal to all three
+        # sentinels; raw int 0 stays "empty" for backward compatibility.
+        if value in (None, '', 0):
             return None
         if isinstance(value, list):
             return [str(self.to_python(v)) for v in value]
@@ -107,6 +110,7 @@ IPAddressField.register_lookup(lookups.NetContainsOrEquals)
 IPAddressField.register_lookup(lookups.NetHost)
 IPAddressField.register_lookup(lookups.NetIn)
 IPAddressField.register_lookup(lookups.NetHostContained)
+IPAddressField.register_lookup(lookups.NetHostBetween)
 IPAddressField.register_lookup(lookups.NetFamily)
 IPAddressField.register_lookup(lookups.NetMaskLength)
 IPAddressField.register_lookup(lookups.Host)

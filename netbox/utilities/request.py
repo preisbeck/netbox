@@ -2,18 +2,22 @@ import warnings
 from contextlib import ExitStack, contextmanager
 from urllib.parse import urlparse
 
+from django.conf import settings
+from django.utils.datastructures import MultiValueDict
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.translation import gettext_lazy as _
 from netaddr import AddrFormatError, IPAddress
 
 from netbox.registry import registry
-from .constants import HTTP_REQUEST_META_SAFE_COPY
+
+from .constants import HTTP_REQUEST_META_SAFE_COPY, HTTP_REQUEST_META_SENSITIVE
 
 __all__ = (
     'NetBoxFakeRequest',
     'apply_request_processors',
     'copy_safe_request',
     'get_client_ip',
+    'get_safe_request_context',
     'safe_for_redirect',
 )
 
@@ -27,6 +31,10 @@ class NetBoxFakeRequest:
     A fake request object which is explicitly defined at the module level so it is able to be pickled. It simply
     takes what is passed to it as kwargs on init and sets them as instance variables.
     """
+    # Fake requests run outside an HTTP exchange and are not HTMX requests.
+    # A class-level default also covers requests pickled before this attribute existed.
+    htmx = False
+
     def __init__(self, _dict):
         self.__dict__ = _dict
 
@@ -44,11 +52,14 @@ def copy_safe_request(request, include_files=True):
         request: The original request object
         include_files: Whether to include request.FILES.
     """
-    meta = {
-        k: request.META[k]
-        for k in HTTP_REQUEST_META_SAFE_COPY
-        if k in request.META and isinstance(request.META[k], str)
-    }
+    meta = {}
+    for k, v in request.META.items():
+        if not isinstance(v, str):
+            continue
+        if k in HTTP_REQUEST_META_SAFE_COPY:
+            meta[k] = v
+        elif k.startswith('HTTP_') and k not in HTTP_REQUEST_META_SENSITIVE:
+            meta[k] = v
     data = {
         'META': meta,
         'COOKIES': request.COOKIES,
@@ -57,25 +68,45 @@ def copy_safe_request(request, include_files=True):
         'user': request.user,
         'method': request.method,
         'path': request.path,
+        'path_info': request.path_info,
         'id': getattr(request, 'id', None),  # UUID assigned by middleware
     }
     if include_files:
         data['FILES'] = request.FILES
+    else:
+        data['FILES'] = MultiValueDict()
 
     return NetBoxFakeRequest(data)
 
 
+def get_safe_request_context(request):
+    """
+    Return a sanitized subset of an HttpRequest suitable for exposure to user-authored templates
+    (e.g. custom links). Excludes sensitive data such as cookies, headers, and session state. Returns a
+    plain dict; Jinja2 resolves attribute access (e.g. request.path) against it via getitem fallback.
+    """
+    if request is None:
+        return None
+    return {
+        'id': str(request.id) if hasattr(request, 'id') else None,  # UUID assigned by middleware
+        'path': request.path,
+        'path_info': request.path_info,
+        'method': request.method,
+        'GET': request.GET,
+        'user': str(request.user),  # Username only; not the User instance
+    }
+
+
 def get_client_ip(request, additional_headers=()):
     """
-    Return the client (source) IP address of the given request.
+    Return the client (source) IP address of the given request. Accepts an optional list of headers to inspect in
+    addition to those configured under HTTP_CLIENT_IP_HEADERS.
     """
-    HTTP_HEADERS = (
-        'HTTP_X_REAL_IP',
-        'HTTP_X_FORWARDED_FOR',
-        'REMOTE_ADDR',
-        *additional_headers
+    headers = (
+        *settings.HTTP_CLIENT_IP_HEADERS,
+        *additional_headers,
     )
-    for header in HTTP_HEADERS:
+    for header in headers:
         if header in request.META:
             ip = request.META[header].split(',')[0].strip()
             try:

@@ -8,6 +8,7 @@ from netbox.utils import get_data_backend_choices
 from users.models import User
 from utilities.filters import MultiValueContentTypeFilter
 from utilities.filtersets import register_filterset
+
 from .choices import *
 from .models import *
 
@@ -131,18 +132,48 @@ class JobFilterSet(BaseFilterSet):
         field_name='completed',
         lookup_expr='gte'
     )
+    execution_time = django_filters.DurationFilter(
+        label=_('Execution time')
+    )
+    execution_time__gte = django_filters.DurationFilter(
+        field_name='execution_time',
+        lookup_expr='gte',
+        label=_('Execution time (minimum)')
+    )
+    execution_time__lte = django_filters.DurationFilter(
+        field_name='execution_time',
+        lookup_expr='lte',
+        label=_('Execution time (maximum)')
+    )
     status = django_filters.MultipleChoiceFilter(
         choices=JobStatusChoices,
         distinct=False,
         null_value=None
     )
+    notifications = django_filters.MultipleChoiceFilter(
+        choices=JobNotificationChoices,
+        distinct=False,
+        null_value=None
+    )
     queue_name = django_filters.CharFilter()
+    user_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=User.objects.all(),
+        distinct=False,
+        label=_('User (ID)'),
+    )
+    user = django_filters.ModelMultipleChoiceFilter(
+        field_name='user__username',
+        queryset=User.objects.all(),
+        distinct=False,
+        to_field_name='username',
+        label=_('User name'),
+    )
 
     class Meta:
         model = Job
         fields = (
             'id', 'object_type', 'object_type_id', 'object_id', 'name', 'interval', 'status', 'user', 'job_id',
-            'queue_name',
+            'queue_name', 'execution_time',
         )
 
     def search(self, queryset, name, value):

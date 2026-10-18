@@ -1,11 +1,23 @@
+import json
 import logging
+import os
+import traceback
 from abc import ABC, abstractmethod
 from datetime import timedelta
+from io import BytesIO
+from pathlib import Path
 
-from django.core.exceptions import ImproperlyConfigured
-from django.utils.functional import classproperty
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied, ValidationError
+from django.core.handlers.wsgi import WSGIRequest
+from django.db.models import ProtectedError, RestrictedError
+from django.http import Http404, QueryDict
 from django.utils import timezone
-from django_pglocks import advisory_lock
+from django.utils.functional import classproperty
+from django.utils.module_loading import import_string
+from django.utils.translation import gettext_lazy as _
+from django_pg_utils import advisory_lock
+from rest_framework.exceptions import APIException
 from rq.timeouts import JobTimeoutException
 
 from core.choices import JobStatusChoices
@@ -13,13 +25,20 @@ from core.exceptions import JobFailed
 from core.models import Job, ObjectType
 from netbox.constants import ADVISORY_LOCK_KEYS
 from netbox.registry import registry
+from utilities.exceptions import AbortRequest
 from utilities.request import apply_request_processors
 
 __all__ = (
+    'AsyncAPIJob',
     'AsyncViewJob',
     'JobRunner',
     'system_job',
 )
+
+# The installation root, e.g. "/opt/netbox/". Used to strip absolute path
+# prefixes from traceback file paths before recording them in the job log.
+# jobs.py lives at <root>/netbox/netbox/jobs.py, so parents[2] is the root.
+_INSTALL_ROOT = str(Path(__file__).resolve().parents[2]) + os.sep
 
 
 def system_job(interval):
@@ -107,6 +126,13 @@ class JobRunner(ABC):
             job.terminate(status=JobStatusChoices.STATUS_FAILED)
 
         except Exception as e:
+            tb_str = traceback.format_exc().replace(_INSTALL_ROOT, '')
+            tb_record = logging.makeLogRecord({
+                'levelno': logging.ERROR,
+                'levelname': 'ERROR',
+                'msg': tb_str,
+            })
+            job.log(tb_record)
             job.terminate(status=JobStatusChoices.STATUS_ERRORED, error=repr(e))
             if type(e) is JobTimeoutException:
                 logger.error(e)
@@ -121,14 +147,57 @@ class JobRunner(ABC):
                 )
                 if job.object and getattr(job.object, "python_class", None):
                     kwargs["job_timeout"] = job.object.python_class.job_timeout
-                cls.enqueue(
+
+                enqueue_kwargs = dict(
                     instance=job.object,
                     name=job.name,
                     user=job.user,
                     schedule_at=new_scheduled_time,
                     interval=job.interval,
+                    notifications=job.notifications,
                     **kwargs,
                 )
+
+                # Reschedule the next occurrence. If the object's configuration has become invalid since this run was
+                # scheduled (e.g. a script's Meta.job_timeout was edited to an invalid value, see #22872), the enqueue
+                # will raise a ValidationError. Record it on this job and decline to reschedule rather than allowing an
+                # unhandled exception to escape the worker's finally block.
+                try:
+                    if cls in registry['system_jobs']:
+                        # System jobs are also scheduled by `enqueue_once()` at worker startup,
+                        # which races with this finally block and can produce duplicate schedules
+                        # (see #22232). Acquire the same advisory lock used by `enqueue_once()`
+                        # and skip rescheduling if a successor is already enqueued.
+                        #
+                        # This branch is limited to system jobs because generic recurring jobs
+                        # (e.g. scheduled scripts) may have multiple legitimate schedules sharing
+                        # the same runner/object/interval but differing in their runtime kwargs.
+                        with advisory_lock(ADVISORY_LOCK_KEYS['job-schedules']):
+                            successor_exists = Job.objects.filter(
+                                name=cls.name,
+                                object_id__isnull=True,
+                                status__in=JobStatusChoices.ENQUEUED_STATE_CHOICES,
+                                interval=job.interval,
+                            ).exclude(pk=job.pk).exists()
+                            if not successor_exists:
+                                cls.enqueue(**enqueue_kwargs)
+                    else:
+                        cls.enqueue(**enqueue_kwargs)
+                except ValidationError as e:
+                    # The successor could not be scheduled because the object's configuration is now invalid. Record
+                    # this against the (already-terminated) job without overwriting the outcome of the run that just
+                    # completed — re-running terminate() here would clobber a successful run's status and fire a
+                    # duplicate notification (see #22872).
+                    error = _("Recurring job not rescheduled due to invalid configuration: {error}").format(
+                        error='; '.join(e.messages)
+                    )
+                    logger.error(f"Job {job}: {error}")
+                    job.log(logging.makeLogRecord({
+                        'levelno': logging.ERROR,
+                        'levelname': 'ERROR',
+                        'msg': error,
+                    }))
+                    job.save()
 
     @classmethod
     def get_jobs(cls, instance=None):
@@ -205,3 +274,150 @@ class AsyncViewJob(JobRunner):
 
         if self.job.error:
             raise JobFailed()
+
+
+class AsyncAPIJob(JobRunner):
+    """
+    Execute a REST API bulk write (create/update/delete) as a background job.
+
+    The viewset's action method is re-invoked inside the worker against a reconstructed
+    request, so the synchronous and background code paths are identical (validation,
+    transaction semantics, object permissions, and change logging all behave the same).
+    The action's serialized Response is captured into the job's data.
+    """
+    class Meta:
+        name = 'Async API Request'
+
+    @staticmethod
+    def _build_request(request_copy, payload, scheme):
+        """
+        Reconstruct a real WSGIRequest from a copy_safe_request() snapshot, injecting the JSON
+        payload as the request body. DRF's Request wrapper requires a real HttpRequest to parse
+        the body, and the snapshot's host metadata (already correctly separated into
+        SERVER_NAME/SERVER_PORT/HTTP_HOST by the original WSGI layer) is carried verbatim so that
+        absolute URLs in the captured result (serializer hyperlink fields) point at the real
+        server. The original headers and query string are carried as well. The scheme is applied
+        separately, as copy_safe_request() does not capture it.
+        """
+        body = json.dumps(payload).encode('utf-8')
+        environ = {
+            'REQUEST_METHOD': request_copy.method,
+            'PATH_INFO': getattr(request_copy, 'path', '/') or '/',
+            'CONTENT_TYPE': 'application/json',
+            'CONTENT_LENGTH': str(len(body)),
+            'wsgi.input': BytesIO(body),
+            'wsgi.url_scheme': scheme,
+            'SERVER_PROTOCOL': 'HTTP/1.1',
+            # Sensible defaults (a real WSGI layer always sets these); overridden below by the
+            # snapshot's host metadata when present.
+            'SERVER_NAME': 'localhost',
+            'SERVER_PORT': '443' if scheme == 'https' else '80',
+        }
+        # Carry the host metadata from the safe request copy (no host:port parsing needed: these
+        # were already split correctly when the original request was received).
+        for key in ('SERVER_NAME', 'SERVER_PORT'):
+            if value := request_copy.META.get(key):
+                environ[key] = value
+        # Carry the original headers (copy_safe_request() has already dropped sensitive ones) so that
+        # request processors (e.g. a plugin selecting the active branch) see the request as received.
+        for key, value in request_copy.META.items():
+            if key.startswith('HTTP_'):
+                environ[key] = value
+        # Carry the query string, less the background flag so the worker executes the action
+        # rather than enqueuing another job.
+        query = QueryDict(request_copy.META.get('QUERY_STRING', ''), mutable=True)
+        query.pop('background', None)
+        environ['QUERY_STRING'] = query.urlencode()
+
+        request = WSGIRequest(environ)
+        request.id = getattr(request_copy, 'id', None)
+        return request
+
+    def run(
+        self, viewset_class, action, payload, user_pk, request,
+        action_kwargs=None, scheme='http', **kwargs
+    ):
+        # Imported here to avoid a circular import (netbox.api.viewsets imports from this module).
+        from netbox.api.viewsets import HTTP_ACTIONS
+
+        action_kwargs = action_kwargs or {}
+        method = request.method
+        request_id = getattr(request, 'id', '') or ''
+        viewset_class = import_string(viewset_class)
+
+        # Re-fetch the requesting user. If the user no longer exists or is inactive, fail
+        # the job rather than running with stale identity (execution-time identity check).
+        User = get_user_model()
+        try:
+            user = User.objects.get(pk=user_pk)
+        except User.DoesNotExist:
+            self.job.error = "The requesting user no longer exists."
+            self.job.save()
+            raise JobFailed()
+        if not user.is_active:
+            self.job.error = "The requesting user is no longer active."
+            self.job.save()
+            raise JobFailed()
+
+        django_request = self._build_request(request, payload, scheme)
+
+        # Instantiate the viewset and apply the minimal scaffolding that DRF's as_view()
+        # normally sets, so initialize_request() can wire up parsers, etc.
+        viewset = viewset_class()
+        viewset.action_map = {method.lower(): action}
+        viewset.kwargs = {}
+        viewset.args = ()
+        viewset.action = action
+        viewset.format_kwarg = None
+
+        drf_request = viewset.initialize_request(django_request)
+        # Carry the authenticated user forward; we do not re-authenticate in the worker.
+        # Setting .user populates the request's user cache, so DRF never lazily invokes
+        # authentication (and nothing on the action path reads the authenticator/auth).
+        drf_request.user = user
+        drf_request.id = request_id
+        viewset.request = drf_request
+
+        # Re-apply object-level permission restriction exactly as BaseViewSet.initial() does.
+        if perm_action := HTTP_ACTIONS[method.upper()]:
+            viewset.queryset = viewset.queryset.restrict(user, perm_action)
+
+        # Execute the action method within the registered request processors so change
+        # logging and event rules fire (and are attributed to the original request_id).
+        #
+        # The synchronous path relies on NetBoxModelViewSet.dispatch() and DRF's
+        # handle_exception() to translate exceptions into HTTP responses. Because we invoke
+        # the action method directly (bypassing dispatch), we reproduce that translation here
+        # so the captured result matches what the synchronous API would have returned:
+        #   - APIException (incl. ValidationError, PermissionDenied, Http404) -> handle_exception()
+        #   - AbortRequest / ProtectedError / RestrictedError -> exception_to_response()
+        with apply_request_processors(drf_request):
+            try:
+                # A job queued before the endpoint opted out carries no query parameter to catch.
+                # Optional because run() accepts any importable viewset, not only mixin subclasses.
+                if check_background := getattr(viewset, 'check_background_enabled', None):
+                    check_background()
+                response = getattr(viewset, action)(drf_request, **action_kwargs)
+            except (APIException, Http404, PermissionDenied) as e:
+                response = viewset.handle_exception(e)
+            except (AbortRequest, ProtectedError, RestrictedError) as e:
+                response = viewset.exception_to_response(e)
+                if response is None:
+                    raise
+
+        # Capture the action's result for the polling client, in the same shape for both
+        # success and failure.
+        self.job.data = {
+            'status_code': response.status_code,
+            'data': response.data,
+        }
+
+        if response.status_code >= 400:
+            # A handled rejection (4xx), not a worker crash: record a concise summary and
+            # mark the job failed (JobRunner.handle reserves "errored" for unhandled crashes).
+            detail = response.data.get('detail') if isinstance(response.data, dict) else None
+            self.job.error = str(detail) if detail else f"Request failed with status {response.status_code}."
+            self.job.save()
+            raise JobFailed()
+
+        # On success, job.data is persisted by JobRunner.handle() -> job.terminate().

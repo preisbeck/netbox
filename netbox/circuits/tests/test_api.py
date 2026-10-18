@@ -1,14 +1,19 @@
+from django.test import tag
 from django.urls import reverse
+from rest_framework import status
 
 from circuits.choices import *
 from circuits.models import *
+from core.models import ObjectType
 from dcim.choices import InterfaceTypeChoices
 from dcim.models import Device, DeviceRole, DeviceType, Interface, Manufacturer, Site
+from extras.choices import CustomFieldTypeChoices
+from extras.models import CustomField
 from ipam.models import ASN, RIR
 from utilities.testing import APITestCase, APIViewTestCases
 
 
-class AppTest(APITestCase):
+class AppTestCase(APITestCase):
 
     def test_root(self):
         url = reverse('circuits-api:api-root')
@@ -17,11 +22,14 @@ class AppTest(APITestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class ProviderTest(APIViewTestCases.APIViewTestCase):
+class ProviderTestCase(APIViewTestCases.APIViewTestCase):
     model = Provider
     brief_fields = ['circuit_count', 'description', 'display', 'id', 'name', 'slug', 'url']
     bulk_update_data = {
         'comments': 'New comments',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
     }
 
     @classmethod
@@ -59,7 +67,7 @@ class ProviderTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class CircuitTypeTest(APIViewTestCases.APIViewTestCase):
+class CircuitTypeTestCase(APIViewTestCases.APIViewTestCase):
     model = CircuitType
     brief_fields = ['circuit_count', 'description', 'display', 'id', 'name', 'slug', 'url']
     create_data = (
@@ -79,6 +87,9 @@ class CircuitTypeTest(APIViewTestCases.APIViewTestCase):
     bulk_update_data = {
         'description': 'New description',
     }
+    bulk_update_invalid_data = {
+        'color': 'not-a-color',
+    }
 
     @classmethod
     def setUpTestData(cls):
@@ -91,11 +102,14 @@ class CircuitTypeTest(APIViewTestCases.APIViewTestCase):
         CircuitType.objects.bulk_create(circuit_types)
 
 
-class CircuitTest(APIViewTestCases.APIViewTestCase):
+class CircuitTestCase(APIViewTestCases.APIViewTestCase):
     model = Circuit
     brief_fields = ['cid', 'description', 'display', 'id', 'provider', 'url']
     bulk_update_data = {
         'status': 'planned',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
     }
     user_permissions = ('circuits.view_provider', 'circuits.view_circuittype')
 
@@ -133,6 +147,26 @@ class CircuitTest(APIViewTestCases.APIViewTestCase):
         )
         Circuit.objects.bulk_create(circuits)
 
+        circuit_groups = (
+            CircuitGroup(name='Circuit Group 1', slug='circuit-group-1'),
+            CircuitGroup(name='Circuit Group 2', slug='circuit-group-2'),
+        )
+        CircuitGroup.objects.bulk_create(circuit_groups)
+
+        assignments = (
+            CircuitGroupAssignment(
+                group=circuit_groups[0],
+                member=circuits[0],
+                priority=CircuitPriorityChoices.PRIORITY_PRIMARY
+            ),
+            CircuitGroupAssignment(
+                group=circuit_groups[1],
+                member=circuits[1],
+                priority=CircuitPriorityChoices.PRIORITY_SECONDARY
+            ),
+        )
+        CircuitGroupAssignment.objects.bulk_create(assignments)
+
         cls.create_data = [
             {
                 'cid': 'Circuit 4',
@@ -154,8 +188,61 @@ class CircuitTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    @tag('regression')  # Ref: #23324
+    def test_assignments_field(self):
+        """The assignments field lists the group assignments of each circuit."""
+        self.add_permissions('circuits.view_circuit')
+        assignment1 = Circuit.objects.get(cid='Circuit 1').group_assignments.get()
+        assignment2 = Circuit.objects.get(cid='Circuit 2').group_assignments.get()
 
-class CircuitTerminationTest(APIViewTestCases.APIViewTestCase):
+        response = self.client.get(self._get_list_url(), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        assignments = {
+            circuit['cid']: [(obj['id'], obj['group']['id']) for obj in circuit['assignments']]
+            for circuit in response.data['results']
+        }
+        self.assertEqual(assignments, {
+            'Circuit 1': [(assignment1.pk, assignment1.group_id)],
+            'Circuit 2': [(assignment2.pk, assignment2.group_id)],
+            'Circuit 3': [],
+        })
+
+    @tag('regression')  # Ref: #23324
+    def test_create_ignores_assignments(self):
+        """Assignments sent when creating a circuit are ignored."""
+        self.add_permissions('circuits.add_circuit')
+        circuit = Circuit.objects.get(cid='Circuit 1')
+        assignment = circuit.group_assignments.get()
+        data = {
+            **self.create_data[0],
+            'assignments': [{'id': assignment.pk}],
+        }
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['assignments'], [])
+        self.assertEqual(list(circuit.group_assignments.all()), [assignment])
+
+    @tag('regression')  # Ref: #23324
+    def test_update_ignores_assignments(self):
+        """Assignments sent when updating a circuit are ignored."""
+        self.add_permissions('circuits.change_circuit')
+        circuit = Circuit.objects.get(cid='Circuit 1')
+        assignment = circuit.group_assignments.get()
+        data = {
+            'description': 'New description',
+            'assignments': [],
+        }
+
+        response = self.client.patch(self._get_detail_url(circuit), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual([obj['id'] for obj in response.data['assignments']], [assignment.pk])
+        circuit.refresh_from_db()
+        self.assertEqual(circuit.description, 'New description')
+        self.assertEqual(list(circuit.group_assignments.all()), [assignment])
+
+
+class CircuitTerminationTestCase(APIViewTestCases.APIViewTestCase):
     model = CircuitTermination
     brief_fields = ['_occupied', 'cable', 'circuit', 'description', 'display', 'id', 'term_side', 'url']
     user_permissions = ('circuits.view_circuit', )
@@ -215,13 +302,19 @@ class CircuitTerminationTest(APIViewTestCases.APIViewTestCase):
         cls.bulk_update_data = {
             'port_speed': 123456
         }
+        cls.bulk_update_invalid_data = {
+            'term_side': 'not-a-valid-term-side',
+        }
 
 
-class CircuitGroupTest(APIViewTestCases.APIViewTestCase):
+class CircuitGroupTestCase(APIViewTestCases.APIViewTestCase):
     model = CircuitGroup
     brief_fields = ['display', 'id', 'name', 'url']
     bulk_update_data = {
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'tenant': 99999,
     }
 
     @classmethod
@@ -249,7 +342,7 @@ class CircuitGroupTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class ProviderAccountTest(APIViewTestCases.APIViewTestCase):
+class ProviderAccountTestCase(APIViewTestCases.APIViewTestCase):
     model = ProviderAccount
     brief_fields = ['account', 'description', 'display', 'id', 'name', 'url']
     user_permissions = ('circuits.view_provider',)
@@ -291,13 +384,19 @@ class ProviderAccountTest(APIViewTestCases.APIViewTestCase):
             'provider': providers[1].pk,
             'description': 'New description',
         }
+        cls.bulk_update_invalid_data = {
+            'provider': 99999,
+        }
 
 
-class CircuitGroupAssignmentTest(APIViewTestCases.APIViewTestCase):
+class CircuitGroupAssignmentTestCase(APIViewTestCases.APIViewTestCase):
     model = CircuitGroupAssignment
     brief_fields = ['display', 'group', 'id', 'member', 'member_id', 'member_type', 'priority', 'url']
     bulk_update_data = {
         'priority': CircuitPriorityChoices.PRIORITY_INACTIVE,
+    }
+    bulk_update_invalid_data = {
+        'priority': 'not-a-valid-priority',
     }
     user_permissions = ('circuits.view_circuit', 'circuits.view_circuitgroup')
 
@@ -367,8 +466,42 @@ class CircuitGroupAssignmentTest(APIViewTestCases.APIViewTestCase):
             },
         ]
 
+    @tag('regression')  # Ref: #23369
+    def test_update_custom_fields(self):
+        """Custom field data sent when updating an assignment is saved and rendered."""
+        custom_field = CustomField.objects.create(name='cf1', type=CustomFieldTypeChoices.TYPE_TEXT)
+        custom_field.object_types.set([ObjectType.objects.get_for_model(CircuitGroupAssignment)])
+        self.add_permissions('circuits.change_circuitgroupassignment')
+        assignment = CircuitGroupAssignment.objects.first()
+        data = {
+            'custom_fields': {'cf1': 'foo'},
+        }
 
-class ProviderNetworkTest(APIViewTestCases.APIViewTestCase):
+        response = self.client.patch(self._get_detail_url(assignment), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertIn('custom_fields', response.data)
+        self.assertEqual(response.data['custom_fields'], {'cf1': 'foo'})
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.custom_field_data, {'cf1': 'foo'})
+
+    @tag('regression')  # Ref: #23369
+    def test_graphql_custom_fields(self):
+        """The GraphQL type renders the custom field data of an assignment."""
+        custom_field = CustomField.objects.create(name='cf1', type=CustomFieldTypeChoices.TYPE_TEXT)
+        custom_field.object_types.set([ObjectType.objects.get_for_model(CircuitGroupAssignment)])
+        self.add_permissions('circuits.view_circuitgroupassignment')
+        assignment = CircuitGroupAssignment.objects.first()
+        CircuitGroupAssignment.objects.filter(pk=assignment.pk).update(custom_field_data={'cf1': 'foo'})
+
+        query = '{ circuit_group_assignment(id: ' + str(assignment.pk) + ') { custom_fields } }'
+        response = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        data = response.json()
+        self.assertNotIn('errors', data)
+        self.assertEqual(data['data']['circuit_group_assignment']['custom_fields'], {'cf1': 'foo'})
+
+
+class ProviderNetworkTestCase(APIViewTestCases.APIViewTestCase):
     model = ProviderNetwork
     brief_fields = ['description', 'display', 'id', 'name', 'url']
     user_permissions = ('circuits.view_provider', )
@@ -407,9 +540,12 @@ class ProviderNetworkTest(APIViewTestCases.APIViewTestCase):
             'provider': providers[1].pk,
             'description': 'New description',
         }
+        cls.bulk_update_invalid_data = {
+            'provider': 99999,
+        }
 
 
-class VirtualCircuitTypeTest(APIViewTestCases.APIViewTestCase):
+class VirtualCircuitTypeTestCase(APIViewTestCases.APIViewTestCase):
     model = VirtualCircuitType
     brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url', 'virtual_circuit_count']
     create_data = (
@@ -429,6 +565,9 @@ class VirtualCircuitTypeTest(APIViewTestCases.APIViewTestCase):
     bulk_update_data = {
         'description': 'New description',
     }
+    bulk_update_invalid_data = {
+        'color': 'not-a-color',
+    }
 
     @classmethod
     def setUpTestData(cls):
@@ -441,11 +580,14 @@ class VirtualCircuitTypeTest(APIViewTestCases.APIViewTestCase):
         VirtualCircuitType.objects.bulk_create(virtual_circuit_types)
 
 
-class VirtualCircuitTest(APIViewTestCases.APIViewTestCase):
+class VirtualCircuitTestCase(APIViewTestCases.APIViewTestCase):
     model = VirtualCircuit
     brief_fields = ['cid', 'description', 'display', 'id', 'provider_network', 'url']
     bulk_update_data = {
         'status': 'planned',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
     }
 
     @classmethod
@@ -505,11 +647,14 @@ class VirtualCircuitTest(APIViewTestCases.APIViewTestCase):
         ]
 
 
-class VirtualCircuitTerminationTest(APIViewTestCases.APIViewTestCase):
+class VirtualCircuitTerminationTestCase(APIViewTestCases.APIViewTestCase):
     model = VirtualCircuitTermination
     brief_fields = ['description', 'display', 'id', 'interface', 'role', 'url', 'virtual_circuit']
     bulk_update_data = {
         'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'role': 'not-a-valid-role',
     }
 
     @classmethod

@@ -3,26 +3,33 @@ from threading import local
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.core.signals import request_finished
+from django.db import transaction
 from django.db.models import CASCADE, RESTRICT
 from django.db.models.fields.reverse_related import ManyToManyRel, ManyToOneRel
 from django.db.models.signals import m2m_changed, post_migrate, post_save, pre_delete
-from django.dispatch import receiver, Signal
-from django.core.signals import request_finished
+from django.dispatch import Signal, receiver
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
 from django_prometheus.models import model_deletes, model_inserts, model_updates
+from rq.timeouts import JobTimeoutException
 
 from core.choices import JobStatusChoices, ObjectChangeActionChoices
 from core.events import *
+from core.exceptions import SyncError
 from core.models import ObjectType
 from extras.events import enqueue_event
 from extras.models import Tag
 from extras.utils import run_validators
 from netbox.config import get_config
-from utilities.data import get_config_value_ci
 from netbox.context import current_request, events_queue
 from netbox.models.features import ChangeLoggingMixin, get_model_features, model_is_public
+from utilities.data import get_config_value_ci
 from utilities.exceptions import AbortRequest
+
 from .models import ConfigRevision, DataSource, ObjectChange
+
+logger = logging.getLogger('netbox.core.signals')
 
 __all__ = (
     'clear_events',
@@ -224,7 +231,23 @@ def handle_deleted_object(sender, instance, **kwargs):
                 # We only care about triggering the m2m_changed signal for models which support
                 # change logging
                 continue
+            related_object_type = ContentType.objects.get_for_model(related_model)
             for obj in related_model.objects.filter(**{related_field_name: instance.pk}):
+                # Skip any related object that is itself being deleted as part of this same
+                # operation (e.g. a sibling caught up in the same cascade). Its deletion has
+                # already been recorded, so nulling the FK and saving here would record an
+                # UPDATE ObjectChange *after* the object's DELETE, corrupting the changelog and
+                # breaking branch replay. (Ref: #22270)
+                #
+                # Note this is order-dependent: it only fires once the related object's own
+                # pre_delete has run (adding it to the set). If the cascade happens to delete
+                # this instance *before* the related object, the guard won't trigger and the
+                # related object still gets an UPDATE — but in the harmless UPDATE-then-DELETE
+                # order, not the corrupting DELETE-then-UPDATE order. Fully suppressing it in
+                # every ordering would require the complete deletion set, which isn't available
+                # from a pre_delete signal.
+                if (related_object_type, obj.pk) in _signals_received.pre_delete:
+                    continue
                 obj.snapshot()  # Ensure the change record includes the "before" state
                 if type(relation) is ManyToManyRel:
                     getattr(obj, related_field_name).remove(instance)
@@ -282,6 +305,10 @@ def enqueue_sync_job(instance, created, **kwargs):
             job.delete()
 
 
+# Keeps the aggregated error readable when a whole source fails at once
+_AUTO_SYNC_DETAIL_LIMIT = 10
+
+
 @receiver(post_sync)
 def auto_sync(instance, **kwargs):
     """
@@ -289,8 +316,56 @@ def auto_sync(instance, **kwargs):
     """
     from .models import AutoSyncRecord
 
-    for autosync in AutoSyncRecord.objects.filter(datafile__source=instance).prefetch_related('object'):
-        autosync.object.sync(save=True)
+    failure_count = 0
+    details = []
+    first_error = None
+
+    records = AutoSyncRecord.objects.filter(datafile__source=instance).order_by('pk')
+    for autosync in records.select_related('object_type').prefetch_related('object'):
+        # The object may be unresolvable or mid-failure, so identify by keys
+        target = f'{autosync.object_type.app_label}.{autosync.object_type.model} ID {autosync.object_id}'
+        if autosync.object_type.model_class() is None:
+            # Not an orphaned row, so leave it for remove_stale_contenttypes
+            logger.warning(f"Skipping AutoSyncRecord for uninstalled model {target}")
+            continue
+        try:
+            # The try must stay outside this, so the savepoint is rolled back before the handler runs
+            with transaction.atomic():
+                obj = autosync.object
+                if obj is None:
+                    # The prefetch resolves through the default manager, so recheck with the base manager
+                    try:
+                        obj = autosync.object_type.get_object_for_this_type(pk=autosync.object_id)
+                    except ObjectDoesNotExist:
+                        logger.warning(f"Deleting stale AutoSyncRecord for {target}")
+                        autosync.delete()
+                        continue
+                obj.sync(save=True)
+        except JobTimeoutException:
+            # rq arms one alarm per job, so a timeout is not an ordinary per-object failure
+            raise
+        except Exception as e:
+            failure_count += 1
+            if first_error is None:
+                first_error = e
+            # Not capped, unlike the raised message below
+            logger.error(f"Error auto-syncing {target}: {e}", exc_info=True)
+            if len(details) < _AUTO_SYNC_DETAIL_LIMIT:
+                details.append(f'- {target}: {type(e).__name__}: {e}')
+
+    if first_error is not None:
+        summary = ngettext(
+            'Automatic synchronization failed for {count} object:',
+            'Automatic synchronization failed for {count} objects:',
+            failure_count,
+        ).format(count=failure_count)
+        if omitted := failure_count - len(details):
+            details.append(ngettext(
+                '{count} additional failure is not shown.',
+                '{count} additional failures are not shown.',
+                omitted,
+            ).format(count=omitted))
+        raise SyncError('\n'.join([summary, *details])) from first_error
 
 
 @receiver(post_save, sender=ConfigRevision)

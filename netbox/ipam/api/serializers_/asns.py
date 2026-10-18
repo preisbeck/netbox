@@ -1,10 +1,14 @@
+from functools import cached_property
+
 from rest_framework import serializers
 
 from dcim.models import Site
-from ipam.models import ASN, ASNRange, RIR
+from ipam.models import ASN, RIR, ASNRange
 from netbox.api.fields import RelatedObjectCountField, SerializedPKRelatedField
 from netbox.api.serializers import OrganizationalModelSerializer, PrimaryModelSerializer
 from tenancy.api.serializers_.tenants import TenantSerializer
+
+from .roles import RoleSerializer
 
 __all__ = (
     'ASNRangeSerializer',
@@ -52,10 +56,12 @@ class ASNSiteSerializer(PrimaryModelSerializer):
         model = Site
         fields = ('id', 'url', 'display', 'name', 'description', 'slug')
         brief_fields = ('id', 'url', 'display', 'name', 'description', 'slug')
+        ref_name = 'ASNSite'
 
 
 class ASNSerializer(PrimaryModelSerializer):
     rir = RIRSerializer(nested=True, required=False, allow_null=True)
+    role = RoleSerializer(nested=True, required=False, allow_null=True)
     tenant = TenantSerializer(nested=True, required=False, allow_null=True)
     sites = SerializedPKRelatedField(
         queryset=Site.objects.all(),
@@ -72,8 +78,8 @@ class ASNSerializer(PrimaryModelSerializer):
     class Meta:
         model = ASN
         fields = [
-            'id', 'url', 'display_url', 'display', 'asn', 'rir', 'tenant', 'description', 'owner', 'comments', 'tags',
-            'custom_fields', 'created', 'last_updated', 'site_count', 'provider_count', 'sites',
+            'id', 'url', 'display_url', 'display', 'asn', 'rir', 'role', 'tenant', 'description', 'owner', 'comments',
+            'tags', 'custom_fields', 'created', 'last_updated', 'site_count', 'provider_count', 'sites',
         ]
         brief_fields = ('id', 'url', 'display', 'asn', 'description')
 
@@ -85,11 +91,12 @@ class AvailableASNSerializer(serializers.Serializer):
     asn = serializers.IntegerField(read_only=True)
     description = serializers.CharField(required=False)
 
+    @cached_property
+    def _rir_serializer(self):
+        return RIRSerializer(nested=True, context={'request': self.context['request']})
+
     def to_representation(self, asn):
-        rir = RIRSerializer(self.context['range'].rir, nested=True, context={
-            'request': self.context['request']
-        }).data
         return {
-            'rir': rir,
+            'rir': self._rir_serializer.to_representation(self.context['range'].rir),
             'asn': asn,
         }

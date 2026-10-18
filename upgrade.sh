@@ -104,8 +104,13 @@ COMMAND="python3 netbox/manage.py trace_paths --no-input"
 echo "Checking for missing cable paths ($COMMAND)..."
 eval $COMMAND || exit 1
 
+# Pre-render and cache config context data for devices and virtual machines
+COMMAND="python3 netbox/manage.py rebuild_config_context_cache"
+echo "Caching config context data ($COMMAND)..."
+eval $COMMAND || exit 1
+
 # Build the local documentation
-COMMAND="mkdocs build"
+COMMAND="zensical build"
 echo "Building documentation ($COMMAND)..."
 eval $COMMAND || exit 1
 

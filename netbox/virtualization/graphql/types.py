@@ -1,14 +1,17 @@
-from typing import Annotated, List, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Annotated
 
 import strawberry
 import strawberry_django
 
+from dcim.models import Location, Region, Site, SiteGroup
 from extras.graphql.mixins import ConfigContextMixin, ContactsMixin
 from ipam.graphql.mixins import IPAddressesMixin, VLANGroupsMixin
+from netbox.graphql.optimization import build_gfk_prefetch
 from netbox.graphql.scalars import BigInt
-from netbox.graphql.types import OrganizationalObjectType, PrimaryObjectType, NetBoxObjectType
+from netbox.graphql.types import NetBoxObjectType, OrganizationalObjectType, PrimaryObjectType, register_type
 from users.graphql.mixins import OwnerMixin
 from virtualization import models
+
 from .filters import *
 
 if TYPE_CHECKING:
@@ -27,12 +30,13 @@ if TYPE_CHECKING:
     from tenancy.graphql.types import TenantType
 
 __all__ = (
-    'ClusterType',
     'ClusterGroupType',
+    'ClusterType',
     'ClusterTypeType',
+    'VMInterfaceType',
     'VirtualDiskType',
     'VirtualMachineType',
-    'VMInterfaceType',
+    'VirtualMachineTypeType',
 )
 
 
@@ -44,7 +48,7 @@ class ComponentType(OwnerMixin, NetBoxObjectType):
     virtual_machine: Annotated["VirtualMachineType", strawberry.lazy('virtualization.graphql.types')]
 
 
-@strawberry_django.type(
+@register_type(
     models.Cluster,
     exclude=['scope_type', 'scope_id', '_location', '_region', '_site', '_site_group'],
     filters=ClusterFilter,
@@ -54,20 +58,32 @@ class ClusterType(ContactsMixin, VLANGroupsMixin, PrimaryObjectType):
     type: Annotated["ClusterTypeType", strawberry.lazy('virtualization.graphql.types')] | None
     group: Annotated["ClusterGroupType", strawberry.lazy('virtualization.graphql.types')] | None
     tenant: Annotated["TenantType", strawberry.lazy('tenancy.graphql.types')] | None
-    virtual_machines: List[Annotated["VirtualMachineType", strawberry.lazy('virtualization.graphql.types')]]
-    devices: List[Annotated["DeviceType", strawberry.lazy('dcim.graphql.types')]]
+    virtual_machines: list[Annotated["VirtualMachineType", strawberry.lazy('virtualization.graphql.types')]]
+    devices: list[Annotated["DeviceType", strawberry.lazy('dcim.graphql.types')]]
 
-    @strawberry_django.field
-    def scope(self) -> Annotated[Union[
-        Annotated["LocationType", strawberry.lazy('dcim.graphql.types')],
-        Annotated["RegionType", strawberry.lazy('dcim.graphql.types')],
-        Annotated["SiteGroupType", strawberry.lazy('dcim.graphql.types')],
-        Annotated["SiteType", strawberry.lazy('dcim.graphql.types')],
-    ], strawberry.union("ClusterScopeType")] | None:
+    @strawberry_django.field(
+        prefetch_related=build_gfk_prefetch(
+            'scope',
+            [
+                Region,
+                SiteGroup,
+                Site,
+                Location,
+            ],
+        ),
+        only=['scope_type', 'scope_id'],
+    )
+    def scope(self) -> Annotated[
+        Annotated['LocationType', strawberry.lazy('dcim.graphql.types')]
+        | Annotated['RegionType', strawberry.lazy('dcim.graphql.types')]
+        | Annotated['SiteGroupType', strawberry.lazy('dcim.graphql.types')]
+        | Annotated['SiteType', strawberry.lazy('dcim.graphql.types')],
+        strawberry.union('ClusterScopeType'),
+    ] | None:
         return self.scope
 
 
-@strawberry_django.type(
+@register_type(
     models.ClusterGroup,
     fields='__all__',
     filters=ClusterGroupFilter,
@@ -75,10 +91,10 @@ class ClusterType(ContactsMixin, VLANGroupsMixin, PrimaryObjectType):
 )
 class ClusterGroupType(ContactsMixin, VLANGroupsMixin, OrganizationalObjectType):
 
-    clusters: List[Annotated["ClusterType", strawberry.lazy('virtualization.graphql.types')]]
+    clusters: list[Annotated["ClusterType", strawberry.lazy('virtualization.graphql.types')]]
 
 
-@strawberry_django.type(
+@register_type(
     models.ClusterType,
     fields='__all__',
     filters=ClusterTypeFilter,
@@ -86,10 +102,23 @@ class ClusterGroupType(ContactsMixin, VLANGroupsMixin, OrganizationalObjectType)
 )
 class ClusterTypeType(OrganizationalObjectType):
 
-    clusters: List[ClusterType]
+    clusters: list[ClusterType]
 
 
-@strawberry_django.type(
+@register_type(
+    models.VirtualMachineType,
+    fields='__all__',
+    filters=VirtualMachineTypeFilter,
+    pagination=True
+)
+class VirtualMachineTypeType(PrimaryObjectType):
+    virtual_machine_count: BigInt
+    default_platform: Annotated['PlatformType', strawberry.lazy('dcim.graphql.types')] | None
+
+    instances: list[Annotated['VirtualMachineType', strawberry.lazy('virtualization.graphql.types')]]
+
+
+@register_type(
     models.VirtualMachine,
     fields='__all__',
     filters=VirtualMachineFilter,
@@ -99,6 +128,7 @@ class VirtualMachineType(ConfigContextMixin, ContactsMixin, PrimaryObjectType):
     interface_count: BigInt
     virtual_disk_count: BigInt
     interface_count: BigInt
+    virtual_machine_type: Annotated['VirtualMachineTypeType', strawberry.lazy('virtualization.graphql.types')] | None
     config_template: Annotated["ConfigTemplateType", strawberry.lazy('extras.graphql.types')] | None
     site: Annotated["SiteType", strawberry.lazy('dcim.graphql.types')] | None
     cluster: Annotated["ClusterType", strawberry.lazy('virtualization.graphql.types')] | None
@@ -109,12 +139,12 @@ class VirtualMachineType(ConfigContextMixin, ContactsMixin, PrimaryObjectType):
     primary_ip4: Annotated["IPAddressType", strawberry.lazy('ipam.graphql.types')] | None
     primary_ip6: Annotated["IPAddressType", strawberry.lazy('ipam.graphql.types')] | None
 
-    interfaces: List[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
-    services: List[Annotated["ServiceType", strawberry.lazy('ipam.graphql.types')]]
-    virtualdisks: List[Annotated["VirtualDiskType", strawberry.lazy('virtualization.graphql.types')]]
+    interfaces: list[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
+    services: list[Annotated["ServiceType", strawberry.lazy('ipam.graphql.types')]]
+    virtualdisks: list[Annotated["VirtualDiskType", strawberry.lazy('virtualization.graphql.types')]]
 
 
-@strawberry_django.type(
+@register_type(
     models.VMInterface,
     fields='__all__',
     filters=VMInterfaceFilter,
@@ -131,13 +161,13 @@ class VMInterfaceType(IPAddressesMixin, ComponentType):
     qinq_svlan: Annotated["VLANType", strawberry.lazy('ipam.graphql.types')] | None
     vlan_translation_policy: Annotated["VLANTranslationPolicyType", strawberry.lazy('ipam.graphql.types')] | None
 
-    tagged_vlans: List[Annotated["VLANType", strawberry.lazy('ipam.graphql.types')]]
-    bridge_interfaces: List[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
-    child_interfaces: List[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
-    mac_addresses: List[Annotated["MACAddressType", strawberry.lazy('dcim.graphql.types')]]
+    tagged_vlans: list[Annotated["VLANType", strawberry.lazy('ipam.graphql.types')]]
+    bridge_interfaces: list[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
+    child_interfaces: list[Annotated["VMInterfaceType", strawberry.lazy('virtualization.graphql.types')]]
+    mac_addresses: list[Annotated["MACAddressType", strawberry.lazy('dcim.graphql.types')]]
 
 
-@strawberry_django.type(
+@register_type(
     models.VirtualDisk,
     fields='__all__',
     filters=VirtualDiskFilter,

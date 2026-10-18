@@ -1,13 +1,38 @@
-from unittest.mock import patch, MagicMock
+import uuid
+from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.test import TestCase
+from django.utils import timezone
 
+from core.choices import JobNotificationChoices, JobStatusChoices, ObjectChangeActionChoices
 from core.models import DataSource, Job, ObjectType
-from core.choices import ObjectChangeActionChoices
-from dcim.models import Site, Location, Device
+from dcim.models import Device, Location, Site
+from extras.models import Notification
 from netbox.constants import CENSOR_TOKEN, CENSOR_TOKEN_CHANGED
+from users.models import User
+
+
+class DataSourceIgnoreRulesTestCase(TestCase):
+
+    def test_no_ignore_rules(self):
+        ds = DataSource(ignore_rules='')
+        self.assertFalse(ds._ignore('README.md'))
+        self.assertFalse(ds._ignore('subdir/file.py'))
+
+    def test_ignore_by_filename(self):
+        ds = DataSource(ignore_rules='*.txt')
+        self.assertTrue(ds._ignore('notes.txt'))
+        self.assertTrue(ds._ignore('subdir/notes.txt'))
+        self.assertFalse(ds._ignore('notes.py'))
+
+    def test_ignore_by_subdirectory(self):
+        ds = DataSource(ignore_rules='dev/*')
+        self.assertTrue(ds._ignore('dev/README.md'))
+        self.assertTrue(ds._ignore('dev/script.py'))
+        self.assertFalse(ds._ignore('prod/script.py'))
 
 
 class DataSourceChangeLoggingTestCase(TestCase):
@@ -127,7 +152,7 @@ class DataSourceChangeLoggingTestCase(TestCase):
         self.assertEqual(objectchange.postchange_data['parameters']['password'], CENSOR_TOKEN)
 
 
-class ObjectTypeTest(TestCase):
+class ObjectTypeTestCase(TestCase):
 
     def test_create(self):
         """
@@ -204,7 +229,19 @@ class ObjectTypeTest(TestCase):
         self.assertNotIn(ObjectType.objects.get_by_natural_key('dcim', 'cabletermination'), bookmarks_ots)
 
 
-class JobTest(TestCase):
+class JobTestCase(TestCase):
+
+    def _make_job(self, user, notifications):
+        """
+        Create and return a persisted Job with the given user and notifications setting.
+        """
+        return Job.objects.create(
+            name='Test Job',
+            job_id=uuid.uuid4(),
+            user=user,
+            notifications=notifications,
+            status=JobStatusChoices.STATUS_RUNNING,
+        )
 
     @patch('core.models.jobs.django_rq.get_queue')
     def test_delete_cancels_job_from_correct_queue(self, mock_get_queue):
@@ -237,3 +274,110 @@ class JobTest(TestCase):
         mock_get_queue.assert_called_with(custom_queue)
         mock_queue.fetch_job.assert_called_with(str(job.job_id))
         mock_rq_job.cancel.assert_called_once()
+
+    @patch('core.models.jobs.job_end')
+    def test_terminate_notification_always(self, mock_job_end):
+        """
+        With notifications=always, a Notification should be created for every
+        terminal status (completed, failed, errored).
+        """
+        user = User.objects.create_user(username='notification-always')
+
+        for status in (
+            JobStatusChoices.STATUS_COMPLETED,
+            JobStatusChoices.STATUS_FAILED,
+            JobStatusChoices.STATUS_ERRORED,
+        ):
+            with self.subTest(status=status):
+                job = self._make_job(user, JobNotificationChoices.NOTIFICATION_ALWAYS)
+                job.terminate(status=status)
+                self.assertEqual(
+                    Notification.objects.filter(user=user, object_id=job.pk).count(),
+                    1,
+                    msg=f"Expected a notification for status={status} with notifications=always",
+                )
+
+    @patch('core.models.jobs.job_end')
+    def test_terminate_notification_on_failure(self, mock_job_end):
+        """
+        With notifications=on_failure, a Notification should be created only for
+        non-completed terminal statuses (failed, errored), not for completed.
+        """
+        user = User.objects.create_user(username='notification-on-failure')
+
+        # No notification on successful completion
+        job = self._make_job(user, JobNotificationChoices.NOTIFICATION_ON_FAILURE)
+        job.terminate(status=JobStatusChoices.STATUS_COMPLETED)
+        self.assertEqual(
+            Notification.objects.filter(user=user, object_id=job.pk).count(),
+            0,
+            msg="Expected no notification for status=completed with notifications=on_failure",
+        )
+
+        # Notification on failure/error
+        for status in (JobStatusChoices.STATUS_FAILED, JobStatusChoices.STATUS_ERRORED):
+            with self.subTest(status=status):
+                job = self._make_job(user, JobNotificationChoices.NOTIFICATION_ON_FAILURE)
+                job.terminate(status=status)
+                self.assertEqual(
+                    Notification.objects.filter(user=user, object_id=job.pk).count(),
+                    1,
+                    msg=f"Expected a notification for status={status} with notifications=on_failure",
+                )
+
+    @patch('core.models.jobs.job_end')
+    def test_terminate_notification_never(self, mock_job_end):
+        """
+        With notifications=never, no Notification should be created regardless
+        of terminal status.
+        """
+        user = User.objects.create_user(username='notification-never')
+
+        for status in (
+            JobStatusChoices.STATUS_COMPLETED,
+            JobStatusChoices.STATUS_FAILED,
+            JobStatusChoices.STATUS_ERRORED,
+        ):
+            with self.subTest(status=status):
+                job = self._make_job(user, JobNotificationChoices.NOTIFICATION_NEVER)
+                job.terminate(status=status)
+                self.assertEqual(
+                    Notification.objects.filter(user=user, object_id=job.pk).count(),
+                    0,
+                    msg=f"Expected no notification for status={status} with notifications=never",
+                )
+
+    @patch('core.models.jobs.job_end')
+    def test_execution_time_set_on_terminate(self, mock_job_end):
+        """
+        terminate() should set execution_time to (completed - started) for a started job.
+        """
+        job = self._make_job(None, JobNotificationChoices.NOTIFICATION_NEVER)
+        job.started = timezone.now() - timedelta(seconds=90)
+        job.save()
+
+        job.terminate(status=JobStatusChoices.STATUS_COMPLETED)
+
+        self.assertIsNotNone(job.execution_time)
+        self.assertEqual(job.execution_time, job.completed - job.started)
+
+    @patch('core.models.jobs.job_end')
+    def test_execution_time_none_before_completion(self, mock_job_end):
+        """
+        A job which has not completed should have a null execution_time.
+        """
+        job = self._make_job(None, JobNotificationChoices.NOTIFICATION_NEVER)
+        self.assertIsNone(job.execution_time)
+
+    @patch('core.models.jobs.job_end')
+    def test_execution_time_none_when_never_started(self, mock_job_end):
+        """
+        Terminating a job which was never started (no started timestamp) should leave
+        execution_time null rather than computing a value from a missing start time.
+        """
+        job = self._make_job(None, JobNotificationChoices.NOTIFICATION_NEVER)
+        self.assertIsNone(job.started)
+
+        job.terminate(status=JobStatusChoices.STATUS_COMPLETED)
+
+        self.assertIsNone(job.execution_time)

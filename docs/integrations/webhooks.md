@@ -17,19 +17,34 @@ For example, you might create a NetBox webhook to [trigger a Slack message](http
 * HTTP method: `POST`
 * URL: Slack incoming webhook URL
 * HTTP content type: `application/json`
-* Body template: `{"text": "IP address {{ data['address'] }} was created by {{ username }}!"}`
+* Body template: `{"text": "IP address {{ data['address'] }} was created by {{ request.user }}!"}`
 
 ### Available Context
 
 The following data is available as context for Jinja2 templates:
 
-* `event` - The type of event which triggered the webhook: created, updated, or deleted.
-* `model` - The NetBox model which triggered the change.
+* `event` - The type of event which triggered the webhook: `created`, `updated`, or `deleted`.
 * `timestamp` - The time at which the event occurred (in [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601) format).
-* `username` - The name of the user account associated with the change.
-* `request_id` - The unique request ID. This may be used to correlate multiple changes associated with a single request.
+* `object_type` - The NetBox model which triggered the change in the form `app_label.model_name`.
+* `request` - Data about the triggering request (if available).
+    * `request.id` - The UUID associated with the request
+    * `request.method` - The HTTP method (e.g. `GET` or `POST`)
+    * `request.path` - The URL path (ex: `/dcim/sites/123/edit/`)
+    * `request.path_info` - The URL path below the application script prefix
+    * `request.GET` - The query parameters included in the request
+    * `request.user` - The name of the authenticated user who made the request (if available)
 * `data` - A detailed representation of the object in its current state. This is typically equivalent to the model's representation in NetBox's REST API.
 * `snapshots` - Minimal "snapshots" of the object state both before and after the change was made; provided as a dictionary with keys named `prechange` and `postchange`. These are not as extensive as the fully serialized representation, but contain enough information to convey what has changed.
+
+### Sanitizing Header Values
+
+When rendering the `additional_headers` field, a `header_safe` filter is made available for sanitizing a value for safe inclusion in a raw HTTP header. It strips newlines and other control characters from the rendered value, preventing HTTP header (CR/LF) injection.
+
+Whenever a header value incorporates data which may be influenced by other users (such as an object's attributes), pass it through this filter to avoid smuggling of additional headers. For example:
+
+```
+X-Object-Name: {{ data.name | header_safe }}
+```
 
 ### Default Request Body
 
@@ -38,27 +53,35 @@ If no body template is specified, the request body will be populated with a JSON
 ```json
 {
     "event": "created",
-    "timestamp": "2021-03-09 17:55:33.968016+00:00",
-    "model": "site",
-    "username": "jstretch",
-    "request_id": "fdbca812-3142-4783-b364-2e2bd5c16c6a",
+    "timestamp": "2026-03-06T15:11:23.503186+00:00",
+    "object_type": "dcim.site",
     "data": {
-        "id": 19,
+        "id": 4,
+        "url": "/api/dcim/sites/4/",
+        "display_url": "/dcim/sites/4/",
+        "display": "Site 1",
         "name": "Site 1",
         "slug": "site-1",
-        "status": 
+        "status": {
             "value": "active",
-            "label": "Active",
-            "id": 1
+            "label": "Active"
         },
         "region": null,
         ...
     },
+    "request": {
+        "id": "17af32f0-852a-46ca-a7d4-33ecd0c13de6",
+        "method": "POST",
+        "path": "/dcim/sites/add/",
+        "user": "jstretch"
+    },
     "snapshots": {
         "prechange": null,
         "postchange": {
-            "created": "2021-03-09",
-            "last_updated": "2021-03-09T17:55:33.851Z",
+            "created": "2026-03-06T15:11:23.484Z",
+            "owner": null,
+            "description": "",
+            "comments": "",
             "name": "Site 1",
             "slug": "site-1",
             "status": "active",

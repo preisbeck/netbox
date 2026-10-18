@@ -3,15 +3,15 @@ from django.test import TestCase
 from dcim.choices import InterfaceModeChoices
 from dcim.models import Device, DeviceRole, MACAddress, Platform, Region, Site, SiteGroup
 from ipam.choices import VLANQinQRoleChoices
-from ipam.models import IPAddress, VLAN, VLANTranslationPolicy, VRF
+from ipam.models import VLAN, VRF, IPAddress, VLANTranslationPolicy
 from tenancy.models import Tenant, TenantGroup
-from utilities.testing import ChangeLoggedFilterSetTests, create_test_device
+from utilities.testing import ChangeLoggedFilterSetTestMixin, create_test_device
 from virtualization.choices import *
 from virtualization.filtersets import *
 from virtualization.models import *
 
 
-class ClusterTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ClusterTypeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ClusterType.objects.all()
     filterset = ClusterTypeFilterSet
 
@@ -42,7 +42,7 @@ class ClusterTypeTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ClusterGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ClusterGroupTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = ClusterGroup.objects.all()
     filterset = ClusterGroupFilterSet
 
@@ -73,7 +73,7 @@ class ClusterGroupTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class ClusterTestCase(TestCase, ChangeLoggedFilterSetTests):
+class ClusterTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = Cluster.objects.all()
     filterset = ClusterFilterSet
 
@@ -230,7 +230,117 @@ class ClusterTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VirtualMachineTypeTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
+    queryset = VirtualMachineType.objects.all()
+    filterset = VirtualMachineTypeFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+
+        platforms = (
+            Platform(name='Platform 1', slug='platform-1'),
+            Platform(name='Platform 2', slug='platform-2'),
+            Platform(name='Platform 3', slug='platform-3'),
+        )
+        for platform in platforms:
+            platform.save()
+
+        cluster_type = ClusterType.objects.create(
+            name='Cluster Type 1',
+            slug='cluster-type-1',
+        )
+        site = Site.objects.create(
+            name='Site 1',
+            slug='site-1',
+        )
+        cluster = Cluster.objects.create(
+            name='Cluster 1',
+            type=cluster_type,
+            scope=site,
+        )
+
+        cls.vm_types = (
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=platforms[0],
+                default_vcpus=1,
+                default_memory=1024,
+                description='foobar1',
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=platforms[1],
+                default_vcpus=2,
+                default_memory=2048,
+                description='foobar2',
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 3',
+                slug='virtual-machine-type-3',
+                default_platform=platforms[2],
+                default_vcpus=4,
+                default_memory=4096,
+                description='foobar3',
+            ),
+        )
+
+        # Populate virtual_machine_count
+        VirtualMachine.objects.create(
+            name='vm-type-1a',
+            cluster=cluster,
+            virtual_machine_type=cls.vm_types[0],
+        )
+        VirtualMachine.objects.create(
+            name='vm-type-1b',
+            cluster=cluster,
+            virtual_machine_type=cls.vm_types[0],
+            tenant=Tenant.objects.create(name='Tenant 1', slug='tenant-1'),
+        )
+        VirtualMachine.objects.create(
+            name='vm-type-2a',
+            cluster=cluster,
+            virtual_machine_type=cls.vm_types[1],
+        )
+
+    def test_q(self):
+        params = {'q': 'foobar1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_name(self):
+        params = {'name': ['Virtual Machine Type 1', 'Virtual Machine Type 2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_slug(self):
+        params = {'slug': ['virtual-machine-type-1', 'virtual-machine-type-2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_description(self):
+        params = {'description': ['foobar1', 'foobar2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_default_platform(self):
+        platforms = Platform.objects.all()[:2]
+        params = {'default_platform_id': [platforms[0].pk, platforms[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'default_platform': [platforms[0].slug, platforms[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_default_vcpus(self):
+        params = {'default_vcpus': [1, 2]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_default_memory(self):
+        params = {'default_memory': [1024, 2048]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_virtual_machine_count(self):
+        params = {'virtual_machine_count': [1, 2]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+
+class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VirtualMachine.objects.all()
     filterset = VirtualMachineFilterSet
 
@@ -290,6 +400,30 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
         for platform in platforms:
             platform.save()
 
+        cls.vm_types = (
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=platforms[0],
+                default_vcpus=1,
+                default_memory=1024,
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=platforms[1],
+                default_vcpus=2,
+                default_memory=2048,
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 3',
+                slug='virtual-machine-type-3',
+                default_platform=platforms[2],
+                default_vcpus=4,
+                default_memory=4096,
+            ),
+        )
+
         roles = (
             DeviceRole(name='Device Role 1', slug='device-role-1'),
             DeviceRole(name='Device Role 2', slug='device-role-2'),
@@ -322,6 +456,7 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
         vms = (
             VirtualMachine(
                 name='Virtual Machine 1',
+                virtual_machine_type=cls.vm_types[0],
                 site=sites[0],
                 cluster=clusters[0],
                 device=devices[0],
@@ -333,11 +468,12 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
                 memory=1,
                 disk=1,
                 description='foobar1',
-                local_context_data={"foo": 123},
-                serial='111-aaa'
+                local_context_data={'foo': 123},
+                serial='111-aaa',
             ),
             VirtualMachine(
                 name='Virtual Machine 2',
+                virtual_machine_type=cls.vm_types[1],
                 site=sites[1],
                 cluster=clusters[1],
                 device=devices[1],
@@ -354,6 +490,7 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
             ),
             VirtualMachine(
                 name='Virtual Machine 3',
+                virtual_machine_type=cls.vm_types[2],
                 site=sites[2],
                 cluster=clusters[2],
                 device=devices[2],
@@ -499,6 +636,13 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'platform': [platforms[0].slug, platforms[1].slug]}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
+    def test_virtual_machine_type(self):
+        vm_types = VirtualMachineType.objects.all()[:2]
+        params = {'virtual_machine_type_id': [vm_types[0].pk, vm_types[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'virtual_machine_type': [vm_types[0].slug, vm_types[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
     def test_mac_address(self):
         params = {'mac_address': ['00-00-00-00-00-01', '00-00-00-00-00-02']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
@@ -556,7 +700,7 @@ class VirtualMachineTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VMInterfaceTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VMInterfaceTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VMInterface.objects.all()
     filterset = VMInterfaceFilterSet
     ignore_fields = ('tagged_vlans', 'untagged_vlan', 'qinq_svlan')
@@ -728,6 +872,24 @@ class VMInterfaceTestCase(TestCase, ChangeLoggedFilterSetTests):
         params = {'vlan': vlan.vid}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
 
+        # A non-integer value is rejected
+        for value in ('no-such-value', '1.5'):
+            self.assertFalse(self.filterset({'vlan_id': value}, self.queryset).is_valid(), msg=value)
+            self.assertFalse(self.filterset({'vlan': value}, self.queryset).is_valid(), msg=value)
+
+        # An interface matching more than one of its VLAN assignments is returned only once
+        vlans = VLAN.objects.bulk_create((
+            VLAN(name='VLAN 4001', vid=4001),
+            VLAN(name='VLAN 4002', vid=4002),
+        ))
+        interface = self.queryset.first()
+        VMInterface.objects.filter(pk=interface.pk).update(untagged_vlan=vlans[0])
+        interface.tagged_vlans.set(vlans)
+        params = {'vlan_id': vlans[0].pk}
+        self.assertEqual(list(self.filterset(params, self.queryset).qs), [interface])
+        params = {'vlan': vlans[0].vid}
+        self.assertEqual(list(self.filterset(params, self.queryset).qs), [interface])
+
     def test_vlan_translation_policy(self):
         vlan_translation_policies = VLANTranslationPolicy.objects.all()[:2]
         params = {'vlan_translation_policy_id': [vlan_translation_policies[0].pk, vlan_translation_policies[1].pk]}
@@ -736,7 +898,7 @@ class VMInterfaceTestCase(TestCase, ChangeLoggedFilterSetTests):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
 
 
-class VirtualDiskTestCase(TestCase, ChangeLoggedFilterSetTests):
+class VirtualDiskTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = VirtualDisk.objects.all()
     filterset = VirtualDiskFilterSet
 

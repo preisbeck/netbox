@@ -2,7 +2,7 @@ from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django_rq.queues import get_redis_connection
-from django_rq.settings import QUEUES_LIST
+from django_rq.settings import get_queues_list
 from django_rq.utils import get_statistics
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema
@@ -18,11 +18,12 @@ from core import filtersets
 from core.jobs import SyncDataSourceJob
 from core.models import *
 from core.utils import delete_rq_job, enqueue_rq_job, get_rq_jobs, requeue_rq_job, stop_rq_job
-from netbox.api.authentication import IsAuthenticatedOrLoginNotRequired
+from netbox.api.authentication import IsAuthenticatedOrLoginNotRequired, TokenSyncPermission
 from netbox.api.metadata import ContentTypeMetadata
 from netbox.api.pagination import LimitOffsetListPagination
 from netbox.api.viewsets import NetBoxModelViewSet, NetBoxReadOnlyModelViewSet
 from utilities.api import IsSuperuser
+
 from . import serializers
 
 
@@ -39,10 +40,17 @@ class DataSourceViewSet(NetBoxModelViewSet):
     serializer_class = serializers.DataSourceSerializer
     filterset_class = filtersets.DataSourceFilterSet
 
+    def get_permissions(self):
+        if self.action == 'sync':
+            return [TokenSyncPermission()]
+        return super().get_permissions()
+
+    @extend_schema(request=None, responses={200: serializers.DataSourceSerializer})
     @action(detail=True, methods=['post'])
     def sync(self, request, pk):
         """
-        Enqueue a job to synchronize the DataSource.
+        Enqueue a job to synchronize the DataSource. The brief representation of the DataSource is returned if the
+        user does not have permission to view it.
         """
         datasource = get_object_or_404(DataSource, pk=pk)
 
@@ -52,7 +60,10 @@ class DataSourceViewSet(NetBoxModelViewSet):
         # Enqueue the sync job
         SyncDataSourceJob.enqueue(instance=datasource, user=request.user)
 
-        serializer = serializers.DataSourceSerializer(datasource, context={'request': request})
+        # Return the full representation only if the user may view the DataSource, as it includes backend
+        # parameters (e.g. credentials).
+        nested = not request.user.has_perm('core.view_datasource', obj=datasource)
+        serializer = serializers.DataSourceSerializer(datasource, nested=nested, context={'request': request})
 
         return Response(serializer.data)
 
@@ -194,7 +205,7 @@ class BackgroundWorkerViewSet(BaseRQViewSet):
         return 'Background Workers'
 
     def get_data(self):
-        config = QUEUES_LIST[0]
+        config = get_queues_list()[0]
         return Worker.all(get_redis_connection(config['connection_config']))
 
     @extend_schema(
@@ -204,7 +215,7 @@ class BackgroundWorkerViewSet(BaseRQViewSet):
     )
     def retrieve(self, request, name):
         # all the RQ queues should use the same connection
-        config = QUEUES_LIST[0]
+        config = get_queues_list()[0]
         workers = Worker.all(get_redis_connection(config['connection_config']))
         worker = next((item for item in workers if item.name == name), None)
         if not worker:
@@ -228,7 +239,7 @@ class BackgroundTaskViewSet(BaseRQViewSet):
         return get_rq_jobs()
 
     def get_task_from_id(self, task_id):
-        config = QUEUES_LIST[0]
+        config = get_queues_list()[0]
         task = RQ_Job.fetch(task_id, connection=get_redis_connection(config['connection_config']))
         if not task:
             raise Http404
@@ -284,5 +295,4 @@ class BackgroundTaskViewSet(BaseRQViewSet):
         stopped_jobs = stop_rq_job(id)
         if len(stopped_jobs) == 1:
             return HttpResponse(status=200)
-        else:
-            return HttpResponse(status=204)
+        return HttpResponse(status=204)

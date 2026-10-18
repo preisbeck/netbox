@@ -8,12 +8,12 @@ from django.utils.translation import gettext_lazy as _
 
 from core.forms.mixins import SyncedDataMixin
 from core.models import *
-from netbox.config import get_config, PARAMS
+from netbox.config import PARAMS, get_config
 from netbox.forms import NetBoxModelForm, PrimaryModelForm
 from netbox.registry import registry
 from netbox.utils import get_data_backend_choices
 from utilities.forms import get_field_value
-from utilities.forms.fields import JSONField
+from utilities.forms.fields import ChoiceField, JSONField
 from utilities.forms.rendering import FieldSet
 from utilities.forms.widgets import HTMXSelect
 
@@ -27,8 +27,9 @@ EMPTY_VALUES = ('', None, [], ())
 
 
 class DataSourceForm(PrimaryModelForm):
-    type = forms.ChoiceField(
+    type = ChoiceField(
         choices=get_data_backend_choices,
+        # No hx_target_id: changing type adds/removes the Backend Parameters fieldset entirely.
         widget=HTMXSelect()
     )
 
@@ -43,7 +44,7 @@ class DataSourceForm(PrimaryModelForm):
                 attrs={
                     'rows': 5,
                     'class': 'font-monospace',
-                    'placeholder': '.cache\n*.txt'
+                    'placeholder': '.cache\n*.txt\nsubdir/*'
                 }
             ),
         }
@@ -114,15 +115,6 @@ class ManagedFileForm(SyncedDataMixin, NetBoxModelForm):
 
         return self.cleaned_data
 
-    def save(self, *args, **kwargs):
-        # If a file was uploaded, save it to disk
-        if self.cleaned_data['upload_file']:
-            self.instance.file_path = self.cleaned_data['upload_file'].name
-            with open(self.instance.full_path, 'wb+') as new_file:
-                new_file.write(self.cleaned_data['upload_file'].read())
-
-        return super().save(*args, **kwargs)
-
 
 class ConfigFormMetaclass(forms.models.ModelFormMetaclass):
 
@@ -165,9 +157,10 @@ class ConfigRevisionForm(forms.ModelForm, metaclass=ConfigFormMetaclass):
         FieldSet('PAGINATE_COUNT', 'MAX_PAGE_SIZE', name=_('Pagination')),
         FieldSet('CUSTOM_VALIDATORS', 'PROTECTION_RULES', name=_('Validation')),
         FieldSet('DEFAULT_USER_PREFERENCES', name=_('User Preferences')),
+        FieldSet('CHANGELOG_RETENTION', 'CHANGELOG_RETAIN_CREATE_LAST_UPDATE', name=_('Change Log')),
         FieldSet(
-            'MAINTENANCE_MODE', 'COPILOT_ENABLED', 'GRAPHQL_ENABLED', 'CHANGELOG_RETENTION', 'JOB_RETENTION',
-            'MAPS_URL', name=_('Miscellaneous'),
+            'MAINTENANCE_MODE', 'COPILOT_ENABLED', 'GRAPHQL_ENABLED', 'JOB_RETENTION', 'MAPS_URL',
+            name=_('Miscellaneous'),
         ),
         FieldSet('comment', name=_('Config Revision'))
     )
@@ -176,12 +169,6 @@ class ConfigRevisionForm(forms.ModelForm, metaclass=ConfigFormMetaclass):
         model = ConfigRevision
         fields = '__all__'
         widgets = {
-            'BANNER_LOGIN': forms.Textarea(attrs={'class': 'font-monospace'}),
-            'BANNER_MAINTENANCE': forms.Textarea(attrs={'class': 'font-monospace'}),
-            'BANNER_TOP': forms.Textarea(attrs={'class': 'font-monospace'}),
-            'BANNER_BOTTOM': forms.Textarea(attrs={'class': 'font-monospace'}),
-            'CUSTOM_VALIDATORS': forms.Textarea(attrs={'class': 'font-monospace'}),
-            'PROTECTION_RULES': forms.Textarea(attrs={'class': 'font-monospace'}),
             'comment': forms.Textarea(),
         }
 
